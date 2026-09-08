@@ -626,25 +626,37 @@ function runAgentInBackground(
   if (model) args.push("--model", model);
   args.push(`@${promptFile}`);
 
+  // Capture output to a log file so failures are diagnosable
+  const logFile = path.join(tmpDir, "agent.log");
+  const logFd = fs.openSync(logFile, "a");
+
   const invocation = getPiInvocation(args);
   const proc = spawn(invocation.command, invocation.args, {
     cwd,
     shell: false,
-    stdio: ["ignore", "ignore", "ignore"],
+    stdio: ["ignore", logFd, logFd],
     detached: true,
   });
 
   // Track as running
   bgRunning.set(sessionFile, { proc, startedAt: Date.now() });
 
+  proc.on("error", (err) => {
+    bgRunning.delete(sessionFile);
+    bgFinished.set(sessionFile, { exitCode: 1, finishedAt: Date.now() });
+    try { fs.appendFileSync(logFile, `\nspawn error: ${err}\n`); } catch {}
+  });
+
   proc.on("exit", (code) => {
-    // Move from running to finished
     bgRunning.delete(sessionFile);
     bgFinished.set(sessionFile, { exitCode: code ?? 1, finishedAt: Date.now() });
-
-    // Clean up temp file
+    try { fs.closeSync(logFd); } catch {}
     try { fs.unlinkSync(promptFile); } catch {}
-    try { fs.rmdirSync(tmpDir); } catch {}
+    // Keep the log on failure for debugging; clean up on success
+    if ((code ?? 1) === 0) {
+      try { fs.unlinkSync(logFile); } catch {}
+      try { fs.rmdirSync(tmpDir); } catch {}
+    }
   });
 
   // Detach so the subprocess outlives us if needed
@@ -702,11 +714,35 @@ function sortAgentsByState(agents: AgentInfo[]): AgentInfo[] {
   // ── Commands ───────────────────────────────────────────────────
 
 
+  /**
+   * If the current agent is busy, hand its work off to a background pi
+   * subprocess before we switch away.
+   *
+   * IMPORTANT: ctx.abort() is async. We must await it so pi finishes
+   * flushing the session file before the subprocess opens it, otherwise
+   * both processes write the same file and the work is lost.
+   */
+  async function handoffCurrentIfBusy(ctx: ExtensionCommandContext): Promise<void> {
+    if (ctx.isIdle()) return;
+    const currentFile = ctx.sessionManager.getSessionFile();
+    if (!currentFile) return;
+
+    const modelStr = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+
+    // Stop the in-flight turn and wait for pi to settle/flush
+    await ctx.abort();
+    await ctx.waitForIdle();
+
+    // Now it is safe for a subprocess to take over this session file
+    runAgentInBackground(currentFile, "continue from where you left off", ctx.cwd, modelStr);
+  }
+
   pi.registerCommand("__av-switch", {
     description: "(internal) Switch to an agent",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const file = args.trim();
       if (!file) return;
+      await handoffCurrentIfBusy(ctx);
       closeView(ctx);
       await ctx.switchSession(file);
     },
@@ -723,6 +759,7 @@ function sortAgentsByState(agents: AgentInfo[]): AgentInfo[] {
       const agentName = prompt.length > 40 ? prompt.slice(0, 40) + "…" : prompt;
       const agentFile = createSubAgent(parent, { name: agentName, cwd: ctx.cwd });
 
+      await handoffCurrentIfBusy(ctx);
       closeView(ctx);
 
       await ctx.switchSession(agentFile, {
@@ -816,20 +853,9 @@ ${task}`;
 
     ctx.ui.setEditorComponent((tui, theme, kb) => {
       const editor = new AgentViewEditor(tui, theme, kb, st, (action, arg) => {
-        // For switch/dispatch: immediately background the current agent if busy,
-        // THEN send the command. This avoids the "followUp" delay which would
-        // wait for the agent to finish before switching.
-        if ((action === "switch" || action === "dispatch") && !ctx.isIdle()) {
-          ctx.abort();
-          const currentFile = ctx.sessionManager.getSessionFile();
-          if (currentFile) {
-            const modelStr = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-            runAgentInBackground(currentFile, "continue from where you left off", ctx.cwd, modelStr);
-          }
-        }
-
+        // Extension commands execute immediately even while streaming,
+        // so the command handler can await abort() before switching.
         const opts: any = { expandPromptTemplates: true };
-        // After abort above, agent is idle — no need for deliverAs
 
         switch (action) {
           case "open": openView(ctx); break;
