@@ -4,10 +4,10 @@ Claude Code-style **Agent Views** for [pi](https://pi.dev) — manage multiple a
 
 ## Features
 
-- **Per-session agent management**: Each pi session has its own agent list. The session itself is the "Main" agent; additional agents are sub-sessions stored separately from normal session management.
-- **Background execution**: Agents created via `/agent` run in background pi subprocesses. Switch between agents freely — running agents continue in the background.
+- **Per-session agent management**: Each pi session has its own agent list. The session itself is the "Main" agent; additional agents are sub-sessions stored separately from normal session management (`/resume` won't see them).
+- **Background execution**: Agents created via `/agent` run in background pi subprocesses. Switch between agents freely — running agents automatically continue in the background.
 - **Grouped by state**: Agents are displayed grouped as **Working → Failed → Idle → Completed** with colored icons.
-- **Context-aware dispatch**: `/agent <task>` serializes the current conversation, lets the background LLM extract relevant context, and starts the new agent — all without blocking.
+- **Context-aware dispatch**: `/agent <task>` serializes the current conversation and starts a background agent that extracts relevant context and works on the task — all without blocking.
 - **Real-time refresh**: Agent Views auto-refreshes every 3 seconds while open so you can watch Working → Completed transitions.
 
 ## Install
@@ -25,11 +25,7 @@ pi install -l git:github.com/AllanZyne/pi-agent-views
 
 ### Open Agent Views
 
-| Method | How |
-|--------|-----|
-| `←` on empty editor | Toggle Agent Views on/off |
-| `/agents` | Toggle via command |
-| `Ctrl+Shift+A` | Keyboard shortcut |
+Press `←` on an empty editor to toggle Agent Views, or use `Ctrl+Shift+A`.
 
 ### Inside Agent Views
 
@@ -45,20 +41,30 @@ pi install -l git:github.com/AllanZyne/pi-agent-views
 
 ### Create agents
 
-**From Agent Views** — type a prompt and press `Enter`:
+**From Agent Views** — type a prompt in the editor and press `Enter`:
 ```
 fix the flaky test in auth_test.go
 ```
+A new agent session is created and you switch into it.
 
-**From any agent** — use `/agent` to create with LLM-curated context:
+**From any agent** — use `/agent` to create a background agent with LLM-curated context:
 ```
 /agent based on our analysis, write a fix PR
 ```
-The current conversation is serialized and sent to the background agent along with the task. The LLM extracts relevant context and works on the task — all in the background.
+The current conversation is serialized and sent to a background pi subprocess. The LLM extracts relevant context and works on the task — without blocking your current work. Check progress anytime via `←` Agent Views.
 
 ### Per-agent model
 
 Each agent can use a different model. Attach to an agent and use `/model` to change it, just like the main session.
+
+## Agent States
+
+| State | Icon | Color | Meaning |
+|-------|------|-------|---------|
+| Working | `✽` | Yellow | Background subprocess running |
+| Failed | `✗` | Red | Subprocess exited non-zero or LLM error |
+| Idle | `∙` | Grey | No background process, waiting |
+| Completed | `✓` | Green | Subprocess finished successfully |
 
 ## Architecture
 
@@ -73,18 +79,10 @@ Each agent can use a different model. Attach to an agent and use `/model` to cha
 ```
 
 - **Main agent** = the session itself (always shown as `[main]`)
-- **Sub-agents** = stored in `__agents__/<parentId>/` so `SessionManager.list()` won't discover them
+- **Sub-agents** = stored in `__agents__/<parentId>/`, invisible to `SessionManager.list()`
 - **Background execution** via detached `pi -p --session <file>` subprocesses
-- **State tracking** from background process lifecycle (running → exit code 0/non-zero)
-
-## Agent States
-
-| State | Icon | Color | Meaning |
-|-------|------|-------|---------|
-| Working | `✽` | Yellow | Background subprocess running |
-| Failed | `✗` | Red | Subprocess exited non-zero or LLM error |
-| Idle | `∙` | Grey | No background process, waiting |
-| Completed | `✓` | Green | Subprocess finished successfully |
+- **State tracking** from background process lifecycle (running → exit code)
+- When switching away from a busy agent, it is automatically backgrounded so it keeps running
 
 ## License
 
