@@ -701,15 +701,6 @@ function sortAgentsByState(agents: AgentInfo[]): AgentInfo[] {
 
   // ── Commands ───────────────────────────────────────────────────
 
-  pi.registerCommand("agents", {
-    description: "Toggle Agent Views — manage agents for this session",
-    handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      if (ctx.mode !== "tui") { ctx.ui.notify("Requires interactive mode", "error"); return; }
-      if (st.active) closeView(ctx);
-      else openView(ctx);
-    },
-  });
-
   /**
    * If the current session is actively processing (LLM streaming / tool running),
    * abort it and spawn a background pi subprocess to continue the work.
@@ -729,7 +720,7 @@ function sortAgentsByState(agents: AgentInfo[]): AgentInfo[] {
     runAgentInBackground(currentFile, "continue from where you left off", ctx.cwd, modelStr);
   }
 
-  pi.registerCommand("agents-switch", {
+  pi.registerCommand("__av-switch", {
     description: "(internal) Switch to an agent",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const file = args.trim();
@@ -744,7 +735,7 @@ function sortAgentsByState(agents: AgentInfo[]): AgentInfo[] {
     },
   });
 
-  pi.registerCommand("agents-dispatch", {
+  pi.registerCommand("__av-dispatch", {
     description: "(internal) Dispatch a new agent",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const prompt = args.trim();
@@ -842,9 +833,8 @@ ${task}`;
   pi.registerShortcut("ctrl+shift+a", {
     description: "Toggle Agent Views",
     handler: async (ctx) => {
-      const opts: any = { expandPromptTemplates: true };
-      if (!ctx.isIdle()) opts.deliverAs = "followUp";
-      pi.sendUserMessage("/agents", opts);
+      if (st.active) closeView(ctx);
+      else openView(ctx);
     },
   });
 
@@ -865,8 +855,8 @@ ${task}`;
         switch (action) {
           case "open": openView(ctx); break;
           case "close": closeView(ctx); break;
-          case "switch": pi.sendUserMessage(`/agents-switch ${arg}`, opts); break;
-          case "dispatch": pi.sendUserMessage(`/agents-dispatch ${arg}`, opts); break;
+          case "switch": pi.sendUserMessage(`/__av-switch ${arg}`, opts); break;
+          case "dispatch": pi.sendUserMessage(`/__av-dispatch ${arg}`, opts); break;
         }
       });
 
