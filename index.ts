@@ -830,14 +830,6 @@ ${task}`;
   });
 
 
-  pi.registerShortcut("ctrl+shift+a", {
-    description: "Toggle Agent Views",
-    handler: async (ctx) => {
-      if (st.active) closeView(ctx);
-      else openView(ctx);
-    },
-  });
-
   // ── Install custom editor ─────────────────────────────────────
 
   pi.on("session_start", (_event, ctx) => {

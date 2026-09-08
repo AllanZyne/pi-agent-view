@@ -25,7 +25,6 @@ pi install -l git:github.com/AllanZyne/pi-agent-views
 
 ### Open Agent Views
 
-Press `←` on an empty editor to toggle Agent Views, or use `Ctrl+Shift+A`.
 
 ### Inside Agent Views
 
