@@ -701,37 +701,14 @@ function sortAgentsByState(agents: AgentInfo[]): AgentInfo[] {
 
   // ── Commands ───────────────────────────────────────────────────
 
-  /**
-   * If the current session is actively processing (LLM streaming / tool running),
-   * abort it and spawn a background pi subprocess to continue the work.
-   * This way the agent keeps running even after we switch away.
-   */
-  function backgroundCurrentIfBusy(ctx: ExtensionCommandContext): void {
-    if (ctx.isIdle()) return;
-
-    const currentFile = ctx.sessionManager.getSessionFile();
-    if (!currentFile) return;
-
-    // Abort the in-flight response so switchSession can proceed
-    ctx.abort();
-
-    // Spawn a background subprocess to continue the interrupted work
-    const modelStr = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-    runAgentInBackground(currentFile, "continue from where you left off", ctx.cwd, modelStr);
-  }
 
   pi.registerCommand("__av-switch", {
     description: "(internal) Switch to an agent",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const file = args.trim();
       if (!file) return;
-      backgroundCurrentIfBusy(ctx);
       closeView(ctx);
-      await ctx.switchSession(file, {
-        withSession: async (rCtx) => {
-          rCtx.ui.notify("Switched agent", "info");
-        },
-      });
+      await ctx.switchSession(file);
     },
   });
 
@@ -746,12 +723,10 @@ function sortAgentsByState(agents: AgentInfo[]): AgentInfo[] {
       const agentName = prompt.length > 40 ? prompt.slice(0, 40) + "…" : prompt;
       const agentFile = createSubAgent(parent, { name: agentName, cwd: ctx.cwd });
 
-      backgroundCurrentIfBusy(ctx);
       closeView(ctx);
 
       await ctx.switchSession(agentFile, {
         withSession: async (rCtx) => {
-          rCtx.ui.notify(`New agent: ${agentName}`, "info");
           await rCtx.sendUserMessage(prompt);
         },
       });
@@ -841,8 +816,20 @@ ${task}`;
 
     ctx.ui.setEditorComponent((tui, theme, kb) => {
       const editor = new AgentViewEditor(tui, theme, kb, st, (action, arg) => {
+        // For switch/dispatch: immediately background the current agent if busy,
+        // THEN send the command. This avoids the "followUp" delay which would
+        // wait for the agent to finish before switching.
+        if ((action === "switch" || action === "dispatch") && !ctx.isIdle()) {
+          ctx.abort();
+          const currentFile = ctx.sessionManager.getSessionFile();
+          if (currentFile) {
+            const modelStr = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+            runAgentInBackground(currentFile, "continue from where you left off", ctx.cwd, modelStr);
+          }
+        }
+
         const opts: any = { expandPromptTemplates: true };
-        if (!ctx.isIdle()) opts.deliverAs = "followUp";
+        // After abort above, agent is idle — no need for deliverAs
 
         switch (action) {
           case "open": openView(ctx); break;
