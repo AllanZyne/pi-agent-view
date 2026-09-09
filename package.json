@@ -1,7 +1,7 @@
 {
   "name": "pi-agent-views",
-  "version": "0.2.0",
-  "description": "Multiple concurrent agents per pi session, each natively rendered",
+  "version": "0.3.0",
+  "description": "Concurrent sub-agents for pi, each rendered by pi itself",
   "keywords": [
     "pi-package"
   ],
@@ -10,5 +10,8 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "scripts": {
+    "test": "node tests/run.mjs"
   }
 }

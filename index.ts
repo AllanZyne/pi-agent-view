@@ -1,242 +1,138 @@
 /**
- * Agent Views — per-session agents, natively rendered, truly concurrent.
+ * Agent Views — per-session agents, rendered by pi itself, truly concurrent.
  *
- * Every agent is a real pi session running in the same process, so each one
- * gets the full native experience: live streaming, markdown, tool rendering,
- * footer stats, /compact, /tree, Ctrl+O — everything.
+ * Two problems this solves:
  *
- * Switching between agents uses `ctx.activateSession()`, which never tears
- * anything down. A background agent keeps working while you look at another
- * one, and you can come back to find it further along (or finished).
+ * 1. Concurrency. Every agent is its own `AgentSession` created through the pi
+ *    SDK (see agent-runtime.ts) and owned by this extension, NOT by pi's
+ *    session runtime. pi's `switchSession()/newSession()/fork()` all funnel
+ *    through `AgentSessionRuntime.teardownCurrent()`, which does
+ *    `await session.abort()` then `session.dispose()` — anything hosted by pi's
+ *    live session is killed when you navigate away. Agent Views never calls
+ *    those APIs, so switching between agents interrupts nothing.
  *
- * Layout: a list widget above the editor. The transcript is pi's own.
+ * 2. Native rendering. Agent output is mirrored into pi's own transcript as
+ *    custom entries (`pi.appendEntry` + `pi.registerEntryRenderer`) rendered
+ *    with pi's real components — `UserMessageComponent`,
+ *    `AssistantMessageComponent` (markdown, thinking blocks) and
+ *    `ToolExecutionComponent` (tool call/result boxes). Nothing about a
+ *    transcript is drawn in a widget; the widget is only the agent picker.
+ *
+ * 3. Separation. The main session and every agent are independent
+ *    conversations, so a view shows exactly one of them. pi appends everything
+ *    to one chat container and persisted custom entries cannot be removed, so
+ *    both directions are filtered at render time: an agent's entries draw only
+ *    while that agent is attached, and while attached pi's own chat children
+ *    draw nothing (see transcript-view.ts). Nothing is deleted — detaching
+ *    restores the main transcript, including what it streamed meanwhile — and
+ *    mirror progress is kept per agent so re-attaching never duplicates.
  *
  *   ┌────────────────────────────┐
- *   │ ◆ Agents   (list widget)   │   ← only while the list is open
+ *   │ transcript                 │  ← the main session's, or one agent's;
+ *   │  ▸ you: …                  │    nothing is injected, an agent view
+ *   │  ⏵ bash(…)                 │    reads like a fresh session
  *   ├────────────────────────────┤
- *   │ transcript (pi native)     │
- *   ├────────────────────────────┤
+ *   │ ◆ Agents (picker widget)   │  ← only while the picker is open
+ *   ├──────────────── ◆ main ────┤  ← current view, on the editor frame
  *   │ editor  /  footer          │
  *   └────────────────────────────┘
  *
  * Keys
- *   ←            open/close the list (empty editor only)
- *   ↑ ↓          move selection (empty editor only)
- *   Enter / →    attach to the selected agent
- *   Enter + text spawn a new agent with that text as its first prompt
- *   Ctrl+X       abort the selected agent's current turn
- *   ? / Esc      help / close
+ *   ←              open/close the agent picker (empty editor only)
+ *   ↑ ↓            move selection (empty editor only)
+ *   Enter / →      attach: stream that agent into the transcript
+ *   Enter + text   picker open: new agent with that first prompt
+ *                  attached:    steer the attached agent
+ *   Esc            detach (agent keeps running)
+ *   Ctrl+X         abort that agent's turn
+ *   ?              help
  *
  * Commands
- *   /agent <task>   spawn a background agent and hand it <task>, without
- *                   leaving the current agent or interrupting it.
+ *   /agent <task>   start a background agent without leaving or interrupting
+ *                   the session you are in
  *
- * Storage: sub-agent sessions live in
+ * Storage: agent sessions live in
  *   <sessionDir>/__agents__/<rootId>/<agentId>.jsonl
  * with a sibling manifest.json. That directory is not scanned by
- * SessionManager.list(), so sub-agents stay out of /resume.
+ * SessionManager.list(), so agents stay out of /resume. Agents are named after
+ * their first prompt, slugified to letters and hyphens (see storage.ts).
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  AssistantMessageComponent,
   CustomEditor,
+  getMarkdownTheme,
   SessionManager,
+  ToolExecutionComponent,
+  UserMessageComponent,
   type ExtensionAPI,
-  type ExtensionCommandContext,
   type ExtensionContext,
-  type LiveSessionInfo,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import {
+  matchesKey,
+  truncateToWidth,
+  visibleWidth,
+  wrapTextWithAnsi,
+  type Component,
+  type TUI,
+} from "@earendil-works/pi-tui";
+import {
+  abortAgent,
+  disposeAll,
+  ensureAgent,
+  getAgent,
+  isLoadingSubAgent,
+  readTranscript,
+  runAgent,
+  setOnChange,
+  steerAgent,
+} from "./agent-runtime.ts";
+import {
+  agentName,
+  listAgentEntries,
+  registerAgent,
+  resolveRoot,
+  ROOT_AGENT_NAME,
+  type RootCtx,
+} from "./storage.ts";
+import { findChatContainer, installChatFilter, type RenderNode } from "./transcript-view.ts";
+import {
+  attachTo,
+  buildRows,
+  isVisible,
+  moveSelection,
+  noteMirrored,
+  reconcileSelection,
+  selectedRow,
+  syncMirror,
+  type AgentRow,
+  type AgentState,
+  type ItemRef,
+  type MirrorState,
+  type Selection,
+} from "./view-model.ts";
 
-// ── Storage ────────────────────────────────────────────────────────
+// Storage and view logic live in storage.ts / view-model.ts so they can be unit
+// tested without a terminal. This file is rendering and key handling only.
 
-interface AgentEntry {
-  id: string;
-  name: string;
-  file: string;
-  createdAt: string;
-}
-
-interface AgentManifest {
-  rootId: string;
-  rootFile: string;
-  agents: AgentEntry[];
-}
-
-const AGENTS_DIR = "__agents__";
-
-const groupDir = (sessionDir: string, rootId: string) => path.join(sessionDir, AGENTS_DIR, rootId);
-const manifestFile = (sessionDir: string, rootId: string) => path.join(groupDir(sessionDir, rootId), "manifest.json");
-
-function loadManifest(sessionDir: string, rootId: string): AgentManifest | null {
-  try {
-    return JSON.parse(fs.readFileSync(manifestFile(sessionDir, rootId), "utf-8")) as AgentManifest;
-  } catch {
-    return null;
-  }
-}
-
-function saveManifest(sessionDir: string, m: AgentManifest): void {
-  fs.mkdirSync(groupDir(sessionDir, m.rootId), { recursive: true });
-  fs.writeFileSync(manifestFile(sessionDir, m.rootId), JSON.stringify(m, null, 2));
-}
-
-/** Root context: the top-level session that owns a group of agents. */
-interface RootCtx {
-  rootId: string;
-  rootFile: string;
-  sessionDir: string;
-}
-
-/**
- * Resolve the owning root regardless of which agent is currently active.
- *
- * Sub-agent files live at `<sessionDir>/__agents__/<rootId>/<id>.jsonl`, so we
- * can recover the root from the path alone. That makes every command work the
- * same whether you run it from the root agent or from a sub-agent.
- */
-function resolveRoot(ctx: ExtensionContext): RootCtx | null {
-  const file = ctx.sessionManager.getSessionFile();
-  if (!file) return null;
-
-  const marker = `${path.sep}${AGENTS_DIR}${path.sep}`;
-  const at = file.indexOf(marker);
-  if (at < 0) {
-    return { rootId: ctx.sessionManager.getSessionId(), rootFile: file, sessionDir: path.dirname(file) };
-  }
-
-  const sessionDir = file.slice(0, at);
-  const rootId = file.slice(at + marker.length).split(path.sep)[0]!;
-  const manifest = loadManifest(sessionDir, rootId);
-  if (!manifest) return null;
-  return { rootId, rootFile: manifest.rootFile, sessionDir };
-}
-
-function registerAgent(root: RootCtx, name: string, cwd: string): string {
-  const dir = groupDir(root.sessionDir, root.rootId);
-  fs.mkdirSync(dir, { recursive: true });
-  const sm = SessionManager.create(cwd, dir, { parentSession: root.rootFile });
-  const file = sm.getSessionFile();
-  if (!file) throw new Error("agent session is not persisted");
-
-  const m = loadManifest(root.sessionDir, root.rootId) ?? {
-    rootId: root.rootId,
-    rootFile: root.rootFile,
-    agents: [],
-  };
-  m.agents.push({ id: sm.getSessionId(), name, file, createdAt: new Date().toISOString() });
-  saveManifest(root.sessionDir, m);
-
-  // Name it up front so it shows up correctly in the list and in /resume-style
-  // pickers without waiting for a first response.
-  sm.appendSessionInfo(name);
-  return file;
-}
-
-// ── Agent list model ───────────────────────────────────────────────
-
-type AgentState = "working" | "idle" | "completed" | "failed";
-
-interface AgentRow {
-  key: string;
-  name: string;
-  isRoot: boolean;
-  isActive: boolean;
-  state: AgentState;
-  messageCount: number;
-  lastModified: Date;
-  summary?: string;
-  model?: string;
-}
-
-/** Read display info for an agent from its session file. */
-function readAgentFile(file: string): Pick<AgentRow, "messageCount" | "lastModified" | "summary" | "model"> & {
-  fileState: AgentState;
-} {
-  const fallback = { messageCount: 0, lastModified: new Date(0), fileState: "idle" as AgentState };
-  try {
-    const sm = SessionManager.open(file);
-    const branch = sm.getBranch();
-    const messageCount = sm.getEntries().filter((e) => e.type === "message").length;
-
-    let model: string | undefined;
-    let summary: string | undefined;
-    let fileState: AgentState = "idle";
-
-    for (let i = branch.length - 1; i >= 0; i--) {
-      const entry = branch[i];
-      if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-      const msg = entry.message;
-      model ??= msg.model;
-      if (msg.stopReason === "error" || msg.errorMessage) fileState = "failed";
-      else if (fileState === "idle") fileState = "completed";
-      if (!summary) {
-        for (const part of msg.content ?? []) {
-          if (part.type === "text" && part.text) {
-            summary = part.text.replace(/\s+/g, " ").trim().slice(0, 300);
-            break;
-          }
-        }
-      }
-      break;
-    }
-
-    return { messageCount, lastModified: fs.statSync(file).mtime, summary, model, fileState };
-  } catch {
-    return fallback;
-  }
-}
-
-function buildRows(root: RootCtx, live: LiveSessionInfo[], cwd: string): AgentRow[] {
-  const liveByKey = new Map(live.map((s) => [s.key, s]));
-  const manifest = loadManifest(root.sessionDir, root.rootId);
-
-  const make = (file: string, name: string, isRoot: boolean): AgentRow => {
-    const info = readAgentFile(file);
-    const liveInfo = liveByKey.get(file);
-    return {
-      key: file,
-      name,
-      isRoot,
-      isActive: liveInfo?.active === true,
-      // A live streaming session is authoritatively "working"; otherwise fall
-      // back to what its transcript says.
-      state: liveInfo?.isStreaming ? "working" : info.fileState,
-      messageCount: info.messageCount,
-      lastModified: info.lastModified,
-      summary: info.summary,
-      model: info.model,
-    };
-  };
-
-  const rootName = liveByKey.get(root.rootFile)?.name ?? "Main";
-  const rows = [make(root.rootFile, rootName, true)];
-  for (const agent of manifest?.agents ?? []) {
-    if (!fs.existsSync(agent.file)) continue;
-    rows.push(make(agent.file, agent.name, false));
-  }
-
-  // Group order mirrors the rendered order so the selection index always
-  // matches the visible row.
-  const order: AgentState[] = ["working", "failed", "idle", "completed"];
-  return rows.sort((a, b) => {
-    const d = order.indexOf(a.state) - order.indexOf(b.state);
-    return d !== 0 ? d : b.lastModified.getTime() - a.lastModified.getTime();
-  });
+function rootOf(ctx: ExtensionContext): RootCtx | null {
+  return resolveRoot(ctx.sessionManager.getSessionFile(), ctx.sessionManager.getSessionId());
 }
 
 // ── View state (survives per-session extension reloads) ────────────
 
-interface ViewState {
+interface ViewState extends MirrorState, Selection {
+  /** Picker widget visible. */
   open: boolean;
   showHelp: boolean;
   rows: AgentRow[];
-  selected: number;
-  scroll: number;
   refresh?: () => void;
-  timer?: NodeJS.Timeout;
+  /** Removes the chat-container render filter (see transcript-view.ts). */
+  unfilter?: () => void;
 }
 
 const VIEW_KEY = "__piAgentViewsState";
@@ -244,12 +140,149 @@ const VIEW_KEY = "__piAgentViewsState";
 function getView(): ViewState {
   const g = globalThis as Record<string, unknown>;
   if (!g[VIEW_KEY]) {
-    g[VIEW_KEY] = { open: false, showHelp: false, rows: [], selected: 0, scroll: 0 } satisfies ViewState;
+    g[VIEW_KEY] = { open: false, showHelp: false, mirrored: {}, rows: [], selected: 0, scroll: 0 } satisfies ViewState;
   }
-  return g[VIEW_KEY] as ViewState;
+  const view = g[VIEW_KEY] as ViewState;
+  // Older builds stored a single counter; normalise so a reload cannot crash.
+  if (typeof view.mirrored !== "object" || view.mirrored === null) view.mirrored = {};
+  return view;
 }
 
-// ── Rendering ──────────────────────────────────────────────────────
+// ── Native transcript rendering ────────────────────────────────────
+
+const ITEM_ENTRY = "agent-view-item";
+const OWNED_ENTRIES: ReadonlySet<string> = new Set([ITEM_ENTRY]);
+
+function synthesizeAssistantMessage(text: string): AssistantMessage {
+  return {
+    role: "assistant",
+    content: text ? [{ type: "text", text }] : [],
+    api: "messages",
+    provider: "unknown",
+    model: "",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "pending",
+    timestamp: Date.now(),
+  } as AssistantMessage;
+}
+
+/**
+ * Renders one agent transcript item using pi's own message components, so an
+ * agent's output is indistinguishable from a normal pi session's.
+ */
+class AgentItemComponent implements Component {
+  private user?: UserMessageComponent;
+  private assistant?: AssistantMessageComponent;
+  private tool?: ToolExecutionComponent;
+  private lastSignature = "";
+
+  constructor(
+    private readonly ref: ItemRef,
+    private readonly theme: Theme,
+    private readonly outputPad: number,
+    private readonly tui: TUI | undefined,
+    private readonly cwd: string,
+    /** Entries are persisted forever; only the attached agent may draw. */
+    private readonly visible: (file: string) => boolean,
+  ) {}
+
+  invalidate(): void {
+    this.user?.invalidate?.();
+    this.assistant?.invalidate();
+    this.tool?.invalidate();
+  }
+
+  render(width: number): string[] {
+    if (!this.visible(this.ref.file)) return [];
+    const items = readTranscript(this.ref.file);
+    const item = items[this.ref.index];
+    if (!item) return [];
+
+    switch (item.kind) {
+      case "user": {
+        this.user ??= new UserMessageComponent(item.text, getMarkdownTheme(), this.outputPad);
+        return this.user.render(width);
+      }
+
+      case "assistant": {
+        this.assistant ??= new AssistantMessageComponent(
+          undefined,
+          false,
+          getMarkdownTheme(),
+          undefined,
+          this.outputPad,
+        );
+        const signature = `${item.text.length}:${item.streaming}`;
+        if (signature !== this.lastSignature) {
+          this.lastSignature = signature;
+          this.assistant.updateContent(item.message ?? synthesizeAssistantMessage(item.text), item.streaming);
+        }
+        return this.assistant.render(width);
+      }
+
+      case "thinking": {
+        const out: string[] = [];
+        for (const raw of item.text.split("\n")) {
+          for (const line of wrapTextWithAnsi(raw, Math.max(20, width - 4))) {
+            out.push(`  ${this.theme.fg("dim", line)}`);
+          }
+        }
+        return out;
+      }
+
+      case "toolCall": {
+        if (!this.tui) {
+          return [truncateToWidth(`  ${this.theme.fg("warning", `⏵ ${item.name}`)}`, width)];
+        }
+        if (!this.tool) {
+          this.tool = new ToolExecutionComponent(
+            item.name,
+            item.id,
+            item.args,
+            undefined,
+            undefined,
+            this.tui,
+            this.cwd,
+          );
+          this.tool.setArgsComplete();
+          this.tool.markExecutionStarted();
+        }
+        // Pair the call with its result so pi renders the usual call+result box.
+        const result = items.find((it) => it.kind === "toolResult" && it.toolCallId === item.id);
+        if (result && result.kind === "toolResult") {
+          this.tool.updateResult(
+            { content: result.content, details: result.details, isError: result.isError },
+            false,
+          );
+        }
+        return this.tool.render(width);
+      }
+
+      // Results are rendered together with their call.
+      case "toolResult":
+        return [];
+
+      case "error": {
+        const out: string[] = [];
+        for (const raw of item.text.split("\n")) {
+          for (const line of wrapTextWithAnsi(raw, Math.max(20, width - 4))) {
+            out.push(`  ${this.theme.fg("error", line)}`);
+          }
+        }
+        return out;
+      }
+    }
+  }
+}
+
+// ── Picker rendering ───────────────────────────────────────────────
 
 const STATE_LABEL: Record<AgentState, string> = {
   working: "Working",
@@ -258,19 +291,18 @@ const STATE_LABEL: Record<AgentState, string> = {
   completed: "Completed",
 };
 
-function relativeTime(d: Date): string {
-  const s = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.floor(s / 60)}m`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h`;
-  return `${Math.floor(s / 86400)}d`;
-}
-
 function clip(s: string, n: number): string {
   return s.length <= n ? s : `${s.slice(0, Math.max(1, n - 1))}…`;
 }
 
-function renderList(view: ViewState, th: Theme, width: number): string[] {
+/** Border characters kept to the right of the editor's view label. */
+const LABEL_TAIL = 4;
+
+function viewportRows(): number {
+  return Math.max(3, Math.floor((process.stdout.rows || 30) / 2) - 4);
+}
+
+function renderPicker(view: ViewState, th: Theme, width: number): string[] {
   if (!view.open) return [];
   const out: string[] = [];
   const rule = th.fg("dim", "─".repeat(Math.max(4, Math.min(width - 4, 100))));
@@ -280,11 +312,12 @@ function renderList(view: ViewState, th: Theme, width: number): string[] {
     out.push(truncateToWidth(`  ${rule}`, width));
     for (const [k, d] of [
       ["↑ ↓", "Select agent"],
-      ["Enter / →", "Attach to selected agent"],
-      ["Enter + text", "Spawn a new agent with that prompt"],
-      ["Ctrl+X", "Abort the selected agent's turn"],
-      ["← / Esc", "Close"],
-      ["/agent <task>", "Spawn a background agent without leaving this one"],
+      ["Enter / →", "Attach: stream it into the transcript"],
+      ["Enter + text", "New agent (picker) · steer (attached)"],
+      ["Esc", "Detach (agent keeps running)"],
+      ["Ctrl+X", "Abort that agent's turn"],
+      ["←", "Close the picker (reopen to refresh the list)"],
+      ["/agent <task>", "Start a background agent"],
     ] as const) {
       out.push(truncateToWidth(`    ${th.fg("accent", k.padEnd(15))}${th.fg("text", d)}`, width));
     }
@@ -299,7 +332,10 @@ function renderList(view: ViewState, th: Theme, width: number): string[] {
   out.push(truncateToWidth(`  ${title}  ${count}${busy}`, width));
   out.push(truncateToWidth(`  ${rule}`, width));
 
-  const maxRows = Math.max(3, (process.stdout.rows || 30) - 16);
+  // The cursor is the *agent* it is on, so it cannot drift onto a neighbour
+  // when a state change re-sorts the list between refreshes.
+  const cursor = view.rows.findIndex((r) => r.key === view.key);
+  const maxRows = viewportRows();
   if (view.scroll > 0) out.push(truncateToWidth(th.fg("dim", `  ↑ ${view.scroll} more`), width));
 
   const end = Math.min(view.scroll + maxRows, view.rows.length);
@@ -322,20 +358,18 @@ function renderList(view: ViewState, th: Theme, width: number): string[] {
             ? th.fg("success", "✓")
             : th.fg("dim", "∙");
 
-    const pointer = i === view.selected ? th.fg("accent", " ▸ ") : "   ";
-    const name = clip(row.name || "(unnamed)", 40);
-    const nameStr = i === view.selected ? th.fg("accent", name) : th.fg("text", name);
-    const tags =
-      (row.isRoot ? th.fg("dim", " [main]") : "") + (row.isActive ? th.fg("success", " (attached)") : "");
-    const time = th.fg("dim", relativeTime(row.lastModified));
-
-    const left = pointer + icon + " " + nameStr + tags;
-    const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(time) - 2);
-    out.push(truncateToWidth(left + " ".repeat(gap) + time, width));
+    const pointer = i === cursor ? th.fg("accent", " ▸ ") : "   ";
+    const name = clip(row.name || "(unnamed)", 48);
+    const nameStr = i === cursor ? th.fg("accent", name) : th.fg("text", name);
+    // The state icon + group header already say everything about the agent's
+    // status, so no "(live)" tag and no ticking mtime column.
+    // No "[main]" tag: the root session is just the agent called "main".
+    const tags = row.isAttached ? th.fg("success", " (attached)") : "";
+    out.push(truncateToWidth(`${pointer}${icon} ${nameStr}${tags}`, width));
 
     const meta = th.fg("muted", `${row.messageCount} msg${row.messageCount === 1 ? "" : "s"}`);
     const model = row.model ? th.fg("dim", ` · ${clip(row.model, 28)}`) : "";
-    const summary = row.summary ? th.fg("dim", `  ${clip(row.summary, Math.max(10, width - 46))}`) : "";
+    const summary = row.summary ? th.fg("dim", `  ${clip(row.summary, Math.max(10, width - 24))}`) : "";
     out.push(truncateToWidth(`     ${meta}${model}${summary}`, width));
   }
 
@@ -356,11 +390,13 @@ function renderList(view: ViewState, th: Theme, width: number): string[] {
 // ── Editor ─────────────────────────────────────────────────────────
 
 type Action =
-  | { t: "open" }
-  | { t: "close" }
+  | { t: "openPicker" }
+  | { t: "closePicker" }
   | { t: "help" }
   | { t: "attach"; key: string }
+  | { t: "detach" }
   | { t: "spawn"; prompt: string }
+  | { t: "steer"; key: string; text: string }
   | { t: "abort"; key: string };
 
 class AgentViewEditor extends CustomEditor {
@@ -370,8 +406,43 @@ class AgentViewEditor extends CustomEditor {
     kb: ConstructorParameters<typeof CustomEditor>[2],
     private readonly view: ViewState,
     private readonly act: (a: Action) => void,
+    /**
+     * Current view's name for the right end of the top border, as plain text:
+     * it is drawn in the editor's own border color.
+     */
+    private readonly label: () => string | undefined,
   ) {
     super(tui, theme, kb, { embedWorkingStatus: true });
+  }
+
+  /**
+   * Show which conversation the editor is talking to on the editor frame
+   * itself, so the transcript can stay exactly as clean as a normal session's.
+   *
+   * The label is inset from the right end — "──── ◆ main ────" — and is dropped
+   * entirely when the frame is too narrow to keep the working status readable.
+   */
+  protected override renderTopBorder(width: number, hiddenLineCount: number): string {
+    const border = super.renderTopBorder(width, hiddenLineCount);
+    const text = this.label();
+    if (!text) return border;
+    const labelWidth = visibleWidth(text);
+    if (labelWidth + LABEL_TAIL + 12 > width) return border;
+    // `truncateToWidth` appends "..." unless the ellipsis is disabled, and a
+    // border must be cut, not elided.
+    return (
+      truncateToWidth(border, width - labelWidth - LABEL_TAIL, "") +
+      this.borderColor(text + "─".repeat(LABEL_TAIL))
+    );
+  }
+
+  /**
+   * The agent the user is looking at. Resolved by key, never by row index: the
+   * list is re-sorted whenever an agent changes state, so an index captured at
+   * render time can point at a different agent by the time a key is pressed.
+   */
+  private row(): AgentRow | undefined {
+    return selectedRow(this.view.rows, this.view);
   }
 
   override handleInput(data: string): void {
@@ -381,35 +452,52 @@ class AgentViewEditor extends CustomEditor {
     // ← on an empty editor is the single entry point.
     if (!view.open) {
       if (empty && matchesKey(data, "left")) {
-        this.act({ t: "open" });
+        this.act({ t: "openPicker" });
         return;
+      }
+      if (view.attached) {
+        if (empty && matchesKey(data, "escape")) {
+          this.act({ t: "detach" });
+          return;
+        }
+        if (empty && matchesKey(data, "ctrl+x")) {
+          this.act({ t: "abort", key: view.attached });
+          return;
+        }
+        if (matchesKey(data, "return") || matchesKey(data, "enter")) {
+          const text = this.getText().trim();
+          if (text) {
+            this.setText("");
+            this.act({ t: "steer", key: view.attached, text });
+            return;
+          }
+        }
       }
       super.handleInput(data);
       return;
     }
 
-    if (empty && (matchesKey(data, "left") || matchesKey(data, "escape"))) {
-      this.act(view.showHelp ? { t: "help" } : { t: "close" });
-      return;
-    }
     if (empty && data === "?") {
       this.act({ t: "help" });
       return;
     }
+    if (empty && (matchesKey(data, "left") || matchesKey(data, "escape"))) {
+      this.act(view.showHelp ? { t: "help" } : { t: "closePicker" });
+      return;
+    }
     if (empty && matchesKey(data, "ctrl+x")) {
-      const row = view.rows[view.selected];
+      const row = this.row();
       if (row) this.act({ t: "abort", key: row.key });
       return;
     }
 
-    // ↑/↓ drive the list only while the editor is empty, so prompt history
+    // ↑/↓ drive the picker only while the editor is empty, so prompt history
     // still works as soon as you start typing.
     if (empty && (matchesKey(data, "up") || matchesKey(data, "down"))) {
-      const delta = matchesKey(data, "up") ? -1 : 1;
-      view.selected = Math.max(0, Math.min(view.rows.length - 1, view.selected + delta));
-      const maxRows = Math.max(3, (process.stdout.rows || 30) - 16);
-      if (view.selected < view.scroll) view.scroll = view.selected;
-      else if (view.selected >= view.scroll + maxRows) view.scroll = view.selected - maxRows + 1;
+      const next = moveSelection(view.rows, view, matchesKey(data, "up") ? -1 : 1, viewportRows());
+      view.selected = next.selected;
+      view.scroll = next.scroll;
+      view.key = next.key;
       view.refresh?.();
       return;
     }
@@ -420,15 +508,15 @@ class AgentViewEditor extends CustomEditor {
         this.setText("");
         this.act({ t: "spawn", prompt: text });
       } else {
-        const row = view.rows[view.selected];
-        if (row) this.act(row.isActive ? { t: "close" } : { t: "attach", key: row.key });
+        const row = this.row();
+        if (row) this.act(row.isRoot ? { t: "detach" } : { t: "attach", key: row.key });
       }
       return;
     }
 
     if (empty && matchesKey(data, "right")) {
-      const row = view.rows[view.selected];
-      if (row) this.act(row.isActive ? { t: "close" } : { t: "attach", key: row.key });
+      const row = this.row();
+      if (row) this.act(row.isRoot ? { t: "detach" } : { t: "attach", key: row.key });
       return;
     }
 
@@ -439,188 +527,335 @@ class AgentViewEditor extends CustomEditor {
 // ── Extension ──────────────────────────────────────────────────────
 
 export default function agentViews(pi: ExtensionAPI): void {
-  const view = getView();
+  // Sub-agents load resources with `noExtensions`, but guard anyway: this
+  // factory must never run inside an agent session being constructed.
+  if (isLoadingSubAgent()) return;
 
-  function close(ctx: ExtensionContext): void {
+  const view = getView();
+  /** Captured from the (invisible) tick widget so components can request renders. */
+  let tui: TUI | undefined;
+  let outputPad = 0;
+
+  /**
+   * Custom entries are persisted and can never be removed, so every agent's
+   * items stay in pi's transcript for good. Visibility is what separates the
+   * agents: an entry draws itself only while its own agent is attached, which
+   * is why detaching to the main session (or switching agents) leaves no
+   * foreign output behind, even for an agent that is still working.
+   */
+  const visible = (file: string) => isVisible(view, file);
+
+  /**
+   * The other half of the separation: while an agent is attached, pi's own chat
+   * children (the main session's messages, notices, errors — anything pi
+   * appends itself) must not draw into the agent's view. `installChatFilter`
+   * makes pi's chat container render only this extension's entries for as long
+   * as `view.attached` is set. Nothing is deleted: detaching restores the main
+   * transcript exactly as pi built it.
+   */
+  function ensureChatFilter(): void {
+    if (view.unfilter) return;
+    const chat = findChatContainer(tui as unknown as RenderNode | undefined, OWNED_ENTRIES);
+    if (!chat) return;
+    view.unfilter = installChatFilter(chat, () => view.attached !== undefined, OWNED_ENTRIES);
+    // The current frame may already have drawn the unfiltered container.
+    tui?.requestRender(true);
+  }
+
+  /** Toggle between the main transcript and an agent transcript. */
+  function redrawTranscript(): void {
+    ensureChatFilter();
+    // Force a full repaint: the visible transcript is replaced wholesale, not
+    // appended to, so a differential frame would leave the old view behind.
+    tui?.requestRender(true);
+  }
+
+  // Agent output is rendered by pi, through these renderers.
+  pi.registerEntryRenderer<ItemRef>(ITEM_ENTRY, (entry, options, theme) =>
+    entry.data
+      ? new AgentItemComponent(entry.data, theme, outputPad, tui, process.cwd(), visible)
+      : undefined,
+  );
+
+  function nameOf(file: string): string {
+    const row = view.rows.find((r) => r.key === file);
+    if (row) return row.name;
+    try {
+      return SessionManager.open(file).getSessionName() ?? path.basename(file);
+    } catch {
+      return path.basename(file);
+    }
+  }
+
+  /** Append any agent transcript items that pi has not rendered yet. */
+  function mirror(): void {
+    syncMirror(view, (ref) => pi.appendEntry<ItemRef>(ITEM_ENTRY, ref));
+    tui?.requestRender();
+  }
+
+  /**
+   * Rebuild mirror progress from what pi already has in this session.
+   *
+   * A resumed session still holds every entry appended by earlier attachments,
+   * so mirroring must resume after them instead of appending the whole
+   * transcript a second time.
+   */
+  function restoreFromSession(ctx: ExtensionContext): void {
+    view.mirrored = {};
+    try {
+      for (const entry of ctx.sessionManager.getEntries()) {
+        if (entry.type !== "custom" || entry.customType !== ITEM_ENTRY) continue;
+        const ref = entry.data as ItemRef | undefined;
+        if (ref?.file) noteMirrored(view, ref.file, ref.index + 1);
+      }
+    } catch {
+      /* best effort: a missing session just replays from scratch */
+    }
+  }
+
+  function closePicker(ctx: ExtensionContext): void {
     view.open = false;
     view.showHelp = false;
-    if (view.timer) {
-      clearInterval(view.timer);
-      view.timer = undefined;
-    }
     ctx.ui.setWidget("agent-views", undefined);
   }
 
-  function open(ctx: ExtensionCommandContext): void {
-    const root = resolveRoot(ctx);
-    if (!root) {
+  /**
+   * Rebuild the picker rows.
+   *
+   * Deliberately *not* on a timer: building rows stats every agent file and
+   * re-sorts by state, so a periodic refresh both burned I/O and reshuffled the
+   * list under the cursor while you were choosing. Rows are a snapshot, taken
+   * when the list is about to be shown or when this extension itself changed
+   * the agent set. The cursor is key-anchored anyway (`reconcileSelection`), so
+   * a snapshot is safe to act on.
+   */
+  function reloadRows(ctx: ExtensionContext): void {
+    const root = rootOf(ctx);
+    if (!root) return;
+    view.rows = buildRows({
+      rootFile: root.rootFile,
+      rootName: ROOT_AGENT_NAME,
+      rootBusy: !ctx.isIdle(),
+      agents: listAgentEntries(root, (f) => getAgent(f) !== undefined),
+      attached: view.attached,
+    });
+    const next = reconcileSelection(view.rows, view, viewportRows());
+    view.selected = next.selected;
+    view.scroll = next.scroll;
+    view.key = next.key;
+  }
+
+  /** Refresh the rows only if the user is actually looking at them. */
+  function refreshRowsIfOpen(ctx: ExtensionContext): void {
+    if (!view.open) return;
+    reloadRows(ctx);
+    view.refresh?.();
+  }
+
+  function openPicker(ctx: ExtensionContext): void {
+    if (!rootOf(ctx)) {
       ctx.ui.notify("Agents need a saved session", "error");
       return;
     }
 
-    const reload = () => {
-      view.rows = buildRows(root, ctx.listLiveSessions(), ctx.cwd);
-      view.selected = Math.max(0, Math.min(view.selected, view.rows.length - 1));
-    };
-
-    reload();
-    // Keep the selection on the attached agent when first opening.
-    const attached = view.rows.findIndex((r) => r.isActive);
-    if (attached >= 0) view.selected = attached;
     view.scroll = 0;
+    reloadRows(ctx);
+    // Open on the attached agent when there is one.
+    const attached = view.rows.find((r) => r.isAttached);
+    if (attached) {
+      view.key = attached.key;
+      reloadRows(ctx);
+    }
     view.showHelp = false;
     view.open = true;
 
-    ctx.ui.setWidget("agent-views", (tui, theme) => {
-      view.refresh = () => tui.requestRender();
-      return {
-        render: (w: number) => renderList(view, theme, w),
-        invalidate: () => {},
-      };
-    });
-
-    // Background agents change state on their own, so poll while open.
-    if (view.timer) clearInterval(view.timer);
-    view.timer = setInterval(() => {
-      if (!view.open) return;
-      reload();
-      view.refresh?.();
-    }, 1500);
+    ctx.ui.setWidget("agent-views", (_tui, theme) => ({
+      render: (w: number) => renderPicker(view, theme, w),
+      invalidate: () => {},
+    }));
   }
 
-  /** Bring an agent to the foreground, reviving it from disk if needed. */
-  async function attach(ctx: ExtensionCommandContext, key: string): Promise<void> {
-    const live = ctx.listLiveSessions();
-    if (!live.some((s) => s.key === key)) {
-      // Not running in this process yet (e.g. created in an earlier pi run).
-      await ctx.spawnSession({ sessionFile: key });
+  /**
+   * Attach: stream an agent's output into pi's transcript. Only rendering
+   * changes — the agent keeps running and pi's own session is untouched.
+   */
+  async function attach(ctx: ExtensionContext, file: string): Promise<void> {
+    // A just-spawned agent is live before pi flushes its session file.
+    if (!getAgent(file) && !fs.existsSync(file)) {
+      ctx.ui.notify("That agent's session file is gone", "error");
+      return;
     }
-    close(ctx);
-    // Nothing is torn down: whatever we were looking at keeps running.
-    if (!(await ctx.activateSession(key))) {
-      ctx.ui.notify("Could not attach to that agent", "error");
+    if (view.attached === file) {
+      closePicker(ctx);
+      return;
     }
+    try {
+      await ensureAgent(file, ctx.cwd, ctx.model, ctx.thinkingLevel);
+    } catch (err) {
+      ctx.ui.notify(`Could not open agent: ${String(err)}`, "error");
+      return;
+    }
+    if (view.attached) detach();
+
+    attachTo(view, file);
+    closePicker(ctx);
+    // Nothing is injected into the agent's transcript: it reads exactly like a
+    // fresh session. Which agent you are looking at is shown on the editor.
+    mirror();
+    redrawTranscript();
   }
 
+  /**
+   * Detach: stop showing the agent. Its entries stay in pi's session but render
+   * nothing, so the main session's transcript is its own again even if the
+   * agent keeps streaming.
+   */
+  function detach(): void {
+    if (!view.attached) return;
+    attachTo(view, undefined);
+    redrawTranscript();
+  }
+
+  /**
+   * Create a new agent and hand it the prompt. Returns as soon as the turn is
+   * queued: the session you are in is never blocked or interrupted.
+   */
   async function spawn(
-    ctx: ExtensionCommandContext,
+    ctx: ExtensionContext,
     prompt: string,
     options: { attach: boolean },
   ): Promise<string | undefined> {
-    const root = resolveRoot(ctx);
+    const root = rootOf(ctx);
     if (!root) {
       ctx.ui.notify("Agents need a saved session", "error");
       return undefined;
     }
 
-    const name = prompt.length > 48 ? `${prompt.slice(0, 48)}…` : prompt;
+    const existing = listAgentEntries(root, (f) => getAgent(f) !== undefined);
+    const name = agentName(prompt, existing.map((a) => a.name));
     const file = registerAgent(root, name, ctx.cwd);
-    const { key } = await ctx.spawnSession({ sessionFile: file, parentSession: root.rootFile });
-
-    // Give it the task. This returns as soon as the turn is queued, so the
-    // agent we are sitting in is never blocked or interrupted.
-    await ctx.promptLiveSession(key, prompt);
-
-    if (options.attach) await attach(ctx, key);
-    return key;
+    try {
+      await runAgent(file, prompt, ctx.cwd, ctx.model, ctx.thinkingLevel);
+    } catch (err) {
+      ctx.ui.notify(`Could not start agent: ${String(err)}`, "error");
+      return undefined;
+    }
+    if (options.attach) await attach(ctx, file);
+    // A new agent changes the list; only rebuild it if it is on screen.
+    else refreshRowsIfOpen(ctx);
+    return file;
   }
 
   // ── Commands ───────────────────────────────────────────────────
   //
   // Extension commands execute immediately even while the agent is streaming,
-  // which is what lets these run without interrupting the current turn.
+  // so they never have to interrupt a turn.
 
   pi.registerCommand("agent", {
-    description: "Spawn a background agent for a task — /agent <task>",
+    description: "Start a background agent for a task — /agent <task>",
     handler: async (args, ctx) => {
       const task = args.trim();
       if (!task) {
         ctx.ui.notify("Usage: /agent <task>", "error");
         return;
       }
-      const key = await spawn(ctx, task, { attach: false });
-      if (!key) return;
-      ctx.ui.notify("Agent started in the background. Press ← to see it.", "info");
-      if (view.open) open(ctx);
+      const file = await spawn(ctx, task, { attach: false });
+      if (file) ctx.ui.notify("Agent started in the background. Press ← to see it.", "info");
     },
   });
 
-  pi.registerCommand("__av-attach", {
-    description: "(internal) attach to an agent",
-    handler: async (args, ctx) => {
-      const key = args.trim();
-      if (key) await attach(ctx, key);
-    },
-  });
+  // ── Wiring ─────────────────────────────────────────────────────
 
-  pi.registerCommand("__av-spawn", {
-    description: "(internal) spawn an agent and attach",
-    handler: async (args, ctx) => {
-      const prompt = args.trim();
-      if (prompt) await spawn(ctx, prompt, { attach: true });
-    },
-  });
-
-  pi.registerCommand("__av-abort", {
-    description: "(internal) abort an agent's turn",
-    handler: async (args, ctx) => {
-      const key = args.trim();
-      if (!key) return;
-      if (await ctx.abortLiveSession(key)) {
-        ctx.ui.notify("Aborted", "info");
-        if (view.open) open(ctx);
-      }
-    },
-  });
-
-  pi.registerCommand("__av-open", {
-    description: "(internal) open the agent list",
-    handler: async (_args, ctx) => {
-      if (view.open) close(ctx);
-      else open(ctx);
-    },
-  });
-
-  // ── Editor ─────────────────────────────────────────────────────
-
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     if (ctx.mode !== "tui") return;
 
-    // The widget belongs to whichever session is active, so drop it on rebind.
-    view.open = false;
-    if (view.timer) {
-      clearInterval(view.timer);
-      view.timer = undefined;
-    }
-    ctx.ui.setWidget("agent-views", undefined);
+    // A reload rebuilds the extension runtime but keeps the session, its chat
+    // container and everything already mirrored into it, so the view survives:
+    // reloading while attached must not silently drop you back on "main".
+    const reloaded = event.reason === "reload";
 
-    ctx.ui.setEditorComponent((tui, theme, kb) => {
-      const editor = new AgentViewEditor(tui, theme, kb, view, (action) => {
+    view.open = false;
+    if (!reloaded) {
+      // A different session means a different chat container and a fresh view.
+      // Live agents are unaffected: they are not pi sessions.
+      view.attached = undefined;
+      view.unfilter?.();
+      view.unfilter = undefined;
+    }
+    restoreFromSession(ctx);
+    ctx.ui.setWidget("agent-views", undefined);
+    // Clear any footer status left behind by an older build of this extension.
+    ctx.ui.setStatus("agent-views", undefined);
+
+    // Zero-height widget used only to obtain a TUI handle: transcript content
+    // lives in pi's transcript, never in a widget.
+    ctx.ui.setWidget("agent-views-tick", (t) => {
+      tui = t;
+      view.refresh = () => t.requestRender();
+      return {
+        render: () => {
+          // Cheap once installed; the container can only be found after pi has
+          // built a child for one of our entries.
+          if (view.attached) ensureChatFilter();
+          return [];
+        },
+        invalidate: () => {},
+      };
+    });
+
+    // Live agents push updates; mirror new items into pi's transcript.
+    setOnChange(() => mirror());
+
+    /**
+     * Which conversation the editor is talking to, drawn on the editor frame.
+     *
+     * Always shown, including the main session (as the agent called "main"), so
+     * there is never any doubt about where a prompt is going. Plain text: the
+     * editor draws it in its border color. Names are slugs and short by
+     * construction, so they are never truncated.
+     */
+    const viewLabel = (): string => ` ◆ ${view.attached ? nameOf(view.attached) : ROOT_AGENT_NAME} `;
+
+    ctx.ui.setEditorComponent((t, theme, kb) => {
+      const act = (action: Action) => {
+        // Everything here runs against the extension-owned agent pool, so no pi
+        // session is switched, aborted or disposed.
         switch (action.t) {
-          case "open":
-            pi.sendUserMessage("/__av-open", { expandPromptTemplates: true });
+          case "openPicker":
+            openPicker(ctx);
             break;
-          case "close":
-            close(ctx);
+          case "closePicker":
+            closePicker(ctx);
             break;
           case "help":
             view.showHelp = !view.showHelp;
             view.refresh?.();
             break;
           case "attach":
-            pi.sendUserMessage(`/__av-attach ${action.key}`, { expandPromptTemplates: true });
+            void attach(ctx, action.key);
+            break;
+          case "detach":
+            closePicker(ctx);
+            detach();
             break;
           case "spawn":
-            pi.sendUserMessage(`/__av-spawn ${action.prompt}`, { expandPromptTemplates: true });
+            void spawn(ctx, action.prompt, { attach: true });
+            break;
+          case "steer":
+            void steerAgent(action.key, action.text).then((ok) => {
+              if (!ok) ctx.ui.notify("That agent is not live", "warning");
+            });
             break;
           case "abort":
-            pi.sendUserMessage(`/__av-abort ${action.key}`, { expandPromptTemplates: true });
+            if (action.key === ctx.sessionManager.getSessionFile()) ctx.abort();
+            else void abortAgent(action.key).then(() => refreshRowsIfOpen(ctx));
             break;
         }
-      });
+      };
 
-      // Restore prompt history so ↑/↓ recall still works after attaching to a
-      // different agent.
+      const editor = new AgentViewEditor(t, theme, kb, view, act, viewLabel);
+
+      // Restore prompt history so ↑/↓ recall still works.
       try {
         for (const entry of ctx.sessionManager.getBranch()) {
           if (entry.type !== "message" || entry.message.role !== "user") continue;
@@ -632,7 +867,7 @@ export default function agentViews(pi: ExtensionAPI): void {
                   ?.filter((c): c is { type: "text"; text: string } => c.type === "text")
                   .map((c) => c.text)
                   .join("");
-          if (text && !text.startsWith("/__av-")) editor.addToHistory(text);
+          if (text) editor.addToHistory(text);
         }
       } catch {
         /* history is best-effort */
@@ -642,12 +877,18 @@ export default function agentViews(pi: ExtensionAPI): void {
     });
   });
 
-  pi.on("session_shutdown", (_event, ctx) => {
-    if (view.timer) {
-      clearInterval(view.timer);
-      view.timer = undefined;
-    }
+  pi.on("session_shutdown", (event, ctx) => {
     view.open = false;
+    view.attached = undefined;
+    view.mirrored = {};
+    view.unfilter?.();
+    view.unfilter = undefined;
+    setOnChange(undefined);
     ctx.ui.setWidget("agent-views", undefined);
+    ctx.ui.setWidget("agent-views-tick", undefined);
+    ctx.ui.setStatus("agent-views", undefined);
+    // Only release the pool when pi is really going away; a session switch or
+    // extension reload must leave background agents running.
+    if (event.reason === "quit") void disposeAll();
   });
 }

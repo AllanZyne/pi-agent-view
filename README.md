@@ -1,35 +1,27 @@
 # pi-agent-views
 
-Run and manage multiple agents inside one [pi](https://pi.dev) session — every agent
-natively rendered, all of them genuinely concurrent.
+Concurrent sub-agents for [pi](https://pi.dev), each rendered by pi itself.
 
-Press `←` on an empty prompt to open the agent list. Attach to any agent and you get
-pi's real interface: live streaming, markdown, tool rendering, footer stats, `/compact`,
-`/tree`, `Ctrl+O`. Switching agents never interrupts anything — a background agent keeps
-working while you look at another one.
+Press `←` on an empty prompt to open the agent list. Attach to any agent and its
+conversation replaces the transcript — live streaming, markdown, tool boxes, all
+drawn with pi's own components. Switching never interrupts anything: a background
+agent keeps working while you look at another one.
 
 ```
   ◆ Agents  3 agents · 1 working
   ──────────────────────────────────────────────────────────
   Working (1)
-   ▸ ✽ write the fix PR                                  2m
+   ▸ ✽ write-the-fix-pr
        4 msgs · claude-sonnet-4-5   Opening a branch and…
-
   Idle (1)
-     ∙ Main [main] (attached)                            9m
+     ∙ main (attached)
        27 msgs · claude-sonnet-4-5
-
   Completed (1)
-     ✓ update the unit tests                             6m
+     ✓ update-the-unit-tests
        9 msgs · claude-sonnet-4-5   Updated 12 test files.
   ──────────────────────────────────────────────────────────
   ↑↓ select · ⏎ attach · type+⏎ new agent · ctrl+x abort · ← close · ? help
 ```
-
-## Requirements
-
-Needs pi's concurrent-session API (`ctx.spawnSession` / `ctx.activateSession`). Without
-it, agents cannot run in parallel and this extension will not work.
 
 ## Install
 
@@ -39,78 +31,154 @@ pi install git:github.com/AllanZyne/pi-agent-views
 
 ## Usage
 
-### The agent list
+| key | effect |
+| --- | --- |
+| `←` | open/close the agent list (empty prompt only) |
+| `↑` `↓` | move the selection (empty prompt only) |
+| `Enter` / `→` | attach to the selected agent |
+| `Enter` + text | list open: new agent with that first prompt · attached: steer the agent |
+| `Esc` | detach — back to `main`, the agent keeps running |
+| `Ctrl+X` | abort that agent's current turn |
+| `?` | help |
 
-Press `←` on an empty prompt.
+`↑`/`↓` only drive the list while the prompt is empty, so prompt history still
+works as soon as you type.
 
-| Key | Action |
-|-----|--------|
-| `↑` `↓` | Select an agent |
-| `Enter` / `→` | Attach to the selected agent |
-| type text + `Enter` | Spawn a new agent with that text as its first prompt |
-| `Ctrl+X` | Abort the selected agent's current turn |
-| `←` / `Esc` | Close |
-| `?` | Help |
+The one command is `/agent <task>`: it starts a background agent and returns
+immediately, without leaving or interrupting the session you are in (extension
+commands are dispatched before pi's streaming guard, so it works mid-response).
 
-`↑`/`↓` only drive the list while the prompt is empty, so prompt history still works as
-soon as you type.
-
-### Delegating without leaving
+Which conversation you are talking to is shown on the editor frame, always:
 
 ```
-/agent write the fix PR based on what we just found
+──────────────────────────────────── ◆ main ────
+│ > 
+└────────────────────────────────────────────────
 ```
 
-Spawns a background agent, hands it the task, and returns immediately. You stay exactly
-where you are and your current turn is not interrupted — extension commands are
-dispatched before pi's streaming guard, so this works mid-response.
+Agents are named after their first prompt, slugified to lowercase letters and
+single hyphens (`agentName()` in `storage.ts`): no spaces, underscores or digits.
+Collisions get a letter suffix (`run-tests`, `run-tests-b`, …). pi's own session
+is listed as the agent called `main`, whatever the session name is — one flat
+list of slugs. Selecting it detaches, exactly like `Esc`.
 
-### Agent state
+A new agent inherits the model of the session that spawned it; attach and use
+`/model` to change it, like anywhere else in pi.
 
-| Icon | State |
-|------|-------|
-| `✽` | Working — the agent is streaming right now |
-| `✗` | Failed |
-| `∙` | Idle |
-| `✓` | Completed |
+| icon | state |
+| --- | --- |
+| `✽` | working — streaming right now |
+| `✗` | failed |
+| `∙` | idle |
+| `✓` | completed |
 
-The list groups by state (working first) and refreshes while open, so you can watch a
-background agent go from Working to Completed without attaching to it.
-
-### Model per agent
-
-A new agent inherits the model of the agent that spawned it. To change it, attach and use
-`/model` — the same as anywhere else in pi.
+The list is a **snapshot**, not a live view: rows are built when it is opened (and
+when this extension adds or aborts an agent), never on a timer. Building rows
+stats every agent file and re-sorts by state, so refreshing while the list is
+open burned I/O and reshuffled rows under the cursor. Reopen (`←` twice) to
+refresh. Selection is anchored to the selected **agent**, not to a row index
+(`reconcileSelection()` / `selectedRow()` in `view-model.ts`), so acting on a
+snapshot always hits the agent you were pointing at.
 
 ## How it works
 
-Every agent is a real pi session in the same process:
+### Agents are not pi sessions
 
-```
-pi process
-├── Main            ← the session pi started with
-├── agent 1         ← concurrent, own turn loop, own JSONL
-└── agent 2         ← concurrent
-```
+pi hosts one *session runtime* per process, and every session-replacing API
+(`switchSession`, `newSession`, `fork`) goes through
+`AgentSessionRuntime.teardownCurrent()`, which does `await session.abort()` then
+`session.dispose()`. Anything hosted by pi's live session is killed when you
+navigate away.
 
-Attaching calls `ctx.activateSession(key)`, which swaps only which session owns the TUI.
-The outgoing session is retained and keeps running: nothing is aborted, shut down, or
-disposed. That is why background work survives switching, and why the transcript is
-pi's own rather than something this extension draws.
+So agents are **not** pi sessions here. `agent-runtime.ts` builds each agent as
+its own `AgentSession` through the SDK (`createAgentSession` +
+`DefaultResourceLoader({ noExtensions: true })`) and keeps them in a pool on
+`globalThis`. Switching which agent you look at only changes rendering, so
+nothing is ever aborted.
 
-Sub-agent sessions are stored separately so they stay out of `/resume`:
+Output is rendered by pi, not by a widget: transcript items are mirrored into
+pi's own transcript as custom entries (`pi.appendEntry` +
+`pi.registerEntryRenderer`) drawn with `UserMessageComponent`,
+`AssistantMessageComponent` and `ToolExecutionComponent`. The only widget is the
+agent list.
+
+### Transcripts stay separate
+
+One view shows exactly one conversation — the main session's or one agent's,
+never a mix. That needs both directions, because pi appends everything to a
+single chat container and custom entries are *persisted* (they cannot be removed,
+and pi has no API to hide its own messages):
+
+| you are looking at | what draws |
+| --- | --- |
+| the main session (detached) | pi's own messages; every agent entry renders nothing (`isVisible()` in `view-model.ts`) |
+| an agent (attached) | that agent's entries only; pi's own chat children render nothing (`installChatFilter()` in `transcript-view.ts`) |
+
+`installChatFilter()` finds pi's chat container through the TUI tree (the node
+holding our entries) and filters *rendering* only: nothing is removed or
+reordered, pi keeps mutating its container as usual, and detaching restores the
+full main transcript — including whatever the main agent streamed while you were
+away. Switching views forces a full repaint since the visible transcript is
+replaced wholesale.
+
+An agent view contains **nothing but the agent's own messages** — no header, no
+banner, exactly like a fresh session.
+
+Because entries cannot be replayed away either, mirror progress is tracked *per
+agent file* (`MirrorState.mirrored[file]`). Re-attaching resumes after the last
+item pi already holds instead of appending the transcript a second time; on
+session start the counters are rebuilt from the persisted entries.
+
+`/reload` keeps the current view: the session, its chat container and everything
+already mirrored into it survive an extension reload, so `session_start` with
+`reason: "reload"` does not detach or drop the render filter.
+
+### Storage
+
+Agent sessions live next to the root session but out of `/resume`:
 
 ```
 <sessionDir>/__agents__/<rootId>/manifest.json
 <sessionDir>/__agents__/<rootId>/<agentId>.jsonl
 ```
 
-`SessionManager.list()` does not descend into `__agents__/`, so only your top-level
-sessions show up in the session picker. Agents created in an earlier pi run are revived
-from disk on demand when you attach to them.
+`SessionManager.list()` does not descend into `__agents__/`, so only top-level
+sessions show up in the session picker. Agents created in an earlier pi run are
+revived from disk on demand when you attach to them. `/agent` works from any
+agent, not just `main`: the owning root is recovered from the session path, so
+new agents always join the same group.
 
-`/agent` works from any agent, not just Main: the owning root is recovered from the
-session path, so new agents always join the same group.
+## Layout
+
+| file | role |
+| --- | --- |
+| `agent-runtime.ts` | in-process concurrent agent pool (headless) |
+| `storage.ts` | `__agents__/<rootId>/*.jsonl` + manifest, agent naming (headless) |
+| `view-model.ts` | list rows, selection, mirror bookkeeping (headless) |
+| `transcript-view.ts` | main-vs-agent transcript separation (headless) |
+| `index.ts` | rendering, key handling, extension wiring (TUI) |
+| `tests/` | test harness and tests |
+
+Everything except `index.ts` is free of TUI/extension-context dependencies so it
+can be tested directly.
+
+## Tests
+
+```sh
+node tests/run.mjs          # unit tests, offline, ~1s
+node tests/run.mjs --e2e    # also runs real agents (needs model credentials)
+```
+
+The harness (`tests/harness.mjs`) loads the extension's TypeScript with jiti —
+the same loader pi uses — so there is no build step. It locates the installed pi
+package next to the running node binary; override with `PI_PACKAGE_DIR`.
+
+The `--e2e` suite is the interesting one: it starts three real agents, flips the
+attached agent every 300 ms while they work, and then asserts that each agent
+completed its own multi-step task (marker file + final message), recorded no
+error items, is still live and not streaming, and that re-attaching appends only
+what is new (never a duplicate, never another agent's item). That is the
+executable version of "switching agents interrupts nothing".
 
 ## License
 
