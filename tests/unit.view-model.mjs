@@ -2,9 +2,37 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { assert, assertEqual, load, tempDir, test } from "./harness.mjs";
+import { assert, assertEqual, load, pi, tempDir, test } from "./harness.mjs";
 
 const vm = await load("view-model.ts");
+
+/** A minimal assistant message, as a session file would hold it. */
+const assistantEntry = (stopReason, text, extra = {}) => ({
+  role: "assistant",
+  content: text ? [{ type: "text", text }] : [],
+  api: "messages",
+  provider: "test",
+  model: "test-model",
+  usage: {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  },
+  stopReason,
+  timestamp: 0,
+  ...extra,
+});
+
+/** Write a real session file, so state detection runs against pi's own reader. */
+function writeSession(dir, name, messages) {
+  const sm = pi.SessionManager.create(dir, dir);
+  sm.appendSessionInfo(name);
+  for (const message of messages) sm.appendMessage(message);
+  return sm.getSessionFile();
+}
 
 const userItem = (text) => ({ kind: "user", text });
 const assistantMessage = (text, extra = {}) => ({
@@ -284,4 +312,62 @@ test("each agent's own model is what the picker reports", () => {
   });
   assertEqual(rows.find((r) => r.key === fast).model, "claude-haiku-4-5", "picker row shows it");
   assertEqual(rows.find((r) => r.key === smart).model, "claude-opus-4-1", "picker row shows it");
+});
+
+// ── States ─────────────────────────────────────────────────────────
+
+const rt = await load("agent-runtime.ts");
+
+test("an agent that died mid-turn is Stopped, not Completed", () => {
+  const dir = tempDir("agent-views-state-");
+  // What a killed agent looks like on disk: a turn that ends on a tool call
+  // nothing ever answered (this is the shape of the hung agent that started it).
+  const cutOff = writeSession(dir, "cut-off", [
+    { role: "user", content: [{ type: "text", text: "go" }] },
+    { ...assistantEntry("toolUse", ""), content: [{ type: "toolCall", id: "t1", name: "bash", arguments: {} }] },
+  ]);
+  assertEqual(vm.readAgentFile(cutOff).fileState, "stopped", "cut off mid tool call");
+
+  const aborted = writeSession(dir, "aborted", [assistantEntry("aborted", "partial")]);
+  assertEqual(vm.readAgentFile(aborted).fileState, "stopped", "aborted turn");
+
+  const errored = writeSession(dir, "errored", [assistantEntry("error", "boom", { errorMessage: "boom" })]);
+  assertEqual(vm.readAgentFile(errored).fileState, "failed", "a task that ended with an error still Failed");
+
+  const done = writeSession(dir, "done", [assistantEntry("stop", "all good")]);
+  assertEqual(vm.readAgentFile(done).fileState, "completed", "a task that finished successfully");
+});
+
+test("terminating an agent keeps it Stopped after its session is gone", async () => {
+  const file = "/tmp/agent-views-not-live.jsonl";
+  assertEqual(rt.stateOf(file), undefined, "not live, nothing recorded");
+  assertEqual(await rt.terminateAgent(file), false, "nothing was running");
+  assertEqual(rt.stateOf(file), "stopped", "still reported as stopped without a session");
+});
+
+test("rows are grouped Working, Failed, Stopped, Idle, Completed", () => {
+  const dir = tempDir("agent-views-groups-");
+  const files = {
+    main: writeSession(dir, "main", [assistantEntry("stop", "main done")]),
+    broken: writeSession(dir, "broken", [assistantEntry("error", "boom", { errorMessage: "boom" })]),
+    killed: writeSession(dir, "killed", [assistantEntry("aborted", "half")]),
+    done: writeSession(dir, "done", [assistantEntry("stop", "finished")]),
+  };
+
+  const rows = vm.buildRows({
+    rootFile: files.main,
+    rootName: "main",
+    rootBusy: true, // the main session is streaming, so it heads the list
+    agents: [
+      { id: "1", name: "done", file: files.done, createdAt: "" },
+      { id: "2", name: "killed", file: files.killed, createdAt: "" },
+      { id: "3", name: "broken", file: files.broken, createdAt: "" },
+    ],
+  });
+
+  assertEqual(
+    rows.map((r) => r.state),
+    ["working", "failed", "stopped", "completed"],
+    "groups come in attention order",
+  );
 });

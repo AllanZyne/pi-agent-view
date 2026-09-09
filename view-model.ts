@@ -44,6 +44,19 @@ export interface AgentFileInfo {
   fileState: AgentState;
 }
 
+/**
+ * State of an agent that is not live here, from its last assistant message.
+ *
+ * A turn that ends on `toolUse` was cut off while a tool was running — nothing
+ * followed it, so the agent died mid-turn (this is what a crashed or killed
+ * agent looks like on disk) and belongs in Stopped, not Completed.
+ */
+function fileStateOf(message: Record<string, any>): AgentState {
+  if (message.errorMessage || message.stopReason === "error") return "failed";
+  if (message.stopReason === "aborted" || message.stopReason === "toolUse") return "stopped";
+  return "completed";
+}
+
 /** Display info for an agent that is not live in this process. */
 export function readAgentFile(file: string): AgentFileInfo {
   const fallback: AgentFileInfo = { messageCount: 0, lastModified: new Date(0), fileState: "idle" };
@@ -70,7 +83,7 @@ export function readAgentFile(file: string): AgentFileInfo {
       if (entry.type !== "message" || entry.message.role !== "assistant") continue;
       const msg = entry.message as any;
       model ??= msg.model;
-      fileState = msg.stopReason === "error" || msg.errorMessage ? "failed" : "completed";
+      fileState = fileStateOf(msg);
       for (const part of msg.content ?? []) {
         if (part.type === "text" && part.text) {
           summary = String(part.text).replace(/\s+/g, " ").trim().slice(0, 300);
@@ -98,7 +111,7 @@ export interface BuildRowsInput {
 }
 
 /** Order rows the way they are rendered, so a selection index maps to a row. */
-const STATE_ORDER: AgentState[] = ["working", "failed", "idle", "completed"];
+const STATE_ORDER: AgentState[] = ["working", "failed", "stopped", "idle", "completed"];
 
 /**
  * Within a group, rows are ordered by *when they joined that group*, not by

@@ -44,7 +44,7 @@
  *   Enter + text   picker open: new agent with that first prompt
  *                  attached:    steer the attached agent
  *   Esc            detach (agent keeps running)
- *   Ctrl+X         abort that agent's turn
+ *   Ctrl+X         terminate that agent (main session: interrupt its turn)
  *   Ctrl+L         model selector for the conversation on screen
  *   Ctrl+P         cycle the attached agent's model
  *   ?              help
@@ -82,6 +82,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import {
+  Loader,
   matchesKey,
   truncateToWidth,
   visibleWidth,
@@ -91,7 +92,6 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import {
-  abortAgent,
   cycleAgentModel,
   disposeAll,
   ensureAgent,
@@ -103,7 +103,9 @@ import {
   setAgentModel,
   setOnChange,
   sharedModelRuntime,
+  stateOf,
   steerAgent,
+  terminateAgent,
   type TranscriptItem,
 } from "./agent-runtime.ts";
 import {
@@ -150,6 +152,8 @@ interface ViewState extends MirrorState, Selection {
   refresh?: () => void;
   /** Removes the chat-container render filter (see transcript-view.ts). */
   unfilter?: () => void;
+  /** Stops the current editor's agent working spinner. */
+  stopStatus?: () => void;
 }
 
 const VIEW_KEY = "__piAgentViewsState";
@@ -339,6 +343,7 @@ export class AgentItemComponent implements Component {
 const STATE_LABEL: Record<AgentState, string> = {
   working: "Working",
   failed: "Failed",
+  stopped: "Stopped",
   idle: "Idle",
   completed: "Completed",
 };
@@ -367,7 +372,7 @@ function renderPicker(view: ViewState, th: Theme, width: number): string[] {
       ["Enter / →", "Attach: stream it into the transcript"],
       ["Enter + text", "New agent (picker) · steer (attached)"],
       ["Esc", "Detach (agent keeps running)"],
-      ["Ctrl+X", "Abort that agent's turn"],
+      ["Ctrl+X", "Terminate that agent (main: interrupt the turn)"],
       ["/model [name]", "Set that agent's model (Ctrl+L when attached)"],
       ["←", "Close the picker (reopen to refresh the list)"],
       ["/agent <task>", "Start a background agent"],
@@ -407,9 +412,11 @@ function renderPicker(view: ViewState, th: Theme, width: number): string[] {
         ? th.fg("warning", "✽")
         : row.state === "failed"
           ? th.fg("error", "✗")
-          : row.state === "completed"
-            ? th.fg("success", "✓")
-            : th.fg("dim", "∙");
+          : row.state === "stopped"
+            ? th.fg("muted", "⊘")
+            : row.state === "completed"
+              ? th.fg("success", "✓")
+              : th.fg("dim", "∙");
 
     const pointer = i === cursor ? th.fg("accent", " ▸ ") : "   ";
     const name = clip(row.name || "(unnamed)", 48);
@@ -452,7 +459,8 @@ type Action =
   | { t: "steer"; key: string; text: string }
   | { t: "model"; key: string; search?: string }
   | { t: "cycleModel"; key: string; direction: "forward" | "backward" }
-  | { t: "abort"; key: string };
+  /** Ctrl+X: interrupt the main session's turn, terminate an agent outright. */
+  | { t: "terminate"; key: string };
 
 /**
  * `/model` typed while an agent is attached.
@@ -467,6 +475,48 @@ function parseModelCommand(text: string): { search?: string } | undefined {
   return { search: search || undefined };
 }
 
+/**
+ * What the editor frame says about the conversation on screen.
+ *
+ * `working` is the *attached agent's* streaming state, not pi's session state:
+ * the two are independent, so an idle agent must not inherit "Working" from a
+ * busy main session, and a working agent must show it even when main is idle.
+ */
+interface ViewStatus {
+  /** Plain-text name for the right end of the border. */
+  label: string;
+  /** True while the conversation on screen is streaming. */
+  working: boolean;
+  /** False on the main session, where pi owns the working status. */
+  ownStatus: boolean;
+}
+
+/**
+ * pi's embedded working status, driven by an agent instead of pi's session.
+ *
+ * `CustomEditor` only needs `renderInBorder`/`renderSpinnerInBorder` from an
+ * indicator, and `Loader` already animates itself and asks the TUI to repaint,
+ * so this is the same spinner pi draws, on our own state.
+ */
+class AgentWorkingStatus extends Loader {
+  constructor(tui: TUI, message: string, colorFn: (text: string) => string) {
+    super(tui, colorFn, colorFn, message);
+  }
+
+  /** Mirrors pi's `WorkingStatusIndicator`: the loader line, unpadded. */
+  renderInBorder(width: number): string {
+    const line = super.render(width + 2)[1] ?? "";
+    return truncateToWidth(line.startsWith(" ") ? line.slice(1).trimEnd() : line.trimEnd(), width, "");
+  }
+
+  renderSpinnerInBorder(width: number): string {
+    return truncateToWidth(this.getRenderedIndicator(), width, "");
+  }
+}
+
+/** Same wording as pi's, with the key that interrupts *an agent*. */
+const AGENT_WORKING_MESSAGE = "Working (ctrl+x to abort)";
+
 class AgentViewEditor extends CustomEditor {
   constructor(
     tui: ConstructorParameters<typeof CustomEditor>[0],
@@ -475,13 +525,49 @@ class AgentViewEditor extends CustomEditor {
     private readonly kb: ConstructorParameters<typeof CustomEditor>[2],
     private readonly view: ViewState,
     private readonly act: (a: Action) => void,
-    /**
-     * Current view's name for the right end of the top border, as plain text:
-     * it is drawn in the editor's own border color.
-     */
-    private readonly label: () => string | undefined,
+    /** What to draw on the frame: the view's name and *its* working state. */
+    private readonly status: () => ViewStatus,
   ) {
     super(tui, theme, kb, { embedWorkingStatus: true });
+    this.tuiRef = tui as TUI;
+  }
+
+  private readonly tuiRef: TUI;
+  /** pi's indicator, remembered so the main session keeps its own status. */
+  private piStatus?: unknown;
+  private agentStatus?: AgentWorkingStatus;
+
+  /** pi hands over its working indicator whenever its own session streams. */
+  override setWorkingStatusIndicator(indicator: Parameters<CustomEditor["setWorkingStatusIndicator"]>[0]): void {
+    this.piStatus = indicator;
+    super.setWorkingStatusIndicator(indicator);
+  }
+
+  /** Stop the spinner's timer (pi replaces the editor on every session start). */
+  stopStatus(): void {
+    this.agentStatus?.stop();
+  }
+
+  /**
+   * The indicator to embed in the border for the conversation on screen.
+   *
+   * While attached this is ours, so it tracks that agent and nothing else;
+   * on the main session it is pi's, untouched.
+   */
+  private borderStatus(working: boolean, ownStatus: boolean): unknown {
+    if (!ownStatus) return this.piStatus;
+    if (!working) {
+      this.agentStatus?.stop();
+      return undefined;
+    }
+    if (!this.agentStatus) {
+      this.agentStatus = new AgentWorkingStatus(this.tuiRef, AGENT_WORKING_MESSAGE, (text) =>
+        this.borderColor(text),
+      );
+    } else {
+      this.agentStatus.start();
+    }
+    return this.agentStatus;
   }
 
   /**
@@ -492,8 +578,22 @@ class AgentViewEditor extends CustomEditor {
    * entirely when the frame is too narrow to keep the working status readable.
    */
   protected override renderTopBorder(width: number, hiddenLineCount: number): string {
-    const border = super.renderTopBorder(width, hiddenLineCount);
-    const text = this.label();
+    const { label, working, ownStatus } = this.status();
+
+    // `CustomEditor` renders whatever indicator it was handed, so swap ours in
+    // for the length of the call instead of reimplementing its border layout
+    // (working status on the left, "↑ N more" centred, narrow-width fallbacks).
+    const self = this as unknown as { workingStatusIndicator?: unknown };
+    const saved = self.workingStatusIndicator;
+    self.workingStatusIndicator = this.borderStatus(working, ownStatus);
+    let border: string;
+    try {
+      border = super.renderTopBorder(width, hiddenLineCount);
+    } finally {
+      self.workingStatusIndicator = saved;
+    }
+
+    const text = label;
     if (!text) return border;
     const labelWidth = visibleWidth(text);
     if (labelWidth + LABEL_TAIL + 12 > width) return border;
@@ -548,7 +648,7 @@ class AgentViewEditor extends CustomEditor {
           return;
         }
         if (empty && matchesKey(data, "ctrl+x")) {
-          this.act({ t: "abort", key: view.attached });
+          this.act({ t: "terminate", key: view.attached });
           return;
         }
         if (matchesKey(data, "return") || matchesKey(data, "enter")) {
@@ -576,7 +676,7 @@ class AgentViewEditor extends CustomEditor {
     }
     if (empty && matchesKey(data, "ctrl+x")) {
       const row = this.row();
-      if (row) this.act({ t: "abort", key: row.key });
+      if (row) this.act({ t: "terminate", key: row.key });
       return;
     }
 
@@ -824,6 +924,24 @@ export default function agentViews(pi: ExtensionAPI): void {
   }
 
   /**
+   * Ctrl+X. On the main session this is pi's interrupt; on an agent it is a
+   * hard stop: the turn is aborted and the session dropped, so nothing of that
+   * agent is left running. Its transcript stays on disk, so the agent remains
+   * in the list and attaching to it revives it.
+   */
+  async function terminate(ctx: ExtensionContext, file: string): Promise<void> {
+    if (file === ctx.sessionManager.getSessionFile()) {
+      ctx.abort();
+      return;
+    }
+    const name = nameOf(file);
+    const wasLive = await terminateAgent(file);
+    ctx.ui.notify(wasLive ? `Terminated ${name}` : `${name} was not running`, wasLive ? "info" : "warning");
+    refreshRowsIfOpen(ctx);
+    tui?.requestRender();
+  }
+
+  /**
    * Create a new agent and hand it the prompt. Returns as soon as the turn is
    * queued: the session you are in is never blocked or interrupted.
    */
@@ -1018,14 +1136,23 @@ export default function agentViews(pi: ExtensionAPI): void {
     setOnChange(() => mirror());
 
     /**
-     * Which conversation the editor is talking to, drawn on the editor frame.
+     * What the editor frame says about the conversation on screen.
      *
-     * Always shown, including the main session (as the agent called "main"), so
-     * there is never any doubt about where a prompt is going. Plain text: the
-     * editor draws it in its border color. Names are slugs and short by
-     * construction, so they are never truncated.
+     * The name is always shown, including the main session (as the agent called
+     * "main"), so there is never any doubt about where a prompt is going. The
+     * working state is that conversation's own: pi's status indicator tracks
+     * pi's session, so while attached it is replaced by the agent's, otherwise
+     * an idle agent would show "Working" borrowed from a busy main session (and
+     * a working agent would show nothing while main is idle).
      */
-    const viewLabel = (): string => ` ◆ ${view.attached ? nameOf(view.attached) : ROOT_AGENT_NAME} `;
+    const viewStatus = (): ViewStatus => {
+      const file = view.attached;
+      return {
+        label: ` ◆ ${file ? nameOf(file) : ROOT_AGENT_NAME} `,
+        working: file ? stateOf(file) === "working" : !ctx.isIdle(),
+        ownStatus: file !== undefined,
+      };
+    };
 
     ctx.ui.setEditorComponent((t, theme, kb) => {
       const act = (action: Action) => {
@@ -1064,14 +1191,17 @@ export default function agentViews(pi: ExtensionAPI): void {
           case "cycleModel":
             void cycleModel(ctx, action.key, action.direction);
             break;
-          case "abort":
-            if (action.key === ctx.sessionManager.getSessionFile()) ctx.abort();
-            else void abortAgent(action.key).then(() => refreshRowsIfOpen(ctx));
+          case "terminate":
+            void terminate(ctx, action.key);
             break;
         }
       };
 
-      const editor = new AgentViewEditor(t, theme, kb, view, act, viewLabel);
+      // Stop the previous editor's spinner: pi builds a new editor on every
+      // session start and never renders the old one again.
+      view.stopStatus?.();
+      const editor = new AgentViewEditor(t, theme, kb, view, act, viewStatus);
+      view.stopStatus = () => editor.stopStatus();
 
       // Restore prompt history so ↑/↓ recall still works.
       try {

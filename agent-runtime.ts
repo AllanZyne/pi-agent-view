@@ -24,7 +24,18 @@ import type { AssistantMessage, Model, ThinkingLevel } from "@earendil-works/pi-
 
 // ─── Types ──────────────────────────────────────────────────────────
 
-export type AgentState = "idle" | "working" | "completed" | "failed";
+/**
+ * How an agent's last turn ended.
+ *
+ * | state | meaning |
+ * | --- | --- |
+ * | `working` | streaming right now |
+ * | `failed` | the task ended with an error |
+ * | `stopped` | not running and never reached a verdict: terminated, aborted, or died mid-turn |
+ * | `idle` | nothing has run yet, waiting for a prompt |
+ * | `completed` | the task finished successfully |
+ */
+export type AgentState = "idle" | "working" | "completed" | "failed" | "stopped";
 
 /**
  * One rendered item in an agent's transcript.
@@ -66,6 +77,12 @@ interface Registry {
   agents: Map<string, LiveAgent>;
   /** True while a sub-agent session is being constructed. */
   loading: boolean;
+  /**
+   * Agents stopped in this process. Kept after the session object is gone so a
+   * terminated agent stays in the Stopped group instead of reverting to
+   * whatever its file happens to say.
+   */
+  stopped: Set<string>;
   modelRuntime?: ModelRuntime;
   onChange?: () => void;
 }
@@ -76,9 +93,12 @@ const KEY = "__piAgentViewsRuntime";
 function registry(): Registry {
   const g = globalThis as Record<string, unknown>;
   if (!g[KEY]) {
-    g[KEY] = { agents: new Map<string, LiveAgent>(), loading: false } satisfies Registry;
+    g[KEY] = { agents: new Map<string, LiveAgent>(), loading: false, stopped: new Set<string>() } satisfies Registry;
   }
-  return g[KEY] as Registry;
+  const reg = g[KEY] as Registry;
+  // Older builds had no stopped set; keep a reload from crashing.
+  reg.stopped ??= new Set<string>();
+  return reg;
 }
 
 /**
@@ -303,7 +323,7 @@ function attachEvents(agent: LiveAgent): () => void {
       }
 
       case "agent_end": {
-        if (agent.state !== "failed") agent.state = "completed";
+        if (agent.state !== "failed" && agent.state !== "stopped") agent.state = "completed";
         notify();
         break;
       }
@@ -363,8 +383,10 @@ export function listAgentFiles(): string[] {
 }
 
 export function stateOf(file: string): AgentState | undefined {
-  const a = registry().agents.get(file);
-  if (!a) return undefined;
+  const reg = registry();
+  const a = reg.agents.get(file);
+  // A terminated agent has no session left, but it is still stopped.
+  if (!a) return reg.stopped.has(file) ? "stopped" : undefined;
   // isStreaming is authoritative for "working".
   try {
     if (a.session.isStreaming) return "working";
@@ -486,7 +508,8 @@ export async function runAgent(
 
   // Fire and forget — concurrency is the point.
   agent.session.prompt(prompt).catch((err: unknown) => {
-    agent.state = "failed";
+    // The turn never reached a verdict: the session itself blew up.
+    agent.state = "stopped";
     agent.error = String(err);
     agent.transcript.push({ kind: "error", text: String(err) });
     notify();
@@ -507,17 +530,20 @@ export async function steerAgent(file: string, text: string): Promise<boolean> {
   }
 }
 
-/** Abort an agent's current turn (does not dispose it). */
-export async function abortAgent(file: string): Promise<void> {
-  const agent = registry().agents.get(file);
-  if (!agent) return;
-  try {
-    await agent.session.abort();
-  } catch {
-    /* ignore */
-  }
-  agent.state = "idle";
+/**
+ * Terminate an agent: abort its turn and drop its session.
+ *
+ * The transcript stays on disk, so the agent remains in the list and can be
+ * attached to (and revived) later — this kills the running thing, it does not
+ * delete the record. Returns false when there was nothing running.
+ */
+export async function terminateAgent(file: string): Promise<boolean> {
+  const reg = registry();
+  const wasLive = reg.agents.has(file);
+  reg.stopped.add(file);
+  await disposeAgent(file);
   notify();
+  return wasLive;
 }
 
 /** Dispose an agent, releasing its session file. */

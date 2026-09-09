@@ -38,7 +38,7 @@ pi install git:github.com/AllanZyne/pi-agent-views
 | `Enter` / `→` | attach to the selected agent |
 | `Enter` + text | list open: new agent with that first prompt · attached: steer the agent |
 | `Esc` | detach — back to `main`, the agent keeps running |
-| `Ctrl+X` | abort that agent's current turn |
+| `Ctrl+X` | terminate that agent — abort its turn and drop its session (on `main`: pi's interrupt) |
 | `Ctrl+L` | model selector for the agent you are looking at |
 | `Ctrl+P` / `Shift+Ctrl+P` | cycle the attached agent's model |
 | `?` | help |
@@ -50,7 +50,13 @@ The one command is `/agent <task>`: it starts a background agent and returns
 immediately, without leaving or interrupting the session you are in (extension
 commands are dispatched before pi's streaming guard, so it works mid-response).
 
-Which conversation you are talking to is shown on the editor frame, always:
+`Ctrl+X` is a hard stop, not a pause: the agent's session is disposed, so
+nothing of it keeps running. Its transcript stays on disk, so it stays in the
+list as **Stopped** and attaching to it revives it.
+
+Which conversation you are talking to is shown on the editor frame, always, next
+to *that conversation's* working state — an idle agent never inherits "Working"
+from a busy main session, and a working agent shows it even when main is idle:
 
 ```
 ──────────────────────────────────── ◆ main ────
@@ -64,12 +70,18 @@ Collisions get a letter suffix (`run-tests`, `run-tests-b`, …). pi's own sessi
 is listed as the agent called `main`, whatever the session name is — one flat
 list of slugs. Selecting it detaches, exactly like `Esc`.
 
-| icon | state |
-| --- | --- |
-| `✽` | working — streaming right now |
-| `✗` | failed |
-| `∙` | idle |
-| `✓` | completed |
+| icon | group | meaning |
+| --- | --- | --- |
+| `✽` | Working | streaming right now |
+| `✗` | Failed | the task ended with an error |
+| `⊘` | Stopped | not running and never reached a verdict: terminated with `Ctrl+X`, aborted, or died mid-turn |
+| `∙` | Idle | nothing has run yet |
+| `✓` | Completed | the task finished successfully |
+
+An agent that was killed while a tool was running looks like a turn ending on a
+tool call nobody answered, which is why that shape is read as **Stopped** rather
+than Completed (`fileStateOf()` in `view-model.ts`) — a hung agent is visible
+instead of masquerading as finished.
 
 The list is a **snapshot**, not a live view: rows are built when it is opened (and
 when this extension adds or aborts an agent), never on a timer. Building rows
@@ -124,6 +136,17 @@ pi's own transcript as custom entries (`pi.appendEntry` +
 `pi.registerEntryRenderer`) drawn with `UserMessageComponent`,
 `AssistantMessageComponent` and `ToolExecutionComponent`. The only widget is the
 agent list.
+
+### The editor frame belongs to the view
+
+pi's working indicator tracks pi's *own* session, so while an agent is attached
+the editor's embedded status is replaced by that agent's (`AgentWorkingStatus` in
+`index.ts`, a `Loader` that animates exactly like pi's). Otherwise the two leak
+into each other in both directions: an idle agent showing "Working" borrowed from
+a busy main session, and a working agent showing nothing while main is idle.
+`CustomEditor` draws whatever indicator it was handed, so the extension swaps
+its own in for the length of one `renderTopBorder()` call rather than
+reimplementing pi's border layout.
 
 ### Identical to the main session, on purpose
 

@@ -196,3 +196,40 @@ test(
   },
   { e2e: true },
 );
+
+test(
+  "terminating an agent stops it for good and leaves the others alone",
+  async () => {
+    const dir = tempDir("agent-views-e2e-");
+    const root = makeRoot(dir, "root-e2e-3");
+    const cwd = dir;
+
+    const doomed = storage.registerAgent(root, storage.agentName("doomed"), cwd);
+    const survivor = storage.registerAgent(root, storage.agentName("survivor"), cwd);
+    const doomedOut = path.join(dir, "doomed.txt");
+    const survivorOut = path.join(dir, "survivor.txt");
+
+    await runtime.runAgent(doomed, taskFor("DOOMED-DONE", doomedOut), cwd);
+    await runtime.runAgent(survivor, taskFor("SURVIVOR-DONE", survivorOut), cwd);
+
+    // Kill one mid-flight.
+    while (runtime.stateOf(doomed) !== "working") await sleep(100);
+    assertEqual(await runtime.terminateAgent(doomed), true, "it was running when terminated");
+
+    assertEqual(runtime.getAgent(doomed), undefined, "its session is gone from the pool");
+    assertEqual(runtime.stateOf(doomed), "stopped", "and it reports Stopped, not Completed");
+
+    await waitForSettled([survivor], 240_000);
+    assertEqual(runtime.stateOf(survivor), "completed", "the other agent was untouched");
+    assert(fs.existsSync(survivorOut), "and finished its own work");
+
+    // A terminated agent stays in the list and is revivable: its transcript is
+    // still on disk, and attaching creates a fresh session for it.
+    assert(runtime.readTranscript(doomed).length > 0, "its transcript survives");
+    await runtime.ensureAgent(doomed, cwd);
+    assert(runtime.getAgent(doomed) !== undefined, "attaching revives it");
+
+    await runtime.disposeAll();
+  },
+  { e2e: true },
+);
