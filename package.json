@@ -1,10 +1,14 @@
 {
   "name": "pi-agent-views",
-  "version": "0.1.0",
-  "description": "Claude Code-style agent views for pi — manage multiple agents per session",
-  "keywords": ["pi-package"],
+  "version": "0.2.0",
+  "description": "Multiple concurrent agents per pi session, each natively rendered",
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   }
 }

@@ -1,54 +1,56 @@
 /**
- * Agent Views — per-session agents with true in-process concurrency
+ * Agent Views — per-session agents, natively rendered, truly concurrent.
  *
- * Architecture (codex-style, adapted to pi):
+ * Every agent is a real pi session running in the same process, so each one
+ * gets the full native experience: live streaming, markdown, tool rendering,
+ * footer stats, /compact, /tree, Ctrl+O — everything.
  *
- *   pi's own session   = "Main" agent. Stays pi-native forever: real
- *                        streaming, markdown, tool rendering, footer stats,
- *                        /compact, /tree all work. We NEVER switchSession,
- *                        so it is never torn down and never aborted.
+ * Switching between agents uses `ctx.activateSession()`, which never tears
+ * anything down. A background agent keeps working while you look at another
+ * one, and you can come back to find it further along (or finished).
  *
- *   sub-agents         = in-process `AgentSession` objects (agent-runtime.ts).
- *                        They run concurrently and are rendered by our own
- *                        widget when focused. Navigating between them is a
- *                        pure view change — nothing is ever aborted.
+ * Layout: a list widget above the editor. The transcript is pi's own.
  *
- * View modes:
- *   hidden      normal pi chat (Main agent)
- *   list        agent list  (← from hidden)
- *   transcript  focused sub-agent's live transcript (Enter from list)
+ *   ┌────────────────────────────┐
+ *   │ ◆ Agents   (list widget)   │   ← only while the list is open
+ *   ├────────────────────────────┤
+ *   │ transcript (pi native)     │
+ *   ├────────────────────────────┤
+ *   │ editor  /  footer          │
+ *   └────────────────────────────┘
  *
- * Storage:
- *   <sessionDir>/__agents__/<parentId>/manifest.json
- *   <sessionDir>/__agents__/<parentId>/<agentId>.jsonl   (hidden from /resume)
+ * Keys
+ *   ←            open/close the list (empty editor only)
+ *   ↑ ↓          move selection (empty editor only)
+ *   Enter / →    attach to the selected agent
+ *   Enter + text spawn a new agent with that text as its first prompt
+ *   Ctrl+X       abort the selected agent's current turn
+ *   ? / Esc      help / close
+ *
+ * Commands
+ *   /agent <task>   spawn a background agent and hand it <task>, without
+ *                   leaving the current agent or interrupting it.
+ *
+ * Storage: sub-agent sessions live in
+ *   <sessionDir>/__agents__/<rootId>/<agentId>.jsonl
+ * with a sibling manifest.json. That directory is not scanned by
+ * SessionManager.list(), so sub-agents stay out of /resume.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   CustomEditor,
-  getMarkdownTheme,
   SessionManager,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
+  type LiveSessionInfo,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import { Markdown, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import {
-  abortAgent,
-  disposeAll,
-  ensureAgent,
-  getAgent,
-  runAgent,
-  setOnChange,
-  stateOf,
-  steerAgent,
-  type RunState,
-  type TranscriptItem,
-} from "./agent-runtime.ts";
+import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-// ─── Manifest / storage ─────────────────────────────────────────────
+// ── Storage ────────────────────────────────────────────────────────
 
 interface AgentEntry {
   id: string;
@@ -58,751 +60,594 @@ interface AgentEntry {
 }
 
 interface AgentManifest {
-  parentId: string;
-  parentFile: string;
+  rootId: string;
+  rootFile: string;
   agents: AgentEntry[];
 }
 
-const agentsBase = (sessionDir: string) => path.join(sessionDir, "__agents__");
-const groupDir = (sessionDir: string, parentId: string) => path.join(agentsBase(sessionDir), parentId);
-const manifestPath = (sessionDir: string, parentId: string) =>
-  path.join(groupDir(sessionDir, parentId), "manifest.json");
+const AGENTS_DIR = "__agents__";
 
-function loadManifest(sessionDir: string, parentId: string): AgentManifest | null {
+const groupDir = (sessionDir: string, rootId: string) => path.join(sessionDir, AGENTS_DIR, rootId);
+const manifestFile = (sessionDir: string, rootId: string) => path.join(groupDir(sessionDir, rootId), "manifest.json");
+
+function loadManifest(sessionDir: string, rootId: string): AgentManifest | null {
   try {
-    return JSON.parse(fs.readFileSync(manifestPath(sessionDir, parentId), "utf-8"));
+    return JSON.parse(fs.readFileSync(manifestFile(sessionDir, rootId), "utf-8")) as AgentManifest;
   } catch {
     return null;
   }
 }
 
 function saveManifest(sessionDir: string, m: AgentManifest): void {
-  fs.mkdirSync(groupDir(sessionDir, m.parentId), { recursive: true });
-  fs.writeFileSync(manifestPath(sessionDir, m.parentId), JSON.stringify(m, null, 2));
+  fs.mkdirSync(groupDir(sessionDir, m.rootId), { recursive: true });
+  fs.writeFileSync(manifestFile(sessionDir, m.rootId), JSON.stringify(m, null, 2));
 }
 
-const isSubAgentPath = (f: string) => f.includes("/__agents__/");
-
-function sessionDirOf(file: string): string {
-  const i = file.indexOf("/__agents__/");
-  return i >= 0 ? file.slice(0, i) : path.dirname(file);
-}
-
-interface ParentCtx {
-  parentId: string;
-  parentFile: string;
+/** Root context: the top-level session that owns a group of agents. */
+interface RootCtx {
+  rootId: string;
+  rootFile: string;
   sessionDir: string;
 }
 
-/** pi's session is always the parent (we never switch into a sub-agent). */
-function resolveParent(ctx: ExtensionContext): ParentCtx | null {
-  const f = ctx.sessionManager.getSessionFile();
-  if (!f) return null;
-  return {
-    parentId: ctx.sessionManager.getSessionId(),
-    parentFile: f,
-    sessionDir: sessionDirOf(f),
-  };
+/**
+ * Resolve the owning root regardless of which agent is currently active.
+ *
+ * Sub-agent files live at `<sessionDir>/__agents__/<rootId>/<id>.jsonl`, so we
+ * can recover the root from the path alone. That makes every command work the
+ * same whether you run it from the root agent or from a sub-agent.
+ */
+function resolveRoot(ctx: ExtensionContext): RootCtx | null {
+  const file = ctx.sessionManager.getSessionFile();
+  if (!file) return null;
+
+  const marker = `${path.sep}${AGENTS_DIR}${path.sep}`;
+  const at = file.indexOf(marker);
+  if (at < 0) {
+    return { rootId: ctx.sessionManager.getSessionId(), rootFile: file, sessionDir: path.dirname(file) };
+  }
+
+  const sessionDir = file.slice(0, at);
+  const rootId = file.slice(at + marker.length).split(path.sep)[0]!;
+  const manifest = loadManifest(sessionDir, rootId);
+  if (!manifest) return null;
+  return { rootId, rootFile: manifest.rootFile, sessionDir };
 }
 
-function createSubAgent(parent: ParentCtx, name: string, cwd: string): string {
-  const dir = groupDir(parent.sessionDir, parent.parentId);
+function registerAgent(root: RootCtx, name: string, cwd: string): string {
+  const dir = groupDir(root.sessionDir, root.rootId);
   fs.mkdirSync(dir, { recursive: true });
-  const sm = SessionManager.create(cwd, dir, { parentSession: parent.parentFile });
-  const file = sm.getSessionFile()!;
+  const sm = SessionManager.create(cwd, dir, { parentSession: root.rootFile });
+  const file = sm.getSessionFile();
+  if (!file) throw new Error("agent session is not persisted");
 
-  const m =
-    loadManifest(parent.sessionDir, parent.parentId) ??
-    { parentId: parent.parentId, parentFile: parent.parentFile, agents: [] };
+  const m = loadManifest(root.sessionDir, root.rootId) ?? {
+    rootId: root.rootId,
+    rootFile: root.rootFile,
+    agents: [],
+  };
   m.agents.push({ id: sm.getSessionId(), name, file, createdAt: new Date().toISOString() });
-  saveManifest(parent.sessionDir, m);
+  saveManifest(root.sessionDir, m);
+
+  // Name it up front so it shows up correctly in the list and in /resume-style
+  // pickers without waiting for a first response.
+  sm.appendSessionInfo(name);
   return file;
 }
 
-// ─── Agent list for display ─────────────────────────────────────────
+// ── Agent list model ───────────────────────────────────────────────
+
+type AgentState = "working" | "idle" | "completed" | "failed";
 
 interface AgentRow {
-  /** null file == Main (pi's own session) */
-  file: string | null;
+  key: string;
   name: string;
-  isMain: boolean;
-  isFocused: boolean;
-  state: RunState;
+  isRoot: boolean;
+  isActive: boolean;
+  state: AgentState;
   messageCount: number;
   lastModified: Date;
   summary?: string;
+  model?: string;
 }
 
-function summarize(items: TranscriptItem[]): string | undefined {
-  for (let i = items.length - 1; i >= 0; i--) {
-    const it = items[i]!;
-    if (it.kind === "assistant" && it.text) return it.text.slice(0, 200).replace(/\s+/g, " ");
-    if (it.kind === "error") return `Error: ${it.text.slice(0, 120)}`;
-  }
-  return undefined;
-}
-
-function buildRows(ctx: ExtensionContext, parent: ParentCtx, focused: string | null): AgentRow[] {
-  const rows: AgentRow[] = [];
-
-  // Main = pi's own session
-  let mainCount = 0;
-  let mainSummary: string | undefined;
+/** Read display info for an agent from its session file. */
+function readAgentFile(file: string): Pick<AgentRow, "messageCount" | "lastModified" | "summary" | "model"> & {
+  fileState: AgentState;
+} {
+  const fallback = { messageCount: 0, lastModified: new Date(0), fileState: "idle" as AgentState };
   try {
-    for (const e of ctx.sessionManager.getBranch()) {
-      const en = e as any;
-      if (en.type === "message") mainCount++;
-    }
-    const branch = ctx.sessionManager.getBranch();
+    const sm = SessionManager.open(file);
+    const branch = sm.getBranch();
+    const messageCount = sm.getEntries().filter((e) => e.type === "message").length;
+
+    let model: string | undefined;
+    let summary: string | undefined;
+    let fileState: AgentState = "idle";
+
     for (let i = branch.length - 1; i >= 0; i--) {
-      const en = branch[i] as any;
-      if (en.type === "message" && en.message?.role === "assistant") {
-        for (const c of en.message.content ?? []) {
-          if (c.type === "text" && c.text) {
-            mainSummary = c.text.slice(0, 200).replace(/\s+/g, " ");
+      const entry = branch[i];
+      if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+      const msg = entry.message;
+      model ??= msg.model;
+      if (msg.stopReason === "error" || msg.errorMessage) fileState = "failed";
+      else if (fileState === "idle") fileState = "completed";
+      if (!summary) {
+        for (const part of msg.content ?? []) {
+          if (part.type === "text" && part.text) {
+            summary = part.text.replace(/\s+/g, " ").trim().slice(0, 300);
             break;
           }
         }
-        if (mainSummary) break;
       }
+      break;
     }
+
+    return { messageCount, lastModified: fs.statSync(file).mtime, summary, model, fileState };
   } catch {
-    /* ignore */
+    return fallback;
+  }
+}
+
+function buildRows(root: RootCtx, live: LiveSessionInfo[], cwd: string): AgentRow[] {
+  const liveByKey = new Map(live.map((s) => [s.key, s]));
+  const manifest = loadManifest(root.sessionDir, root.rootId);
+
+  const make = (file: string, name: string, isRoot: boolean): AgentRow => {
+    const info = readAgentFile(file);
+    const liveInfo = liveByKey.get(file);
+    return {
+      key: file,
+      name,
+      isRoot,
+      isActive: liveInfo?.active === true,
+      // A live streaming session is authoritatively "working"; otherwise fall
+      // back to what its transcript says.
+      state: liveInfo?.isStreaming ? "working" : info.fileState,
+      messageCount: info.messageCount,
+      lastModified: info.lastModified,
+      summary: info.summary,
+      model: info.model,
+    };
+  };
+
+  const rootName = liveByKey.get(root.rootFile)?.name ?? "Main";
+  const rows = [make(root.rootFile, rootName, true)];
+  for (const agent of manifest?.agents ?? []) {
+    if (!fs.existsSync(agent.file)) continue;
+    rows.push(make(agent.file, agent.name, false));
   }
 
-  rows.push({
-    file: null,
-    name: ctx.sessionManager.getSessionName() ?? "Main",
-    isMain: true,
-    isFocused: focused === null,
-    state: ctx.isIdle() ? "idle" : "working",
-    messageCount: mainCount,
-    lastModified: new Date(),
-    summary: mainSummary,
+  // Group order mirrors the rendered order so the selection index always
+  // matches the visible row.
+  const order: AgentState[] = ["working", "failed", "idle", "completed"];
+  return rows.sort((a, b) => {
+    const d = order.indexOf(a.state) - order.indexOf(b.state);
+    return d !== 0 ? d : b.lastModified.getTime() - a.lastModified.getTime();
   });
-
-  const m = loadManifest(parent.sessionDir, parent.parentId);
-  for (const entry of m?.agents ?? []) {
-    const live = getAgent(entry.file);
-    let mtime = new Date(entry.createdAt);
-    let count = 0;
-    try {
-      mtime = fs.statSync(entry.file).mtime;
-    } catch {
-      /* ignore */
-    }
-    if (live) {
-      count = live.transcript.filter((t) => t.kind === "user" || t.kind === "assistant").length;
-    } else {
-      try {
-        count = SessionManager.open(entry.file)
-          .getEntries()
-          .filter((e: any) => e.type === "message").length;
-      } catch {
-        /* ignore */
-      }
-    }
-    rows.push({
-      file: entry.file,
-      name: entry.name,
-      isMain: false,
-      isFocused: focused === entry.file,
-      state: stateOf(entry.file) ?? "idle",
-      messageCount: count,
-      lastModified: mtime,
-      summary: live ? summarize(live.transcript) : undefined,
-    });
-  }
-
-  return rows;
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────
+// ── View state (survives per-session extension reloads) ────────────
 
-function relTime(d: Date): string {
-  const s = Math.floor((Date.now() - d.getTime()) / 1000);
-  if (s < 60) return "now";
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h`;
-  return `${Math.floor(h / 24)}d`;
-}
-
-const clip = (s: string, n: number) => (s.length <= n ? s : s.slice(0, n - 1) + "…");
-
-const STATE_ICON: Record<RunState, [string, string]> = {
-  working: ["✽", "warning"],
-  failed: ["✗", "error"],
-  completed: ["✓", "success"],
-  idle: ["∙", "dim"],
-};
-
-// ─── View state ─────────────────────────────────────────────────────
-
-type Mode = "hidden" | "list" | "transcript";
-
-interface View {
-  mode: Mode;
-  /** null = Main (pi-native). Non-null = sub-agent file. */
-  focused: string | null;
+interface ViewState {
+  open: boolean;
+  showHelp: boolean;
   rows: AgentRow[];
   selected: number;
-  listScroll: number;
-  /** transcript scroll from bottom; 0 = follow tail */
-  tScroll: number;
-  showHelp: boolean;
-  parent: ParentCtx | null;
-  tui?: any;
+  scroll: number;
+  refresh?: () => void;
+  timer?: NodeJS.Timeout;
 }
 
-const view: View = {
-  mode: "hidden",
-  focused: null,
-  rows: [],
-  selected: 0,
-  listScroll: 0,
-  tScroll: 0,
-  showHelp: false,
-  parent: null,
+const VIEW_KEY = "__piAgentViewsState";
+
+function getView(): ViewState {
+  const g = globalThis as Record<string, unknown>;
+  if (!g[VIEW_KEY]) {
+    g[VIEW_KEY] = { open: false, showHelp: false, rows: [], selected: 0, scroll: 0 } satisfies ViewState;
+  }
+  return g[VIEW_KEY] as ViewState;
+}
+
+// ── Rendering ──────────────────────────────────────────────────────
+
+const STATE_LABEL: Record<AgentState, string> = {
+  working: "Working",
+  failed: "Failed",
+  idle: "Idle",
+  completed: "Completed",
 };
 
-function rerender(): void {
-  view.tui?.requestRender();
+function relativeTime(d: Date): string {
+  const s = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
 }
 
-function rowsHeight(): number {
-  return Math.max(6, (process.stdout.rows || 30) - 12);
+function clip(s: string, n: number): string {
+  return s.length <= n ? s : `${s.slice(0, Math.max(1, n - 1))}…`;
 }
 
-// ─── Renderers ──────────────────────────────────────────────────────
-
-function renderList(th: Theme, width: number): string[] {
-  const lines: string[] = [];
-  const inner = Math.min(width - 4, 100);
+function renderList(view: ViewState, th: Theme, width: number): string[] {
+  if (!view.open) return [];
+  const out: string[] = [];
+  const rule = th.fg("dim", "─".repeat(Math.max(4, Math.min(width - 4, 100))));
 
   if (view.showHelp) {
-    lines.push(truncateToWidth("  " + th.fg("accent", th.bold("Agent Views")), width));
-    lines.push(truncateToWidth("  " + th.fg("dim", "─".repeat(Math.min(width - 4, 60))), width));
+    out.push(truncateToWidth(`  ${th.fg("accent", th.bold("Agents — keys"))}`, width));
+    out.push(truncateToWidth(`  ${rule}`, width));
     for (const [k, d] of [
-      ["↑ / ↓", "Select agent"],
-      ["Enter / →", "Open agent (view its output here)"],
-      ["← / Esc", "Back"],
-      ["Ctrl+X", "Abort selected agent's current turn"],
-      ["?", "Toggle help"],
-      ["", "Type a prompt + Enter = create a new agent"],
-    ] as const)
-      lines.push(truncateToWidth("    " + th.fg("accent", k.padEnd(12)) + th.fg("text", d), width));
-    return lines;
+      ["↑ ↓", "Select agent"],
+      ["Enter / →", "Attach to selected agent"],
+      ["Enter + text", "Spawn a new agent with that prompt"],
+      ["Ctrl+X", "Abort the selected agent's turn"],
+      ["← / Esc", "Close"],
+      ["/agent <task>", "Spawn a background agent without leaving this one"],
+    ] as const) {
+      out.push(truncateToWidth(`    ${th.fg("accent", k.padEnd(15))}${th.fg("text", d)}`, width));
+    }
+    out.push(truncateToWidth(`  ${th.fg("dim", "? to close help")}`, width));
+    return out;
   }
 
   const working = view.rows.filter((r) => r.state === "working").length;
-  lines.push(
-    truncateToWidth(
-      "  " + th.fg("accent", th.bold("◆ Agents")) +
-        th.fg("muted", `  ${view.rows.length}`) +
-        (working > 0 ? th.fg("warning", `  ${working} working`) : ""),
-      width,
-    ),
-  );
-  lines.push(truncateToWidth("  " + th.fg("dim", "─".repeat(inner)), width));
+  const title = th.fg("accent", th.bold("◆ Agents"));
+  const count = th.fg("muted", `${view.rows.length} agent${view.rows.length === 1 ? "" : "s"}`);
+  const busy = working > 0 ? th.fg("warning", ` · ${working} working`) : "";
+  out.push(truncateToWidth(`  ${title}  ${count}${busy}`, width));
+  out.push(truncateToWidth(`  ${rule}`, width));
 
-  const h = rowsHeight();
-  const maxRows = Math.max(2, Math.floor(h / 2));
-  if (view.selected < view.listScroll) view.listScroll = view.selected;
-  if (view.selected >= view.listScroll + maxRows) view.listScroll = view.selected - maxRows + 1;
+  const maxRows = Math.max(3, (process.stdout.rows || 30) - 16);
+  if (view.scroll > 0) out.push(truncateToWidth(th.fg("dim", `  ↑ ${view.scroll} more`), width));
 
-  const end = Math.min(view.listScroll + maxRows, view.rows.length);
-  if (view.listScroll > 0) lines.push(truncateToWidth(th.fg("dim", `  ↑ ${view.listScroll}`), width));
+  const end = Math.min(view.scroll + maxRows, view.rows.length);
+  let lastState: AgentState | undefined;
 
-  for (let i = view.listScroll; i < end; i++) {
-    const r = view.rows[i]!;
-    const sel = i === view.selected;
-    const [ic, col] = STATE_ICON[r.state];
-    const icon = r.isFocused ? th.fg("accent", "●") : th.fg(col as any, ic);
-    const ptr = sel ? th.fg("accent", " ▸ ") : "   ";
-    const nm = sel ? th.fg("accent", clip(r.name, 38)) : clip(r.name, 38);
-    const tag = r.isMain ? th.fg("dim", " [main]") : "";
-    const cur = r.isFocused ? th.fg("success", " (open)") : "";
-    const t = th.fg("dim", relTime(r.lastModified));
-    const left = ptr + icon + " " + nm + tag + cur;
-    const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(t) - 2);
-    lines.push(truncateToWidth(left + " ".repeat(gap) + t, width));
-
-    const meta = `${r.messageCount} msg`;
-    const sum = r.summary ? "  " + clip(r.summary, Math.max(10, width - 30)) : "";
-    lines.push(truncateToWidth("     " + th.fg("muted", meta) + th.fg("dim", sum), width));
-  }
-
-  if (end < view.rows.length)
-    lines.push(truncateToWidth(th.fg("dim", `  ↓ ${view.rows.length - end}`), width));
-
-  lines.push(truncateToWidth("  " + th.fg("dim", "─".repeat(inner)), width));
-  lines.push(
-    truncateToWidth(
-      "  " +
-        th.fg("dim", "↑↓") + th.fg("muted", " select") +
-        th.fg("dim", "  ⏎") + th.fg("muted", " open") +
-        th.fg("dim", "  ←") + th.fg("muted", " back") +
-        th.fg("dim", "  ^X") + th.fg("muted", " abort") +
-        th.fg("dim", "  ?") + th.fg("muted", " help") +
-        th.fg("dim", "   type+⏎") + th.fg("muted", " new agent"),
-      width,
-    ),
-  );
-  return lines;
-}
-
-function renderTranscript(th: Theme, width: number): string[] {
-  const file = view.focused!;
-  const agent = getAgent(file);
-  const row = view.rows.find((r) => r.file === file);
-  const lines: string[] = [];
-  const inner = Math.min(width - 4, 100);
-
-  const st = stateOf(file) ?? "idle";
-  const [ic, col] = STATE_ICON[st];
-  lines.push(
-    truncateToWidth(
-      "  " + th.fg(col as any, ic) + " " +
-        th.fg("accent", th.bold(clip(row?.name ?? "agent", 44))) +
-        th.fg("muted", `   ${st}`),
-      width,
-    ),
-  );
-  lines.push(truncateToWidth("  " + th.fg("dim", "─".repeat(inner)), width));
-
-  // Build the body from the transcript
-  const body: string[] = [];
-  const mdTheme = getMarkdownTheme();
-  const contentW = Math.max(20, width - 4);
-
-  for (const it of agent?.transcript ?? []) {
-    switch (it.kind) {
-      case "user": {
-        for (const l of it.text.split("\n"))
-          body.push(truncateToWidth("  " + th.fg("userMessageText", "› " + l), width));
-        body.push("");
-        break;
-      }
-      case "assistant": {
-        try {
-          const md = new Markdown(it.text, 0, 0, mdTheme);
-          for (const l of md.render(contentW)) body.push(truncateToWidth("  " + l, width));
-        } catch {
-          for (const l of it.text.split("\n")) body.push(truncateToWidth("  " + l, width));
-        }
-        if (it.streaming) body.push(truncateToWidth("  " + th.fg("dim", "▌"), width));
-        body.push("");
-        break;
-      }
-      case "thinking": {
-        const t = clip(it.text.replace(/\s+/g, " "), contentW);
-        body.push(truncateToWidth("  " + th.fg("dim", "◈ " + t), width));
-        break;
-      }
-      case "toolCall": {
-        const a = JSON.stringify(it.args ?? {});
-        body.push(
-          truncateToWidth(
-            "  " + th.fg("muted", "→ ") + th.fg("toolTitle", it.name) +
-              th.fg("dim", " " + clip(a, Math.max(10, contentW - it.name.length - 6))),
-            width,
-          ),
-        );
-        break;
-      }
-      case "toolResult": {
-        const c = it.isError ? "error" : "toolOutput";
-        const first = it.text.split("\n").slice(0, 6);
-        for (const l of first)
-          body.push(truncateToWidth("    " + th.fg(c as any, clip(l, contentW - 2)), width));
-        if (it.text.split("\n").length > 6)
-          body.push(truncateToWidth("    " + th.fg("dim", "…"), width));
-        body.push("");
-        break;
-      }
-      case "error": {
-        body.push(truncateToWidth("  " + th.fg("error", "✗ " + clip(it.text, contentW)), width));
-        body.push("");
-        break;
-      }
+  for (let i = view.scroll; i < end; i++) {
+    const row = view.rows[i]!;
+    if (row.state !== lastState) {
+      lastState = row.state;
+      const n = view.rows.filter((r) => r.state === row.state).length;
+      out.push(truncateToWidth(`  ${th.fg("muted", `${STATE_LABEL[row.state]} (${n})`)}`, width));
     }
+
+    const icon =
+      row.state === "working"
+        ? th.fg("warning", "✽")
+        : row.state === "failed"
+          ? th.fg("error", "✗")
+          : row.state === "completed"
+            ? th.fg("success", "✓")
+            : th.fg("dim", "∙");
+
+    const pointer = i === view.selected ? th.fg("accent", " ▸ ") : "   ";
+    const name = clip(row.name || "(unnamed)", 40);
+    const nameStr = i === view.selected ? th.fg("accent", name) : th.fg("text", name);
+    const tags =
+      (row.isRoot ? th.fg("dim", " [main]") : "") + (row.isActive ? th.fg("success", " (attached)") : "");
+    const time = th.fg("dim", relativeTime(row.lastModified));
+
+    const left = pointer + icon + " " + nameStr + tags;
+    const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(time) - 2);
+    out.push(truncateToWidth(left + " ".repeat(gap) + time, width));
+
+    const meta = th.fg("muted", `${row.messageCount} msg${row.messageCount === 1 ? "" : "s"}`);
+    const model = row.model ? th.fg("dim", ` · ${clip(row.model, 28)}`) : "";
+    const summary = row.summary ? th.fg("dim", `  ${clip(row.summary, Math.max(10, width - 46))}`) : "";
+    out.push(truncateToWidth(`     ${meta}${model}${summary}`, width));
   }
 
-  if (body.length === 0) {
-    body.push(truncateToWidth("  " + th.fg("dim", "(no output yet — type below to prompt it)"), width));
+  if (end < view.rows.length) {
+    out.push(truncateToWidth(th.fg("dim", `  ↓ ${view.rows.length - end} more`), width));
   }
 
-  // Window: follow the tail unless the user scrolled up
-  const h = rowsHeight();
-  const maxScroll = Math.max(0, body.length - h);
-  if (view.tScroll > maxScroll) view.tScroll = maxScroll;
-  const start = Math.max(0, body.length - h - view.tScroll);
-  const end = Math.min(body.length, start + h);
-  if (start > 0) lines.push(truncateToWidth(th.fg("dim", `  ↑ ${start} more`), width));
-  for (let i = start; i < end; i++) lines.push(body[i]!);
-  if (end < body.length) lines.push(truncateToWidth(th.fg("dim", `  ↓ ${body.length - end} more`), width));
-
-  lines.push(truncateToWidth("  " + th.fg("dim", "─".repeat(inner)), width));
-  lines.push(
+  out.push(truncateToWidth(`  ${rule}`, width));
+  out.push(
     truncateToWidth(
-      "  " +
-        th.fg("dim", "←") + th.fg("muted", " agents") +
-        th.fg("dim", "  ↑↓") + th.fg("muted", " scroll") +
-        th.fg("dim", "  ^X") + th.fg("muted", " abort") +
-        th.fg("dim", "   type+⏎") + th.fg("muted", st === "working" ? " steer" : " prompt"),
+      `  ${th.fg("dim", "↑↓ select · ⏎ attach · type+⏎ new agent · ctrl+x abort · ← close · ? help")}`,
       width,
     ),
   );
-  return lines;
+  return out;
 }
 
-function renderWidget(th: Theme, width: number): string[] {
-  if (view.mode === "hidden") return [];
-  if (view.mode === "list") return renderList(th, width);
-  return renderTranscript(th, width);
-}
-
-// ─── Custom editor ──────────────────────────────────────────────────
+// ── Editor ─────────────────────────────────────────────────────────
 
 type Action =
-  | { t: "openList" }
+  | { t: "open" }
   | { t: "close" }
-  | { t: "openAgent"; file: string | null }
-  | { t: "newAgent"; prompt: string }
-  | { t: "send"; file: string; text: string }
-  | { t: "abort"; file: string };
+  | { t: "help" }
+  | { t: "attach"; key: string }
+  | { t: "spawn"; prompt: string }
+  | { t: "abort"; key: string };
 
-class AgentEditor extends CustomEditor {
-  private act: (a: Action) => void;
-
-  constructor(tui: any, theme: any, kb: any, act: (a: Action) => void) {
-    super(tui, theme, kb);
-    this.act = act;
-    view.tui = tui;
+class AgentViewEditor extends CustomEditor {
+  constructor(
+    tui: ConstructorParameters<typeof CustomEditor>[0],
+    theme: ConstructorParameters<typeof CustomEditor>[1],
+    kb: ConstructorParameters<typeof CustomEditor>[2],
+    private readonly view: ViewState,
+    private readonly act: (a: Action) => void,
+  ) {
+    super(tui, theme, kb, { embedWorkingStatus: true });
   }
 
-  handleInput(data: string): void {
-    const text = this.getText();
-    const empty = !text || text.trim() === "";
+  override handleInput(data: string): void {
+    const empty = this.getText().length === 0;
+    const view = this.view;
 
-    // ── Normal pi chat (Main agent) ──────────────────────────────
-    if (view.mode === "hidden") {
-      if (matchesKey(data, "left") && empty) {
-        this.act({ t: "openList" });
+    // ← on an empty editor is the single entry point.
+    if (!view.open) {
+      if (empty && matchesKey(data, "left")) {
+        this.act({ t: "open" });
         return;
       }
       super.handleInput(data);
       return;
     }
 
-    // ── Help overlay ─────────────────────────────────────────────
-    if (view.showHelp) {
-      view.showHelp = false;
-      rerender();
+    if (empty && (matchesKey(data, "left") || matchesKey(data, "escape"))) {
+      this.act(view.showHelp ? { t: "help" } : { t: "close" });
       return;
     }
-    if (data === "?" && empty) {
-      view.showHelp = true;
-      rerender();
+    if (empty && data === "?") {
+      this.act({ t: "help" });
       return;
     }
-
-    // ── Agent list ───────────────────────────────────────────────
-    if (view.mode === "list") {
-      if ((matchesKey(data, "left") || matchesKey(data, "escape")) && empty) {
-        this.act({ t: "close" });
-        return;
-      }
-      if (empty && (matchesKey(data, "up") || matchesKey(data, "ctrl+p"))) {
-        view.selected = Math.max(0, view.selected - 1);
-        rerender();
-        return;
-      }
-      if (empty && (matchesKey(data, "down") || matchesKey(data, "ctrl+n"))) {
-        view.selected = Math.min(view.rows.length - 1, view.selected + 1);
-        rerender();
-        return;
-      }
-      if (matchesKey(data, "enter")) {
-        if (!empty) {
-          const p = text!.trim();
-          this.setText("");
-          this.act({ t: "newAgent", prompt: p });
-          return;
-        }
-        const r = view.rows[view.selected];
-        if (r) this.act({ t: "openAgent", file: r.file });
-        return;
-      }
-      if (matchesKey(data, "right") && empty) {
-        const r = view.rows[view.selected];
-        if (r) this.act({ t: "openAgent", file: r.file });
-        return;
-      }
-      if (matchesKey(data, "ctrl+x") && empty) {
-        const r = view.rows[view.selected];
-        if (r?.file) this.act({ t: "abort", file: r.file });
-        return;
-      }
-      super.handleInput(data);
-      rerender();
+    if (empty && matchesKey(data, "ctrl+x")) {
+      const row = view.rows[view.selected];
+      if (row) this.act({ t: "abort", key: row.key });
       return;
     }
 
-    // ── Focused sub-agent transcript ─────────────────────────────
-    if ((matchesKey(data, "left") || matchesKey(data, "escape")) && empty) {
-      this.act({ t: "openList" });
+    // ↑/↓ drive the list only while the editor is empty, so prompt history
+    // still works as soon as you start typing.
+    if (empty && (matchesKey(data, "up") || matchesKey(data, "down"))) {
+      const delta = matchesKey(data, "up") ? -1 : 1;
+      view.selected = Math.max(0, Math.min(view.rows.length - 1, view.selected + delta));
+      const maxRows = Math.max(3, (process.stdout.rows || 30) - 16);
+      if (view.selected < view.scroll) view.scroll = view.selected;
+      else if (view.selected >= view.scroll + maxRows) view.scroll = view.selected - maxRows + 1;
+      view.refresh?.();
       return;
     }
-    if (empty && matchesKey(data, "up")) {
-      view.tScroll += 1;
-      rerender();
+
+    if (matchesKey(data, "return") || matchesKey(data, "enter")) {
+      const text = this.getText().trim();
+      if (text) {
+        this.setText("");
+        this.act({ t: "spawn", prompt: text });
+      } else {
+        const row = view.rows[view.selected];
+        if (row) this.act(row.isActive ? { t: "close" } : { t: "attach", key: row.key });
+      }
       return;
     }
-    if (empty && matchesKey(data, "down")) {
-      view.tScroll = Math.max(0, view.tScroll - 1);
-      rerender();
+
+    if (empty && matchesKey(data, "right")) {
+      const row = view.rows[view.selected];
+      if (row) this.act(row.isActive ? { t: "close" } : { t: "attach", key: row.key });
       return;
     }
-    if (empty && matchesKey(data, "ctrl+u")) {
-      view.tScroll += rowsHeight();
-      rerender();
-      return;
-    }
-    if (empty && matchesKey(data, "ctrl+d")) {
-      view.tScroll = Math.max(0, view.tScroll - rowsHeight());
-      rerender();
-      return;
-    }
-    if (matchesKey(data, "ctrl+x") && empty) {
-      this.act({ t: "abort", file: view.focused! });
-      return;
-    }
-    if (matchesKey(data, "enter") && !empty) {
-      const t = text!.trim();
-      this.setText("");
-      this.act({ t: "send", file: view.focused!, text: t });
-      return;
-    }
+
     super.handleInput(data);
-    rerender();
   }
 }
 
-// ─── Extension ──────────────────────────────────────────────────────
+// ── Extension ──────────────────────────────────────────────────────
 
-export default function (pi: ExtensionAPI) {
-  let refresh: ReturnType<typeof setInterval> | null = null;
+export default function agentViews(pi: ExtensionAPI): void {
+  const view = getView();
 
-  function refreshRows(ctx: ExtensionContext): void {
-    const parent = view.parent ?? resolveParent(ctx);
-    if (!parent) return;
-    view.parent = parent;
-    view.rows = buildRows(ctx, parent, view.focused);
-    if (view.selected >= view.rows.length) view.selected = Math.max(0, view.rows.length - 1);
-  }
-
-  function showWidget(ctx: ExtensionContext): void {
-    ctx.ui.setWidget("agent-views", (_tui, theme) => ({
-      render: (w: number) => renderWidget(theme, w),
-      invalidate: () => {},
-    }));
-  }
-
-  function setMode(ctx: ExtensionContext, mode: Mode): void {
-    view.mode = mode;
+  function close(ctx: ExtensionContext): void {
+    view.open = false;
     view.showHelp = false;
-    if (mode === "hidden") {
-      ctx.ui.setWidget("agent-views", undefined);
-      ctx.ui.setStatus("agent-views", undefined);
-      if (refresh) {
-        clearInterval(refresh);
-        refresh = null;
-      }
+    if (view.timer) {
+      clearInterval(view.timer);
+      view.timer = undefined;
+    }
+    ctx.ui.setWidget("agent-views", undefined);
+  }
+
+  function open(ctx: ExtensionCommandContext): void {
+    const root = resolveRoot(ctx);
+    if (!root) {
+      ctx.ui.notify("Agents need a saved session", "error");
       return;
     }
-    refreshRows(ctx);
-    showWidget(ctx);
-    if (!refresh) {
-      refresh = setInterval(() => {
-        if (view.mode === "hidden") return;
-        refreshRows(ctx);
-        rerender();
-      }, 1000);
+
+    const reload = () => {
+      view.rows = buildRows(root, ctx.listLiveSessions(), ctx.cwd);
+      view.selected = Math.max(0, Math.min(view.selected, view.rows.length - 1));
+    };
+
+    reload();
+    // Keep the selection on the attached agent when first opening.
+    const attached = view.rows.findIndex((r) => r.isActive);
+    if (attached >= 0) view.selected = attached;
+    view.scroll = 0;
+    view.showHelp = false;
+    view.open = true;
+
+    ctx.ui.setWidget("agent-views", (tui, theme) => {
+      view.refresh = () => tui.requestRender();
+      return {
+        render: (w: number) => renderList(view, theme, w),
+        invalidate: () => {},
+      };
+    });
+
+    // Background agents change state on their own, so poll while open.
+    if (view.timer) clearInterval(view.timer);
+    view.timer = setInterval(() => {
+      if (!view.open) return;
+      reload();
+      view.refresh?.();
+    }, 1500);
+  }
+
+  /** Bring an agent to the foreground, reviving it from disk if needed. */
+  async function attach(ctx: ExtensionCommandContext, key: string): Promise<void> {
+    const live = ctx.listLiveSessions();
+    if (!live.some((s) => s.key === key)) {
+      // Not running in this process yet (e.g. created in an earlier pi run).
+      await ctx.spawnSession({ sessionFile: key });
+    }
+    close(ctx);
+    // Nothing is torn down: whatever we were looking at keeps running.
+    if (!(await ctx.activateSession(key))) {
+      ctx.ui.notify("Could not attach to that agent", "error");
     }
   }
 
-  function statusLine(ctx: ExtensionContext): void {
-    const working = view.rows.filter((r) => r.state === "working" && !r.isMain).length;
-    ctx.ui.setStatus(
-      "agent-views",
-      working > 0 ? ctx.ui.theme.fg("warning", `✽ ${working} agent${working > 1 ? "s" : ""}`) : undefined,
-    );
+  async function spawn(
+    ctx: ExtensionCommandContext,
+    prompt: string,
+    options: { attach: boolean },
+  ): Promise<string | undefined> {
+    const root = resolveRoot(ctx);
+    if (!root) {
+      ctx.ui.notify("Agents need a saved session", "error");
+      return undefined;
+    }
+
+    const name = prompt.length > 48 ? `${prompt.slice(0, 48)}…` : prompt;
+    const file = registerAgent(root, name, ctx.cwd);
+    const { key } = await ctx.spawnSession({ sessionFile: file, parentSession: root.rootFile });
+
+    // Give it the task. This returns as soon as the turn is queued, so the
+    // agent we are sitting in is never blocked or interrupted.
+    await ctx.promptLiveSession(key, prompt);
+
+    if (options.attach) await attach(ctx, key);
+    return key;
   }
 
   // ── Commands ───────────────────────────────────────────────────
-
-  pi.registerCommand("agents", {
-    description: "Open Agent Views",
-    handler: async (_a: string, ctx: ExtensionCommandContext) => {
-      if (ctx.mode !== "tui") return;
-      setMode(ctx, view.mode === "hidden" ? "list" : "hidden");
-    },
-  });
+  //
+  // Extension commands execute immediately even while the agent is streaming,
+  // which is what lets these run without interrupting the current turn.
 
   pi.registerCommand("agent", {
-    description: "Create a new agent with context from this conversation — /agent <task>",
-    handler: async (args: string, ctx: ExtensionCommandContext) => {
-      if (ctx.mode !== "tui") return;
+    description: "Spawn a background agent for a task — /agent <task>",
+    handler: async (args, ctx) => {
       const task = args.trim();
       if (!task) {
         ctx.ui.notify("Usage: /agent <task>", "error");
         return;
       }
-      const parent = resolveParent(ctx);
-      if (!parent) return;
-
-      const name = task.length > 40 ? task.slice(0, 40) + "…" : task;
-      const file = createSubAgent(parent, name, ctx.cwd);
-
-      // Give the new agent the conversation so far plus the task.
-      // It reads the transcript itself and decides what matters.
-      let convo = "";
-      try {
-        const parts: string[] = [];
-        for (const e of ctx.sessionManager.getBranch()) {
-          const en = e as any;
-          if (en.type !== "message") continue;
-          const m = en.message;
-          const t = (m?.content ?? [])
-            .filter((c: any) => c.type === "text")
-            .map((c: any) => c.text)
-            .join("\n");
-          if (t) parts.push(`${m.role}: ${t}`);
-        }
-        convo = parts.join("\n\n");
-      } catch {
-        /* ignore */
-      }
-
-      const prompt = convo
-        ? `Below is a conversation from another agent, followed by your task. Review the conversation, take what is relevant, and do the task.\n\n## Conversation\n\n${convo}\n\n## Your task\n\n${task}`
-        : task;
-
-      await runAgent(file, prompt, ctx.cwd, ctx.model, ctx.thinkingLevel);
-
-      pi.sendMessage({
-        customType: "agent-views:spawned",
-        content: `→ Agent started: **${name}**\n\nRunning concurrently. Press ← to open Agent Views.`,
-        display: true,
-      });
-      if (view.mode !== "hidden") refreshRows(ctx);
-      statusLine(ctx);
-      rerender();
+      const key = await spawn(ctx, task, { attach: false });
+      if (!key) return;
+      ctx.ui.notify("Agent started in the background. Press ← to see it.", "info");
+      if (view.open) open(ctx);
     },
   });
 
-  // ── Editor + lifecycle ─────────────────────────────────────────
+  pi.registerCommand("__av-attach", {
+    description: "(internal) attach to an agent",
+    handler: async (args, ctx) => {
+      const key = args.trim();
+      if (key) await attach(ctx, key);
+    },
+  });
 
-  pi.on("session_start", (_e, ctx) => {
+  pi.registerCommand("__av-spawn", {
+    description: "(internal) spawn an agent and attach",
+    handler: async (args, ctx) => {
+      const prompt = args.trim();
+      if (prompt) await spawn(ctx, prompt, { attach: true });
+    },
+  });
+
+  pi.registerCommand("__av-abort", {
+    description: "(internal) abort an agent's turn",
+    handler: async (args, ctx) => {
+      const key = args.trim();
+      if (!key) return;
+      if (await ctx.abortLiveSession(key)) {
+        ctx.ui.notify("Aborted", "info");
+        if (view.open) open(ctx);
+      }
+    },
+  });
+
+  pi.registerCommand("__av-open", {
+    description: "(internal) open the agent list",
+    handler: async (_args, ctx) => {
+      if (view.open) close(ctx);
+      else open(ctx);
+    },
+  });
+
+  // ── Editor ─────────────────────────────────────────────────────
+
+  pi.on("session_start", (_event, ctx) => {
     if (ctx.mode !== "tui") return;
 
-    view.mode = "hidden";
-    view.focused = null;
-    view.parent = resolveParent(ctx);
-
-    // Any in-process agent change repaints the widget / status
-    setOnChange(() => {
-      if (view.mode !== "hidden") refreshRows(ctx);
-      statusLine(ctx);
-      rerender();
-    });
+    // The widget belongs to whichever session is active, so drop it on rebind.
+    view.open = false;
+    if (view.timer) {
+      clearInterval(view.timer);
+      view.timer = undefined;
+    }
+    ctx.ui.setWidget("agent-views", undefined);
 
     ctx.ui.setEditorComponent((tui, theme, kb) => {
-      const ed = new AgentEditor(tui, theme, kb, (a) => {
-        void (async () => {
-          switch (a.t) {
-            case "openList":
-              setMode(ctx, "list");
-              break;
-
-            case "close":
-              setMode(ctx, "hidden");
-              break;
-
-            case "openAgent": {
-              if (a.file === null) {
-                // Back to Main: pi-native rendering
-                view.focused = null;
-                setMode(ctx, "hidden");
-                break;
-              }
-              view.focused = a.file;
-              view.tScroll = 0;
-              // Materialize the in-process session so we can stream it
-              try {
-                await ensureAgent(a.file, ctx.cwd, ctx.model, ctx.thinkingLevel);
-              } catch (err) {
-                ctx.ui.notify(`Failed to open agent: ${err}`, "error");
-                break;
-              }
-              setMode(ctx, "transcript");
-              break;
-            }
-
-            case "newAgent": {
-              const parent = view.parent ?? resolveParent(ctx);
-              if (!parent) break;
-              const name = a.prompt.length > 40 ? a.prompt.slice(0, 40) + "…" : a.prompt;
-              const file = createSubAgent(parent, name, ctx.cwd);
-              await runAgent(file, a.prompt, ctx.cwd, ctx.model, ctx.thinkingLevel);
-              view.focused = file;
-              view.tScroll = 0;
-              setMode(ctx, "transcript");
-              break;
-            }
-
-            case "send":
-              await steerAgent(a.file, a.text);
-              view.tScroll = 0;
-              break;
-
-            case "abort":
-              await abortAgent(a.file);
-              break;
-          }
-          refreshRows(ctx);
-          statusLine(ctx);
-          rerender();
-        })();
+      const editor = new AgentViewEditor(tui, theme, kb, view, (action) => {
+        switch (action.t) {
+          case "open":
+            pi.sendUserMessage("/__av-open", { expandPromptTemplates: true });
+            break;
+          case "close":
+            close(ctx);
+            break;
+          case "help":
+            view.showHelp = !view.showHelp;
+            view.refresh?.();
+            break;
+          case "attach":
+            pi.sendUserMessage(`/__av-attach ${action.key}`, { expandPromptTemplates: true });
+            break;
+          case "spawn":
+            pi.sendUserMessage(`/__av-spawn ${action.prompt}`, { expandPromptTemplates: true });
+            break;
+          case "abort":
+            pi.sendUserMessage(`/__av-abort ${action.key}`, { expandPromptTemplates: true });
+            break;
+        }
       });
 
-      // Restore prompt history from Main's user messages
+      // Restore prompt history so ↑/↓ recall still works after attaching to a
+      // different agent.
       try {
-        for (const e of ctx.sessionManager.getBranch()) {
-          const en = e as any;
-          if (en.type === "message" && en.message?.role === "user") {
-            for (const c of en.message.content ?? []) {
-              if (c.type === "text" && c.text) ed.addToHistory(c.text);
-            }
-          }
+        for (const entry of ctx.sessionManager.getBranch()) {
+          if (entry.type !== "message" || entry.message.role !== "user") continue;
+          const content = entry.message.content;
+          const text =
+            typeof content === "string"
+              ? content
+              : content
+                  ?.filter((c): c is { type: "text"; text: string } => c.type === "text")
+                  .map((c) => c.text)
+                  .join("");
+          if (text && !text.startsWith("/__av-")) editor.addToHistory(text);
         }
       } catch {
-        /* ignore */
+        /* history is best-effort */
       }
 
-      return ed;
+      return editor;
     });
   });
 
-  pi.on("session_shutdown", async () => {
-    setOnChange(undefined);
-    if (refresh) {
-      clearInterval(refresh);
-      refresh = null;
+  pi.on("session_shutdown", (_event, ctx) => {
+    if (view.timer) {
+      clearInterval(view.timer);
+      view.timer = undefined;
     }
-    await disposeAll();
+    view.open = false;
+    ctx.ui.setWidget("agent-views", undefined);
   });
 }
