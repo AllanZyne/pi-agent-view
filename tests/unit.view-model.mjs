@@ -1,6 +1,8 @@
 /** Unit tests for view-model.ts (picker rows + transcript mirroring). */
 
-import { assert, assertEqual, load, test } from "./harness.mjs";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { assert, assertEqual, load, tempDir, test } from "./harness.mjs";
 
 const vm = await load("view-model.ts");
 
@@ -136,6 +138,25 @@ test("buildRows puts working agents first and marks the attached one", () => {
   assertEqual(two.isAttached, true, "the attached agent is marked");
 });
 
+test("buildRows keeps a group in join order across refreshes", () => {
+  vm.resetGroupOrder();
+  const agents = [
+    { id: "1", name: "one", file: "/tmp/missing-one.jsonl", createdAt: "" },
+    { id: "2", name: "two", file: "/tmp/missing-two.jsonl", createdAt: "" },
+  ];
+  const build = (list) =>
+    vm.buildRows({ rootFile: "/tmp/root.jsonl", rootName: "main", rootBusy: false, agents: list })
+      .map((r) => r.key);
+
+  const first = build(agents);
+  assertEqual(first, ["/tmp/root.jsonl", "/tmp/missing-one.jsonl", "/tmp/missing-two.jsonl"], "join order");
+  assertEqual(build([...agents].reverse()), first, "order does not follow the input or mtimes");
+
+  // A newcomer joins at the bottom of its group.
+  const third = { id: "3", name: "three", file: "/tmp/missing-three.jsonl", createdAt: "" };
+  assertEqual(build([agents[1], third, agents[0]]), [...first, "/tmp/missing-three.jsonl"], "appended last");
+});
+
 test("buildRows reports pi's own session as working while it streams", () => {
   const rows = vm.buildRows({
     rootFile: "/tmp/root.jsonl",
@@ -205,4 +226,39 @@ test("scrolling keeps the selection inside the viewport", () => {
   assert(sel.selected >= sel.scroll && sel.selected < sel.scroll + 3, "last row is visible");
   sel = vm.moveSelection(rows, sel, 1, 3);
   assertEqual(sel.selected, 9, "cannot move past the end");
+});
+
+test("each agent's own model is what the picker reports", () => {
+  const dir = tempDir();
+  // Two agents that picked different models: the model is recorded in each
+  // agent's own session (a model_change entry), never shared.
+  const write = (name, provider, modelId) => {
+    const file = path.join(dir, `${name}.jsonl`);
+    fs.writeFileSync(
+      file,
+      [
+        JSON.stringify({ type: "session", version: 3, id: name, timestamp: new Date().toISOString(), cwd: dir }),
+        JSON.stringify({ type: "model_change", id: "m1", parentId: null, timestamp: new Date().toISOString(), provider, modelId }),
+      ].join("\n") + "\n",
+    );
+    return file;
+  };
+
+  const fast = write("fast", "anthropic", "claude-haiku-4-5");
+  const smart = write("smart", "anthropic", "claude-opus-4-1");
+
+  assertEqual(vm.readAgentFile(fast).model, "claude-haiku-4-5", "the agent's own model, not the main session's");
+  assertEqual(vm.readAgentFile(smart).model, "claude-opus-4-1", "models do not bleed between agents");
+
+  const rows = vm.buildRows({
+    rootFile: path.join(dir, "root.jsonl"),
+    rootName: "main",
+    rootBusy: false,
+    agents: [
+      { id: "1", name: "fast", file: fast, createdAt: "" },
+      { id: "2", name: "smart", file: smart, createdAt: "" },
+    ],
+  });
+  assertEqual(rows.find((r) => r.key === fast).model, "claude-haiku-4-5", "picker row shows it");
+  assertEqual(rows.find((r) => r.key === smart).model, "claude-opus-4-1", "picker row shows it");
 });

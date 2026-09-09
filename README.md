@@ -39,6 +39,8 @@ pi install git:github.com/AllanZyne/pi-agent-views
 | `Enter` + text | list open: new agent with that first prompt · attached: steer the agent |
 | `Esc` | detach — back to `main`, the agent keeps running |
 | `Ctrl+X` | abort that agent's current turn |
+| `Ctrl+L` | model selector for the agent you are looking at |
+| `Ctrl+P` / `Shift+Ctrl+P` | cycle the attached agent's model |
 | `?` | help |
 
 `↑`/`↓` only drive the list while the prompt is empty, so prompt history still
@@ -62,9 +64,6 @@ Collisions get a letter suffix (`run-tests`, `run-tests-b`, …). pi's own sessi
 is listed as the agent called `main`, whatever the session name is — one flat
 list of slugs. Selecting it detaches, exactly like `Esc`.
 
-A new agent inherits the model of the session that spawned it; attach and use
-`/model` to change it, like anywhere else in pi.
-
 | icon | state |
 | --- | --- |
 | `✽` | working — streaming right now |
@@ -79,6 +78,30 @@ open burned I/O and reshuffled rows under the cursor. Reopen (`←` twice) to
 refresh. Selection is anchored to the selected **agent**, not to a row index
 (`reconcileSelection()` / `selectedRow()` in `view-model.ts`), so acting on a
 snapshot always hits the agent you were pointing at.
+
+## Models
+
+**Every agent owns its model.** A new agent inherits whatever `main` is using at
+spawn time (pinned into its own session right away, so a later `/model` on
+`main` does not move it), and from then on the two are independent in both
+directions — nothing is ever written to the global default either.
+
+| where | how |
+| --- | --- |
+| attached | `/model`, `/model <provider/id>`, `Ctrl+L`, `Ctrl+P` |
+| picker open | `/model [search]` + `⏎` targets the **selected** row (including `main`) |
+
+pi's built-in `/model` is handled by interactive mode before extensions see it
+and always targets pi's own session, so an attached view recognises the command
+itself (`parseModelCommand()` in `index.ts`) and runs pi's real
+`ModelSelectorComponent` against the agent's own `AgentSession.setModel(model,
+{ persist: false })`. The choice lands as a `model_change` entry in that agent's
+jsonl, which is also how it survives: `ensureAgent()` passes the inherited model
+to `createAgentSession()` **only** when the agent has no recorded model of its
+own (`ownSettings()` in `agent-runtime.ts`), so reviving an agent restores its
+model instead of resetting it to the main session's. The picker shows a live
+agent's current model immediately, without waiting for its next assistant
+message.
 
 ## How it works
 

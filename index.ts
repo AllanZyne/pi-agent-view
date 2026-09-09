@@ -45,11 +45,17 @@
  *                  attached:    steer the attached agent
  *   Esc            detach (agent keeps running)
  *   Ctrl+X         abort that agent's turn
+ *   Ctrl+L         model selector for the conversation on screen
+ *   Ctrl+P         cycle the attached agent's model
  *   ?              help
  *
  * Commands
  *   /agent <task>   start a background agent without leaving or interrupting
  *                   the session you are in
+ *   /model [name]   while attached (or with the picker open): set that agent's
+ *                   model. pi's own /model is intercepted by interactive mode
+ *                   and always targets pi's session, so an agent view has to
+ *                   recognise it itself.
  *
  * Storage: agent sessions live in
  *   <sessionDir>/__agents__/<rootId>/<agentId>.jsonl
@@ -64,6 +70,7 @@ import {
   AssistantMessageComponent,
   CustomEditor,
   getMarkdownTheme,
+  ModelSelectorComponent,
   SessionManager,
   ToolExecutionComponent,
   UserMessageComponent,
@@ -71,7 +78,7 @@ import {
   type ExtensionContext,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import {
   matchesKey,
   truncateToWidth,
@@ -82,13 +89,17 @@ import {
 } from "@earendil-works/pi-tui";
 import {
   abortAgent,
+  cycleAgentModel,
   disposeAll,
   ensureAgent,
   getAgent,
   isLoadingSubAgent,
+  modelOf,
   readTranscript,
   runAgent,
+  setAgentModel,
   setOnChange,
+  sharedModelRuntime,
   steerAgent,
 } from "./agent-runtime.ts";
 import {
@@ -316,6 +327,7 @@ function renderPicker(view: ViewState, th: Theme, width: number): string[] {
       ["Enter + text", "New agent (picker) · steer (attached)"],
       ["Esc", "Detach (agent keeps running)"],
       ["Ctrl+X", "Abort that agent's turn"],
+      ["/model [name]", "Set that agent's model (Ctrl+L when attached)"],
       ["←", "Close the picker (reopen to refresh the list)"],
       ["/agent <task>", "Start a background agent"],
     ] as const) {
@@ -380,7 +392,7 @@ function renderPicker(view: ViewState, th: Theme, width: number): string[] {
   out.push(truncateToWidth(`  ${rule}`, width));
   out.push(
     truncateToWidth(
-      `  ${th.fg("dim", "↑↓ select · ⏎ attach · type+⏎ new agent · ctrl+x abort · ← close · ? help")}`,
+      `  ${th.fg("dim", "↑↓ select · ⏎ attach · type+⏎ new agent · /model · ctrl+x abort · ← close · ? help")}`,
       width,
     ),
   );
@@ -397,13 +409,29 @@ type Action =
   | { t: "detach" }
   | { t: "spawn"; prompt: string }
   | { t: "steer"; key: string; text: string }
+  | { t: "model"; key: string; search?: string }
+  | { t: "cycleModel"; key: string; direction: "forward" | "backward" }
   | { t: "abort"; key: string };
+
+/**
+ * `/model` typed while an agent is attached.
+ *
+ * pi's own `/model` is handled by interactive mode before extensions see it and
+ * always targets pi's session, so an attached view has to recognise it itself —
+ * otherwise the command text would be sent to the agent as a prompt.
+ */
+function parseModelCommand(text: string): { search?: string } | undefined {
+  if (text !== "/model" && !text.startsWith("/model ")) return undefined;
+  const search = text.slice("/model".length).trim();
+  return { search: search || undefined };
+}
 
 class AgentViewEditor extends CustomEditor {
   constructor(
     tui: ConstructorParameters<typeof CustomEditor>[0],
     theme: ConstructorParameters<typeof CustomEditor>[1],
-    kb: ConstructorParameters<typeof CustomEditor>[2],
+    /** Kept: `CustomEditor.keybindings` is private, and model keys are remappable. */
+    private readonly kb: ConstructorParameters<typeof CustomEditor>[2],
     private readonly view: ViewState,
     private readonly act: (a: Action) => void,
     /**
@@ -449,6 +477,24 @@ class AgentViewEditor extends CustomEditor {
     const empty = this.getText().length === 0;
     const view = this.view;
 
+    // Model keys belong to the conversation on screen. The app handlers copied
+    // in by pi (Ctrl+L, Ctrl+P) would switch the *main* session's model, which
+    // is not what the user is looking at while attached.
+    if (view.attached) {
+      if (this.kb.matches(data, "app.model.select")) {
+        this.act({ t: "model", key: view.attached });
+        return;
+      }
+      if (this.kb.matches(data, "app.model.cycleForward")) {
+        this.act({ t: "cycleModel", key: view.attached, direction: "forward" });
+        return;
+      }
+      if (this.kb.matches(data, "app.model.cycleBackward")) {
+        this.act({ t: "cycleModel", key: view.attached, direction: "backward" });
+        return;
+      }
+    }
+
     // ← on an empty editor is the single entry point.
     if (!view.open) {
       if (empty && matchesKey(data, "left")) {
@@ -467,8 +513,10 @@ class AgentViewEditor extends CustomEditor {
         if (matchesKey(data, "return") || matchesKey(data, "enter")) {
           const text = this.getText().trim();
           if (text) {
+            const model = parseModelCommand(text);
             this.setText("");
-            this.act({ t: "steer", key: view.attached, text });
+            if (model) this.act({ t: "model", key: view.attached, search: model.search });
+            else this.act({ t: "steer", key: view.attached, text });
             return;
           }
         }
@@ -505,7 +553,15 @@ class AgentViewEditor extends CustomEditor {
     if (matchesKey(data, "return") || matchesKey(data, "enter")) {
       const text = this.getText().trim();
       if (text) {
+        const model = parseModelCommand(text);
         this.setText("");
+        // `/model` in the picker retargets the selected agent instead of
+        // spawning an agent called "model".
+        if (model) {
+          const row = this.row();
+          if (row) this.act({ t: "model", key: row.key, search: model.search });
+          return;
+        }
         this.act({ t: "spawn", prompt: text });
       } else {
         const row = this.row();
@@ -746,6 +802,103 @@ export default function agentViews(pi: ExtensionAPI): void {
     return file;
   }
 
+  // ── Model selection ────────────────────────────────────────────
+  //
+  // pi's `/model` (and Ctrl+L / Ctrl+P) is wired to pi's own session, so it
+  // cannot switch the model of the conversation you are actually looking at.
+  // These handlers run the same UI against the attached agent's session, which
+  // records the change in that agent's transcript like pi does for its own.
+
+  function isRoot(ctx: ExtensionContext, file: string): boolean {
+    return file === ctx.sessionManager.getSessionFile();
+  }
+
+  /** Apply a model to an agent (or to pi's own session for `main`). */
+  async function applyModel(ctx: ExtensionContext, file: string, model: Model<any>): Promise<void> {
+    try {
+      if (isRoot(ctx, file)) {
+        const ok = await pi.setModel(model);
+        if (!ok) {
+          ctx.ui.notify(`No auth configured for ${model.provider}`, "error");
+          return;
+        }
+      } else if (!(await setAgentModel(file, model))) {
+        ctx.ui.notify("That agent is not live", "warning");
+        return;
+      }
+      ctx.ui.notify(`${nameOf(file)} → ${model.id}`, "info");
+      refreshRowsIfOpen(ctx);
+    } catch (err) {
+      ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+    }
+  }
+
+  /**
+   * `/model [search]` for one agent: exact `provider/id` (or `id`) matches are
+   * applied directly, anything else opens pi's own model selector prefilled
+   * with the search term.
+   */
+  async function chooseModel(ctx: ExtensionContext, file: string, search?: string): Promise<void> {
+    if (!isRoot(ctx, file)) {
+      try {
+        await ensureAgent(file, ctx.cwd, ctx.model, ctx.thinkingLevel);
+      } catch (err) {
+        ctx.ui.notify(`Could not open agent: ${String(err)}`, "error");
+        return;
+      }
+    }
+
+    const runtime = await sharedModelRuntime();
+    const available = [...runtime.getAvailableSnapshot()];
+    const current = isRoot(ctx, file) ? ctx.model : modelOf(file);
+
+    if (search) {
+      const wanted = search.toLowerCase();
+      const exact = available.find(
+        (m) => `${m.provider}/${m.id}`.toLowerCase() === wanted || m.id.toLowerCase() === wanted,
+      );
+      if (exact) {
+        await applyModel(ctx, file, exact);
+        return;
+      }
+    }
+
+    if (ctx.mode !== "tui") return;
+    const picked = await ctx.ui.custom<Model<any> | undefined>((t, _theme, _kb, done) => {
+      const selector = new ModelSelectorComponent(
+        t,
+        current,
+        runtime,
+        ctx.scopedModels,
+        (model) => done(model),
+        () => done(undefined),
+        search,
+      );
+      return selector as unknown as Component & { dispose?(): void };
+    });
+    if (picked) await applyModel(ctx, file, picked);
+  }
+
+  /** Ctrl+P style cycling for the attached agent. */
+  async function cycleModel(
+    ctx: ExtensionContext,
+    file: string,
+    direction: "forward" | "backward",
+  ): Promise<void> {
+    if (isRoot(ctx, file)) return;
+    try {
+      const model = await cycleAgentModel(file, direction);
+      if (!model) {
+        ctx.ui.notify("No other model available", "warning");
+        return;
+      }
+      ctx.ui.notify(`${nameOf(file)} → ${model.id}`, "info");
+      refreshRowsIfOpen(ctx);
+    } catch (err) {
+      ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+    }
+  }
+
   // ── Commands ───────────────────────────────────────────────────
   //
   // Extension commands execute immediately even while the agent is streaming,
@@ -845,6 +998,13 @@ export default function agentViews(pi: ExtensionAPI): void {
             void steerAgent(action.key, action.text).then((ok) => {
               if (!ok) ctx.ui.notify("That agent is not live", "warning");
             });
+            break;
+          case "model":
+            closePicker(ctx);
+            void chooseModel(ctx, action.key, action.search);
+            break;
+          case "cycleModel":
+            void cycleModel(ctx, action.key, action.direction);
             break;
           case "abort":
             if (action.key === ctx.sessionManager.getSessionFile()) ctx.abort();

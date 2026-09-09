@@ -8,7 +8,7 @@
 
 import * as fs from "node:fs";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { getAgent, readTranscript, stateOf, type AgentState, type TranscriptItem } from "./agent-runtime.ts";
+import { getAgent, modelOf, readTranscript, stateOf, type AgentState, type TranscriptItem } from "./agent-runtime.ts";
 import type { AgentEntry } from "./storage.ts";
 
 export type { AgentState };
@@ -22,7 +22,7 @@ export interface AgentRow {
   isAttached: boolean;
   state: AgentState;
   messageCount: number;
-  /** Last activity, used for ordering only — the picker does not show it. */
+  /** Last activity. Informational: ordering uses group join order. */
   lastModified: Date;
   summary?: string;
   model?: string;
@@ -47,6 +47,15 @@ export function readAgentFile(file: string): AgentFileInfo {
     let model: string | undefined;
     let summary: string | undefined;
     let fileState: AgentState = "idle";
+
+    // Each agent owns its model, and a `/model` switch is recorded as a
+    // model_change entry, so the session context — not just the last assistant
+    // message — is the source of truth for what it will use next.
+    try {
+      model = sm.buildSessionContext().model?.modelId;
+    } catch {
+      /* fall back to the last assistant message below */
+    }
 
     for (let i = branch.length - 1; i >= 0; i--) {
       const entry = branch[i]!;
@@ -83,13 +92,42 @@ export interface BuildRowsInput {
 /** Order rows the way they are rendered, so a selection index maps to a row. */
 const STATE_ORDER: AgentState[] = ["working", "failed", "idle", "completed"];
 
+/**
+ * Within a group, rows are ordered by *when they joined that group*, not by
+ * last activity: an agent's mtime keeps moving while it streams, which made
+ * rows swap places under the cursor on every refresh. A join ticket is minted
+ * the first time an agent is seen in a state and kept until its state changes,
+ * so a group's order is fixed and new members are appended at the bottom.
+ */
+const groupTickets = new Map<string, { state: AgentState; ticket: number }>();
+let nextTicket = 0;
+
+function groupTicket(key: string, state: AgentState): number {
+  const previous = groupTickets.get(key);
+  if (previous && previous.state === state) return previous.ticket;
+  const ticket = ++nextTicket;
+  groupTickets.set(key, { state, ticket });
+  return ticket;
+}
+
+/** Forget agents that vanished, so tickets do not leak across long sessions. */
+function pruneTickets(live: Set<string>): void {
+  for (const key of groupTickets.keys()) if (!live.has(key)) groupTickets.delete(key);
+}
+
+/** Test hook: drop all join tickets. */
+export function resetGroupOrder(): void {
+  groupTickets.clear();
+  nextTicket = 0;
+}
+
 export function buildRows(input: BuildRowsInput): AgentRow[] {
   const make = (file: string, name: string, isRoot: boolean): AgentRow => {
     const info = readAgentFile(file);
     const live = getAgent(file);
     const liveState = stateOf(file);
-    // A live agent whose file pi has not flushed yet has no mtime: treat it as
-    // fresh so it does not sink to the bottom of its group.
+    // A live agent whose file pi has not flushed yet has no mtime: report now,
+    // so callers never see a 1970 timestamp for a running agent.
     const lastModified = info.lastModified.getTime() === 0 && live ? new Date() : info.lastModified;
     return {
       key: file,
@@ -100,16 +138,21 @@ export function buildRows(input: BuildRowsInput): AgentRow[] {
       messageCount: live ? live.transcript.filter((t) => t.kind === "user").length : info.messageCount,
       lastModified,
       summary: info.summary,
-      model: info.model,
+      // A live agent's session knows its model right away; the file only learns
+      // it from the next assistant message, so `/model` would look like a no-op.
+      model: (isRoot ? undefined : modelOf(file)?.id) ?? info.model,
     };
   };
 
   const rows = [make(input.rootFile, input.rootName, true)];
   for (const agent of input.agents) rows.push(make(agent.file, agent.name, false));
 
+  pruneTickets(new Set(rows.map((r) => r.key)));
+  const tickets = new Map(rows.map((r) => [r.key, groupTicket(r.key, r.state)]));
+
   return rows.sort((a, b) => {
     const d = STATE_ORDER.indexOf(a.state) - STATE_ORDER.indexOf(b.state);
-    return d !== 0 ? d : b.lastModified.getTime() - a.lastModified.getTime();
+    return d !== 0 ? d : tickets.get(a.key)! - tickets.get(b.key)!;
   });
 }
 

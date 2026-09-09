@@ -107,6 +107,16 @@ async function getModelRuntime(): Promise<ModelRuntime> {
   return reg.modelRuntime;
 }
 
+/**
+ * The `ModelRuntime` every agent shares.
+ *
+ * Exposed so the view layer can drive pi's own model selector (which needs a
+ * runtime) against the same catalogue and credentials the agents use.
+ */
+export async function sharedModelRuntime(): Promise<ModelRuntime> {
+  return getModelRuntime();
+}
+
 // ─── Transcript building from events ────────────────────────────────
 
 function textOf(content: unknown): string {
@@ -274,6 +284,46 @@ export function getAgent(file: string): LiveAgent | undefined {
   return registry().agents.get(file);
 }
 
+/** Model a live agent is currently using. */
+export function modelOf(file: string): Model<any> | undefined {
+  try {
+    return registry().agents.get(file)?.session.model;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Switch a live agent's model, exactly like `/model` does for pi's own session:
+ * session-scoped (never persisted as the global default) and recorded in the
+ * agent's own transcript, so the choice is remembered when that agent is
+ * revived later and never leaks to the main session or to another agent.
+ *
+ * The thinking level is left to `setModel()`, which applies the per-model
+ * override for the new model just as pi does.
+ *
+ * @throws Error if no auth is configured for the model.
+ */
+export async function setAgentModel(file: string, model: Model<any>): Promise<boolean> {
+  const agent = registry().agents.get(file);
+  if (!agent) return false;
+  await agent.session.setModel(model, { persist: false });
+  notify();
+  return true;
+}
+
+/** Cycle a live agent's model, like Ctrl+P does for pi's own session. */
+export async function cycleAgentModel(
+  file: string,
+  direction: "forward" | "backward",
+): Promise<Model<any> | undefined> {
+  const agent = registry().agents.get(file);
+  if (!agent) return undefined;
+  const result = await agent.session.cycleModel(direction, { persist: false });
+  notify();
+  return result?.model;
+}
+
 export function listAgentFiles(): string[] {
   return [...registry().agents.keys()];
 }
@@ -291,8 +341,30 @@ export function stateOf(file: string): AgentState | undefined {
 }
 
 /**
+ * What an agent's own session file already says about its model/thinking level.
+ *
+ * Each agent owns its model: `createAgentSession()` restores it from the
+ * session only when no `model` option is passed, so an agent that has already
+ * chosen one must NOT be handed the caller's (main session's) model again —
+ * that would silently reset it on every re-attach.
+ */
+function ownSettings(sm: SessionManager): { model: boolean; thinkingLevel: boolean } {
+  try {
+    return {
+      model: sm.buildSessionContext().model !== null,
+      thinkingLevel: sm.getBranch().some((entry) => entry.type === "thinking_level_change"),
+    };
+  } catch {
+    return { model: false, thinkingLevel: false };
+  }
+}
+
+/**
  * Ensure an in-process AgentSession exists for `file`, creating it if needed.
  * Does not send any prompt.
+ *
+ * `model`/`thinkingLevel` are only an *inheritance* default, used for a brand
+ * new agent. An agent that already recorded its own model keeps it.
  */
 export async function ensureAgent(
   file: string,
@@ -306,6 +378,7 @@ export async function ensureAgent(
 
   const sm = SessionManager.open(file);
   const transcript = seedTranscript(sm);
+  const own = ownSettings(sm);
 
   const modelRuntime = await getModelRuntime();
 
@@ -325,8 +398,9 @@ export async function ensureAgent(
 
     const created = await createAgentSession({
       cwd,
-      model,
-      thinkingLevel,
+      // Undefined lets the SDK restore the agent's own recorded model/level.
+      model: own.model ? undefined : model,
+      thinkingLevel: own.thinkingLevel ? undefined : thinkingLevel,
       modelRuntime,
       sessionManager: sm,
       resourceLoader: loader,
@@ -334,6 +408,16 @@ export async function ensureAgent(
     session = created.session;
   } finally {
     reg.loading = false;
+  }
+
+  // Pin the inherited model into the agent's own session so it stays put even
+  // if the main session switches model before this agent says anything.
+  if (!own.model && session.model) {
+    try {
+      sm.appendModelChange(session.model.provider, session.model.id);
+    } catch {
+      /* best effort: the model is still correct for this process */
+    }
   }
 
   const agent: LiveAgent = {
