@@ -2,6 +2,12 @@
 
 Concurrent sub-agents for [pi](https://pi.dev), each rendered by pi itself.
 
+> **Status: early / actively developed.** Expect rough edges and breaking
+> changes between versions. This extension mirrors agent transcripts into your
+> main session's `.jsonl` and patches how pi renders it, so a bug here can
+> corrupt or otherwise mess up your session history. Use it on sessions you
+> don't mind losing, and keep backups if that matters to you.
+
 Press `←` on an empty prompt to open the agent list. Attach to any agent and its
 conversation replaces the transcript — live streaming, markdown, tool boxes, all
 drawn with pi's own components. Switching never interrupts anything: a background
