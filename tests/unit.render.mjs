@@ -174,6 +174,47 @@ test("without pi's renderers a command is not even shown — the bug this fixes"
   assert(real.includes("$ ls -la"), `pi's shell rendering is used: ${JSON.stringify(real)}`);
 });
 
+test("a tool call built before renderers loaded upgrades once they arrive", async () => {
+  // initToolRenderers() is awaited asynchronously from session_start, while
+  // the first render pass can happen synchronously right after — the exact
+  // race that used to leave every tool call in an agent view stuck showing
+  // raw JSON args forever, because `ToolExecutionComponent` only takes
+  // renderers in its constructor.
+  const items = [
+    { kind: "toolCall", id: "t1", name: "bash", args: { command: "ls -la" } },
+    {
+      kind: "toolResult",
+      toolCallId: "t1",
+      name: "bash",
+      text: "foo",
+      isError: false,
+      content: [{ type: "text", text: "foo" }],
+    },
+  ];
+
+  toolRenderers.resetToolRenderers();
+  const component = new AgentItemComponent(
+    { file: "/tmp/agent.jsonl", index: 0 },
+    pi.theme ?? {},
+    settings,
+    false,
+    fakeTui,
+    process.cwd(),
+    () => true,
+    () => items,
+  );
+
+  const beforeLoad = component.render(WIDTH).join("\n");
+  assert(beforeLoad.includes('"command"'), `renders raw args before load: ${JSON.stringify(beforeLoad)}`);
+
+  await toolRenderers.initToolRenderers();
+  const afterLoad = component.render(WIDTH).join("\n");
+  assert(
+    afterLoad.includes("$ ls -la"),
+    `the same component upgrades to pi's shell rendering once renderers load: ${JSON.stringify(afterLoad)}`,
+  );
+});
+
 test("nothing is drawn for an agent that is not attached", () => {
   const items = [{ kind: "user", text: "hidden" }];
   const component = new AgentItemComponent(

@@ -229,6 +229,7 @@ export class AgentItemComponent implements Component {
   private user?: UserMessageComponent;
   private assistant?: AssistantMessageComponent;
   private tool?: ToolExecutionComponent;
+  private toolHasRenderers = false;
   private lastSignature = "";
   private lastExpanded?: boolean;
 
@@ -290,23 +291,29 @@ export class AgentItemComponent implements Component {
         if (!this.tui) {
           return [truncateToWidth(`${" ".repeat(pad)}${this.theme.fg("warning", `⏵ ${item.name}`)}`, width)];
         }
-        if (!this.tool) {
+        // Renderers load asynchronously (see initToolRenderers): the first
+        // render of a fresh agent view can race that load. `toolDefinition`
+        // is constructor-only on `ToolExecutionComponent`, so a tool call
+        // built before renderers were ready would be stuck rendering its
+        // bare name plus raw JSON args forever. Rebuild once renderers show
+        // up instead of caching that miss permanently.
+        const renderers = toolRenderersFor(item.name);
+        if (!this.tool || (!this.toolHasRenderers && renderers)) {
           this.tool = new ToolExecutionComponent(
             item.name,
             item.id,
             item.args,
             this.settings.tool,
-            // Without pi's built-in renderers a tool call degrades to its bare
-            // name plus raw output, which is the one thing that never looked
-            // like the main session.
-            toolRenderersFor(item.name) as never,
+            renderers as never,
             this.tui,
             this.cwd,
           );
+          this.toolHasRenderers = Boolean(renderers);
           this.tool.setArgsComplete();
           this.tool.markExecutionStarted();
-        }
-        if (this.lastExpanded !== this.expanded) {
+          this.tool.setExpanded(this.expanded);
+          this.lastExpanded = this.expanded;
+        } else if (this.lastExpanded !== this.expanded) {
           this.lastExpanded = this.expanded;
           this.tool.setExpanded(this.expanded);
         }
