@@ -53,7 +53,7 @@ function transcriptText(file) {
   return runtime
     .readTranscript(file)
     .filter((i) => i.kind === "assistant")
-    .map((i) => i.text)
+    .map((i) => runtime.assistantText(i.message))
     .join("\n");
 }
 

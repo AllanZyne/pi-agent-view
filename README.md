@@ -125,6 +125,27 @@ pi's own transcript as custom entries (`pi.appendEntry` +
 `AssistantMessageComponent` and `ToolExecutionComponent`. The only widget is the
 agent list.
 
+### Identical to the main session, on purpose
+
+Using pi's components is not enough — they have to be fed what pi feeds them:
+
+| input | why it matters |
+| --- | --- |
+| `outputPad`, `markdown.codeBlockIndent`, `hideThinkingBlock`, `terminal.showImages`/`imageWidthCells` (read via `SettingsManager`) | body padding, code indentation, thinking blocks and images; a wrong `outputPad` shifts every agent line by a column |
+| whole `AssistantMessage` objects, thinking parts included | pi renders text, thinking and stop-reason notices in *one* component with its own spacing — synthesising per-part items cannot reproduce it |
+| `Spacer(1)` before a user message | pi separates a user turn from what precedes it |
+| pi's **built-in tool renderers** (`withBuiltInRenderers`) | without them a tool call degrades to a bold name plus a raw JSON argument dump; with them `bash` shows `$ ls -la`, `edit` shows a diff, exactly like the main session |
+| `options.expanded` from the entry renderer | `Ctrl+O` expands agent tool output too |
+
+The tool renderers live in a package path that pi's `exports` map does not
+expose. `tool-renderers.ts` reaches them without guessing an install path, by
+walking out of the alias the host already set up for the package entry
+(`"@earendil-works/pi-coding-agent/../core/tools/renderers/index.js"`), and
+degrades to the generic rendering if that ever fails.
+
+`tests/unit.render.mjs` renders agent items and asserts they are line-for-line
+identical to what pi's own components produce for the same messages.
+
 ### Transcripts stay separate
 
 One view shows exactly one conversation — the main session's or one agent's,
@@ -179,6 +200,7 @@ new agents always join the same group.
 | `storage.ts` | `__agents__/<rootId>/*.jsonl` + manifest, agent naming (headless) |
 | `view-model.ts` | list rows, selection, mirror bookkeeping (headless) |
 | `transcript-view.ts` | main-vs-agent transcript separation (headless) |
+| `tool-renderers.ts` | pi's built-in tool renderers, for agent tool calls (headless) |
 | `index.ts` | rendering, key handling, extension wiring (TUI) |
 | `tests/` | test harness and tests |
 

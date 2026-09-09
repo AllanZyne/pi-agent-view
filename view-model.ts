@@ -8,7 +8,15 @@
 
 import * as fs from "node:fs";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { getAgent, modelOf, readTranscript, stateOf, type AgentState, type TranscriptItem } from "./agent-runtime.ts";
+import {
+  assistantHasContent,
+  getAgent,
+  modelOf,
+  readTranscript,
+  stateOf,
+  type AgentState,
+  type TranscriptItem,
+} from "./agent-runtime.ts";
 import type { AgentEntry } from "./storage.ts";
 
 export type { AgentState };
@@ -275,10 +283,11 @@ export function isVisible(state: MirrorState, file: string): boolean {
 export function renderable(item: TranscriptItem): boolean {
   switch (item.kind) {
     case "user":
-    case "assistant":
-    case "thinking":
     case "error":
       return item.text.trim().length > 0;
+    // An assistant message draws nothing until its first delta arrives.
+    case "assistant":
+      return assistantHasContent(item.message);
     case "toolCall":
       return true;
     case "toolResult":

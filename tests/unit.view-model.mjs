@@ -7,7 +7,25 @@ import { assert, assertEqual, load, tempDir, test } from "./harness.mjs";
 const vm = await load("view-model.ts");
 
 const userItem = (text) => ({ kind: "user", text });
-const assistantItem = (text, streaming = false) => ({ kind: "assistant", text, streaming });
+const assistantMessage = (text, extra = {}) => ({
+  role: "assistant",
+  content: text ? [{ type: "text", text }] : [],
+  stopReason: "stop",
+  ...extra,
+});
+const assistantItem = (text, streaming = false) => ({
+  kind: "assistant",
+  message: assistantMessage(text, streaming ? { stopReason: "pending" } : {}),
+  streaming,
+});
+const setText = (item, text) => {
+  item.message.content = text ? [{ type: "text", text }] : [];
+};
+const thinkingItem = (thinking) => ({
+  kind: "assistant",
+  message: { role: "assistant", content: [{ type: "thinking", thinking }], stopReason: "stop" },
+  streaming: false,
+});
 const toolCall = (id, name = "bash") => ({ kind: "toolCall", id, name, args: { command: "true" } });
 const toolResult = (toolCallId, name = "bash") => ({
   kind: "toolResult",
@@ -22,6 +40,11 @@ test("renderable skips tool results and empty streaming text", () => {
   assert(vm.renderable(userItem("hi")), "user text renders");
   assert(!vm.renderable(assistantItem("", true)), "empty streaming assistant does not render yet");
   assert(vm.renderable(assistantItem("partial", true)), "assistant with a first delta renders");
+  assert(vm.renderable(thinkingItem("hmm")), "a thinking-only message renders");
+  assert(
+    vm.renderable({ kind: "assistant", message: { role: "assistant", content: [], stopReason: "error" }, streaming: false }),
+    "an errored turn renders its notice",
+  );
   assert(vm.renderable(toolCall("t1")), "tool call renders");
   assert(!vm.renderable(toolResult("t1")), "tool result is drawn inside its call");
 });
@@ -55,7 +78,7 @@ test("syncMirror waits for the streaming tail to produce text", () => {
   assertEqual(vm.mirroredCount(state, "A"), 1, "the empty assistant tail is not consumed");
 
   // First delta arrives.
-  items[1].text = "wor";
+  setText(items[1], "wor");
   assertEqual(vm.syncMirror(state, (r) => appended.push(r), () => items), 1, "assistant appears once");
   assertEqual(
     appended.map((r) => r.index),
@@ -64,7 +87,7 @@ test("syncMirror waits for the streaming tail to produce text", () => {
   );
 
   // Further deltas do not append: pi re-renders the same entry.
-  items[1].text = "working";
+  setText(items[1], "working");
   assertEqual(vm.syncMirror(state, (r) => appended.push(r), () => items), 0, "deltas do not append entries");
 });
 

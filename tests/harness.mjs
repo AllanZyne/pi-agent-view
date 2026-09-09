@@ -45,6 +45,14 @@ const jiti = createJiti(import.meta.url, {
 export const load = (file) => jiti.import(path.join(EXT_DIR, file));
 export const pi = await import(`${PI_DIR}/dist/index.js`);
 
+// pi initialises its theme at startup; rendering tests need the same, or every
+// component throws "Theme not initialized".
+try {
+  pi.initTheme("dark");
+} catch {
+  /* older pi builds initialise on import */
+}
+
 // ── assertions ─────────────────────────────────────────────────────
 
 export function assert(cond, message) {

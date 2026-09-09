@@ -35,8 +35,12 @@ export type AgentState = "idle" | "working" | "completed" | "failed";
  */
 export type TranscriptItem =
   | { kind: "user"; text: string }
-  | { kind: "assistant"; text: string; streaming: boolean; message?: AssistantMessage }
-  | { kind: "thinking"; text: string }
+  /**
+   * A whole assistant message, text and thinking parts in order, exactly as pi
+   * keeps it: `AssistantMessageComponent` renders all of it (markdown, thinking
+   * blocks, truncation/abort notices), so the view needs no per-part items.
+   */
+  | { kind: "assistant"; message: AssistantMessage; streaming: boolean }
   | { kind: "toolCall"; id: string; name: string; args: Record<string, unknown> }
   | {
       kind: "toolResult";
@@ -127,6 +131,45 @@ function textOf(content: unknown): string {
     .join("\n");
 }
 
+/** Concatenated text parts of an assistant message. */
+export function assistantText(message: AssistantMessage): string {
+  return textOf(message.content);
+}
+
+/**
+ * True when pi would draw something for this assistant message.
+ *
+ * Mirrors `AssistantMessageComponent`: visible text or thinking, or a notice it
+ * renders for a stop reason it treats as an error.
+ */
+export function assistantHasContent(message: AssistantMessage): boolean {
+  const content = (message.content ?? []) as Array<Record<string, any>>;
+  for (const part of content) {
+    if (part.type === "text" && String(part.text ?? "").trim()) return true;
+    if (part.type === "thinking" && String(part.thinking ?? "").trim()) return true;
+  }
+  if (content.some((part) => part.type === "toolCall")) return false;
+  const stop = (message as any).stopReason;
+  return stop === "length" || stop === "aborted" || stop === "error";
+}
+
+/** An empty assistant message to append streaming deltas into. */
+function emptyAssistant(message: unknown): AssistantMessage {
+  return { ...(message as AssistantMessage), content: [] };
+}
+
+/** Append a streaming delta to the last part of `kind`, or start a new one. */
+function appendDelta(message: AssistantMessage, kind: "text" | "thinking", delta: string): void {
+  if (!delta) return;
+  const content = message.content as Array<Record<string, any>>;
+  const last = content[content.length - 1];
+  if (last?.type === kind) {
+    last[kind === "text" ? "text" : "thinking"] += delta;
+    return;
+  }
+  content.push(kind === "text" ? { type: "text", text: delta } : { type: "thinking", thinking: delta });
+}
+
 /**
  * Seed the transcript from an existing session file so attaching to a
  * previously-created agent shows its history.
@@ -142,21 +185,16 @@ export function seedTranscript(sm: SessionManager): TranscriptItem[] {
         const t = textOf(m.content);
         if (t) out.push({ kind: "user", text: t });
       } else if (m.role === "assistant") {
-        const texts = (m.content ?? []).filter((c: any) => c.type === "text" && c.text);
-        if (texts.length > 0) {
-          out.push({
-            kind: "assistant",
-            text: texts.map((c: any) => c.text).join("\n"),
-            streaming: false,
-            message: m as AssistantMessage,
-          });
+        // The whole message goes in, so history renders like a live turn:
+        // thinking blocks, markdown and error notices all come from pi.
+        if (assistantHasContent(m as AssistantMessage)) {
+          out.push({ kind: "assistant", message: m as AssistantMessage, streaming: false });
         }
         for (const c of m.content ?? []) {
           if (c.type === "toolCall") {
             out.push({ kind: "toolCall", id: c.id, name: c.name, args: c.arguments ?? {} });
           }
         }
-        if (m.errorMessage) out.push({ kind: "error", text: m.errorMessage });
       } else if (m.role === "toolResult") {
         out.push({
           kind: "toolResult",
@@ -198,7 +236,7 @@ function attachEvents(agent: LiveAgent): () => void {
           if (t) agent.transcript.push({ kind: "user", text: t });
         } else if (m?.role === "assistant") {
           // Placeholder that streaming deltas append into.
-          agent.transcript.push({ kind: "assistant", text: "", streaming: true });
+          agent.transcript.push({ kind: "assistant", message: emptyAssistant(m), streaming: true });
         }
         agent.state = "working";
         notify();
@@ -209,13 +247,12 @@ function attachEvents(agent: LiveAgent): () => void {
         const ev = event.assistantMessageEvent;
         if (!ev) break;
         const last = agent.transcript[agent.transcript.length - 1];
-        if (ev.type === "text_delta" && last?.kind === "assistant" && last.streaming) {
-          last.text += ev.delta ?? "";
+        if (last?.kind !== "assistant" || !last.streaming) break;
+        if (ev.type === "text_delta") {
+          appendDelta(last.message, "text", ev.delta ?? "");
           notify();
         } else if (ev.type === "thinking_delta") {
-          const prev = agent.transcript[agent.transcript.length - 1];
-          if (prev?.kind === "thinking") prev.text += ev.delta ?? "";
-          else agent.transcript.push({ kind: "thinking", text: ev.delta ?? "" });
+          appendDelta(last.message, "thinking", ev.delta ?? "");
           notify();
         }
         break;
@@ -223,16 +260,14 @@ function attachEvents(agent: LiveAgent): () => void {
 
       case "message_end": {
         const m = event.message;
-        // Finalize the streaming assistant placeholder.
+        // Finalize the streaming assistant placeholder with the authoritative
+        // message: it carries usage, stop reason and any error notice.
         for (let i = agent.transcript.length - 1; i >= 0; i--) {
           const it = agent.transcript[i]!;
           if (it.kind === "assistant" && it.streaming) {
             it.streaming = false;
-            // Prefer the authoritative final message.
-            const finalText = textOf(m?.content);
-            if (finalText) it.text = finalText;
             if (m?.role === "assistant") it.message = m as AssistantMessage;
-            if (!it.text) agent.transcript.splice(i, 1);
+            if (!assistantHasContent(it.message)) agent.transcript.splice(i, 1);
             break;
           }
         }
@@ -243,7 +278,6 @@ function attachEvents(agent: LiveAgent): () => void {
             }
           }
           if (m.errorMessage) {
-            agent.transcript.push({ kind: "error", text: m.errorMessage });
             agent.state = "failed";
             agent.error = m.errorMessage;
           }

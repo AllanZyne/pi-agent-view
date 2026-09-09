@@ -69,9 +69,11 @@ import * as path from "node:path";
 import {
   AssistantMessageComponent,
   CustomEditor,
+  getAgentDir,
   getMarkdownTheme,
   ModelSelectorComponent,
   SessionManager,
+  SettingsManager,
   ToolExecutionComponent,
   UserMessageComponent,
   type ExtensionAPI,
@@ -85,6 +87,7 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
   type Component,
+  type MarkdownTheme,
   type TUI,
 } from "@earendil-works/pi-tui";
 import {
@@ -101,6 +104,7 @@ import {
   setOnChange,
   sharedModelRuntime,
   steerAgent,
+  type TranscriptItem,
 } from "./agent-runtime.ts";
 import {
   agentName,
@@ -111,6 +115,7 @@ import {
   type RootCtx,
 } from "./storage.ts";
 import { findChatContainer, installChatFilter, type RenderNode } from "./transcript-view.ts";
+import { initToolRenderers, toolRenderersFor } from "./tool-renderers.ts";
 import {
   attachTo,
   buildRows,
@@ -118,6 +123,7 @@ import {
   moveSelection,
   noteMirrored,
   reconcileSelection,
+  renderable,
   selectedRow,
   syncMirror,
   type AgentRow,
@@ -164,44 +170,76 @@ function getView(): ViewState {
 const ITEM_ENTRY = "agent-view-item";
 const OWNED_ENTRIES: ReadonlySet<string> = new Set([ITEM_ENTRY]);
 
-function synthesizeAssistantMessage(text: string): AssistantMessage {
+/**
+ * Everything pi feeds its own message components, read from settings once so an
+ * agent transcript is laid out and coloured exactly like the main session's.
+ */
+export interface RenderSettings {
+  /** `outputPad` setting: horizontal padding of message bodies (pi default 1). */
+  outputPad: number;
+  markdownTheme: MarkdownTheme;
+  hideThinkingBlock: boolean;
+  tool: { showImages: boolean; imageWidthCells: number };
+}
+
+export function defaultRenderSettings(): RenderSettings {
   return {
-    role: "assistant",
-    content: text ? [{ type: "text", text }] : [],
-    api: "messages",
-    provider: "unknown",
-    model: "",
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-    stopReason: "pending",
-    timestamp: Date.now(),
-  } as AssistantMessage;
+    outputPad: 1,
+    markdownTheme: getMarkdownTheme(),
+    hideThinkingBlock: false,
+    tool: { showImages: true, imageWidthCells: 60 },
+  };
+}
+
+/** Read the same settings pi's interactive mode reads for rendering. */
+function readRenderSettings(cwd: string): RenderSettings {
+  const fallback = defaultRenderSettings();
+  try {
+    const settings = SettingsManager.create(cwd, getAgentDir());
+    return {
+      outputPad: settings.getOutputPad(),
+      markdownTheme: { ...getMarkdownTheme(), codeBlockIndent: settings.getCodeBlockIndent() },
+      hideThinkingBlock: settings.getHideThinkingBlock(),
+      tool: { showImages: settings.getShowImages(), imageWidthCells: settings.getImageWidthCells() },
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+/** Cheap change detector for a (possibly streaming) assistant message. */
+function assistantSignature(item: { message: AssistantMessage; streaming: boolean }): string {
+  let size = 0;
+  for (const part of (item.message.content ?? []) as Array<Record<string, any>>) {
+    size += String(part.text ?? part.thinking ?? "").length + 1;
+  }
+  const message = item.message as any;
+  return `${size}:${item.streaming}:${message.stopReason ?? ""}:${message.errorMessage ?? ""}`;
 }
 
 /**
  * Renders one agent transcript item using pi's own message components, so an
  * agent's output is indistinguishable from a normal pi session's.
  */
-class AgentItemComponent implements Component {
+export class AgentItemComponent implements Component {
   private user?: UserMessageComponent;
   private assistant?: AssistantMessageComponent;
   private tool?: ToolExecutionComponent;
   private lastSignature = "";
+  private lastExpanded?: boolean;
 
   constructor(
     private readonly ref: ItemRef,
     private readonly theme: Theme,
-    private readonly outputPad: number,
+    private readonly settings: RenderSettings,
+    /** Ctrl+O state, forwarded to tool boxes exactly like pi does. */
+    private readonly expanded: boolean,
     private readonly tui: TUI | undefined,
     private readonly cwd: string,
     /** Entries are persisted forever; only the attached agent may draw. */
     private readonly visible: (file: string) => boolean,
+    /** Test seam; defaults to the live agent pool. */
+    private readonly read: (file: string) => TranscriptItem[] = readTranscript,
   ) {}
 
   invalidate(): void {
@@ -212,58 +250,61 @@ class AgentItemComponent implements Component {
 
   render(width: number): string[] {
     if (!this.visible(this.ref.file)) return [];
-    const items = readTranscript(this.ref.file);
+    const items = this.read(this.ref.file);
     const item = items[this.ref.index];
     if (!item) return [];
+    const pad = this.settings.outputPad;
 
     switch (item.kind) {
       case "user": {
-        this.user ??= new UserMessageComponent(item.text, getMarkdownTheme(), this.outputPad);
-        return this.user.render(width);
+        this.user ??= new UserMessageComponent(item.text, this.settings.markdownTheme, pad);
+        const lines = this.user.render(width);
+        // pi separates a user message from whatever precedes it with a blank
+        // line (`Spacer(1)` when the chat is not empty).
+        return items.slice(0, this.ref.index).some(renderable) ? ["", ...lines] : lines;
       }
 
       case "assistant": {
+        // The component draws text, thinking blocks and stop-reason notices,
+        // and adds its own leading spacer — same call pi makes.
         this.assistant ??= new AssistantMessageComponent(
           undefined,
-          false,
-          getMarkdownTheme(),
+          this.settings.hideThinkingBlock,
+          this.settings.markdownTheme,
           undefined,
-          this.outputPad,
+          pad,
         );
-        const signature = `${item.text.length}:${item.streaming}`;
+        const signature = assistantSignature(item);
         if (signature !== this.lastSignature) {
           this.lastSignature = signature;
-          this.assistant.updateContent(item.message ?? synthesizeAssistantMessage(item.text), item.streaming);
+          this.assistant.updateContent(item.message, item.streaming);
         }
         return this.assistant.render(width);
       }
 
-      case "thinking": {
-        const out: string[] = [];
-        for (const raw of item.text.split("\n")) {
-          for (const line of wrapTextWithAnsi(raw, Math.max(20, width - 4))) {
-            out.push(`  ${this.theme.fg("dim", line)}`);
-          }
-        }
-        return out;
-      }
-
       case "toolCall": {
         if (!this.tui) {
-          return [truncateToWidth(`  ${this.theme.fg("warning", `⏵ ${item.name}`)}`, width)];
+          return [truncateToWidth(`${" ".repeat(pad)}${this.theme.fg("warning", `⏵ ${item.name}`)}`, width)];
         }
         if (!this.tool) {
           this.tool = new ToolExecutionComponent(
             item.name,
             item.id,
             item.args,
-            undefined,
-            undefined,
+            this.settings.tool,
+            // Without pi's built-in renderers a tool call degrades to its bare
+            // name plus raw output, which is the one thing that never looked
+            // like the main session.
+            toolRenderersFor(item.name) as never,
             this.tui,
             this.cwd,
           );
           this.tool.setArgsComplete();
           this.tool.markExecutionStarted();
+        }
+        if (this.lastExpanded !== this.expanded) {
+          this.lastExpanded = this.expanded;
+          this.tool.setExpanded(this.expanded);
         }
         // Pair the call with its result so pi renders the usual call+result box.
         const result = items.find((it) => it.kind === "toolResult" && it.toolCallId === item.id);
@@ -283,8 +324,8 @@ class AgentItemComponent implements Component {
       case "error": {
         const out: string[] = [];
         for (const raw of item.text.split("\n")) {
-          for (const line of wrapTextWithAnsi(raw, Math.max(20, width - 4))) {
-            out.push(`  ${this.theme.fg("error", line)}`);
+          for (const line of wrapTextWithAnsi(raw, Math.max(20, width - pad * 2))) {
+            out.push(`${" ".repeat(pad)}${this.theme.fg("error", line)}`);
           }
         }
         return out;
@@ -590,7 +631,8 @@ export default function agentViews(pi: ExtensionAPI): void {
   const view = getView();
   /** Captured from the (invisible) tick widget so components can request renders. */
   let tui: TUI | undefined;
-  let outputPad = 0;
+  /** Refreshed on every session start, like pi refreshes its own render settings. */
+  let renderSettings = defaultRenderSettings();
 
   /**
    * Custom entries are persisted and can never be removed, so every agent's
@@ -626,10 +668,19 @@ export default function agentViews(pi: ExtensionAPI): void {
     tui?.requestRender(true);
   }
 
-  // Agent output is rendered by pi, through these renderers.
+  // Agent output is rendered by pi, through this renderer. `options.expanded`
+  // is pi's Ctrl+O state, so agent tool boxes expand with everything else.
   pi.registerEntryRenderer<ItemRef>(ITEM_ENTRY, (entry, options, theme) =>
     entry.data
-      ? new AgentItemComponent(entry.data, theme, outputPad, tui, process.cwd(), visible)
+      ? new AgentItemComponent(
+          entry.data,
+          theme,
+          renderSettings,
+          options.expanded,
+          tui,
+          process.cwd(),
+          visible,
+        )
       : undefined,
   );
 
@@ -926,6 +977,13 @@ export default function agentViews(pi: ExtensionAPI): void {
     // container and everything already mirrored into it, so the view survives:
     // reloading while attached must not silently drop you back on "main".
     const reloaded = event.reason === "reload";
+
+    // Same inputs pi's interactive mode uses to draw messages, plus the
+    // built-in tool renderers it hands to every tool box.
+    renderSettings = readRenderSettings(ctx.cwd);
+    void initToolRenderers().then((ok) => {
+      if (ok) tui?.requestRender();
+    });
 
     view.open = false;
     if (!reloaded) {
