@@ -115,6 +115,17 @@ model instead of resetting it to the main session's. The picker shows a live
 agent's current model immediately, without waiting for its next assistant
 message.
 
+## Slash commands while attached
+
+pi's own slash-command dispatch never runs while an agent is attached: typed
+text (other than `/model`, above) is sent to the agent as a chat message
+instead, exactly like typing anything else. Commands that operate on pi's own
+session/tree — `/resume`, `/fork`, `/new`, `/tree`, and so on — have no
+meaning for an agent, so `/` completion only lists commands actually
+implemented for an attached view (`SUPPORTED_ATTACHED_COMMANDS` in
+`index.ts`, currently just `/model`) instead of suggesting every pi built-in
+as if it would work.
+
 ## How it works
 
 ### Agents are not pi sessions

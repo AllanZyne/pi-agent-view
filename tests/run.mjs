@@ -10,6 +10,7 @@ import "./unit.view-model.mjs";
 import "./unit.transcript-view.mjs";
 import "./unit.tool-renderers.mjs";
 import "./unit.render.mjs";
+import "./unit.attached-commands.mjs";
 import "./e2e.concurrency.mjs";
 import { run } from "./harness.mjs";
 

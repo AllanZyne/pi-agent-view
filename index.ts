@@ -87,6 +87,8 @@ import {
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
+  type AutocompleteItem,
+  type AutocompleteProvider,
   type Component,
   type MarkdownTheme,
   type TUI,
@@ -144,7 +146,7 @@ function rootOf(ctx: ExtensionContext): RootCtx | null {
 
 // ── View state (survives per-session extension reloads) ────────────
 
-interface ViewState extends MirrorState, Selection {
+export interface ViewState extends MirrorState, Selection {
   /** Picker widget visible. */
   open: boolean;
   showHelp: boolean;
@@ -480,6 +482,48 @@ function parseModelCommand(text: string): { search?: string } | undefined {
   if (text !== "/model" && !text.startsWith("/model ")) return undefined;
   const search = text.slice("/model".length).trim();
   return { search: search || undefined };
+}
+
+/**
+ * Slash commands actually implemented for an attached agent, keyed by the
+ * name pi's autocomplete lists them under (no leading slash).
+ *
+ * Every pi built-in command past this set is meaningless for an agent — it
+ * operates on pi's own session/tree (`/resume`, `/fork`, `/new`, `/tree`, …),
+ * which is not what an attached view is showing — and `handleInput` below
+ * never lets pi's real command dispatch run while attached, so typing one
+ * used to just get sent to the agent as a chat message with the autocomplete
+ * suggesting it as if it would work. Add a command here (and teach
+ * `handleInput` to actually run it) as attached-agent support for it lands.
+ */
+export const SUPPORTED_ATTACHED_COMMANDS = new Set<string>(["model"]);
+
+/**
+ * Hide slash commands the attached view does not support from `/` completion,
+ * so the suggestion list matches what actually works when you press Enter
+ * (see `SUPPORTED_ATTACHED_COMMANDS`). Detached (on `main`), this passes
+ * every call straight through: `view.attached` is unset only there.
+ */
+export function withAttachedCommandFilter(current: AutocompleteProvider, view: ViewState): AutocompleteProvider {
+  return {
+    triggerCharacters: current.triggerCharacters,
+    async getSuggestions(lines, cursorLine, cursorCol, options) {
+      const result = await current.getSuggestions(lines, cursorLine, cursorCol, options);
+      if (!result || !view.attached) return result;
+      // Only the top-level "/" command list needs filtering: a command that
+      // made it past that list is one we support, so its own argument
+      // completions (prefix has a space in it) are left untouched.
+      if (!result.prefix.startsWith("/") || result.prefix.includes(" ")) return result;
+      const items = result.items.filter((item: AutocompleteItem) => SUPPORTED_ATTACHED_COMMANDS.has(item.value));
+      if (items.length === 0) return null;
+      return { ...result, items };
+    },
+    applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
+      current.applyCompletion(lines, cursorLine, cursorCol, item, prefix),
+    shouldTriggerFileCompletion: current.shouldTriggerFileCompletion
+      ? (lines, cursorLine, cursorCol) => current.shouldTriggerFileCompletion!(lines, cursorLine, cursorCol)
+      : undefined,
+  };
 }
 
 /**
@@ -1109,6 +1153,7 @@ export default function agentViews(pi: ExtensionAPI): void {
     void initToolRenderers().then((ok) => {
       if (ok) tui?.requestRender();
     });
+    ctx.ui.addAutocompleteProvider((current) => withAttachedCommandFilter(current, view));
 
     view.open = false;
     if (!reloaded) {
