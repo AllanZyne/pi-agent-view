@@ -521,8 +521,8 @@ class AgentWorkingStatus extends Loader {
   }
 }
 
-/** Same wording as pi's, with the key that interrupts *an agent*. */
-const AGENT_WORKING_MESSAGE = "Working (ctrl+x to abort)";
+/** Shown on the agent's editor border while it streams. */
+const AGENT_WORKING_MESSAGE = "Working";
 
 class AgentViewEditor extends CustomEditor {
   constructor(
