@@ -1,4 +1,4 @@
-# pi-agent-views
+# pi-agent-view
 
 Concurrent sub-agents for [pi](https://pi.dev), each rendered by pi itself.
 
@@ -32,7 +32,7 @@ agent keeps working while you look at another one.
 ## Install
 
 ```bash
-pi install git:github.com/AllanZyne/pi-agent-views
+pi install git:github.com/AllanZyne/pi-agent-view
 ```
 
 ## Usage

@@ -64,7 +64,7 @@ function renderableCount(file) {
 test(
   "three agents keep running while the attached view is switched around",
   async () => {
-    const dir = tempDir("agent-views-e2e-");
+    const dir = tempDir("agent-view-e2e-");
     const root = makeRoot(dir);
     const cwd = dir;
 
@@ -158,7 +158,7 @@ test(
 test(
   "an agent keeps working while you are looking at another one",
   async () => {
-    const dir = tempDir("agent-views-e2e-");
+    const dir = tempDir("agent-view-e2e-");
     const root = makeRoot(dir, "root-e2e-2");
     const cwd = dir;
 
@@ -200,7 +200,7 @@ test(
 test(
   "terminating an agent stops it for good and leaves the others alone",
   async () => {
-    const dir = tempDir("agent-views-e2e-");
+    const dir = tempDir("agent-view-e2e-");
     const root = makeRoot(dir, "root-e2e-3");
     const cwd = dir;
 

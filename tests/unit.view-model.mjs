@@ -319,7 +319,7 @@ test("each agent's own model is what the picker reports", () => {
 const rt = await load("agent-runtime.ts");
 
 test("an agent that died mid-turn is Stopped, not Completed", () => {
-  const dir = tempDir("agent-views-state-");
+  const dir = tempDir("agent-view-state-");
   // What a killed agent looks like on disk: a turn that ends on a tool call
   // nothing ever answered (this is the shape of the hung agent that started it).
   const cutOff = writeSession(dir, "cut-off", [
@@ -339,14 +339,14 @@ test("an agent that died mid-turn is Stopped, not Completed", () => {
 });
 
 test("terminating an agent keeps it Stopped after its session is gone", async () => {
-  const file = "/tmp/agent-views-not-live.jsonl";
+  const file = "/tmp/agent-view-not-live.jsonl";
   assertEqual(rt.stateOf(file), undefined, "not live, nothing recorded");
   assertEqual(await rt.terminateAgent(file), false, "nothing was running");
   assertEqual(rt.stateOf(file), "stopped", "still reported as stopped without a session");
 });
 
 test("rows are grouped Working, Failed, Stopped, Idle, Completed", () => {
-  const dir = tempDir("agent-views-groups-");
+  const dir = tempDir("agent-view-groups-");
   const files = {
     main: writeSession(dir, "main", [assistantEntry("stop", "main done")]),
     broken: writeSession(dir, "broken", [assistantEntry("error", "boom", { errorMessage: "boom" })]),

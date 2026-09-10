@@ -874,7 +874,7 @@ export default function agentViews(pi: ExtensionAPI): void {
   function closePicker(ctx: ExtensionContext): void {
     view.open = false;
     view.showHelp = false;
-    ctx.ui.setWidget("agent-views", undefined);
+    ctx.ui.setWidget("agent-view", undefined);
   }
 
   /**
@@ -927,7 +927,7 @@ export default function agentViews(pi: ExtensionAPI): void {
     view.showHelp = false;
     view.open = true;
 
-    ctx.ui.setWidget("agent-views", (_tui, theme) => ({
+    ctx.ui.setWidget("agent-view", (_tui, theme) => ({
       render: (w: number) => renderPicker(view, theme, w),
       invalidate: () => {},
     }));
@@ -1164,13 +1164,13 @@ export default function agentViews(pi: ExtensionAPI): void {
       view.unfilter = undefined;
     }
     restoreFromSession(ctx);
-    ctx.ui.setWidget("agent-views", undefined);
+    ctx.ui.setWidget("agent-view", undefined);
     // Clear any footer status left behind by an older build of this extension.
-    ctx.ui.setStatus("agent-views", undefined);
+    ctx.ui.setStatus("agent-view", undefined);
 
     // Zero-height widget used only to obtain a TUI handle: transcript content
     // lives in pi's transcript, never in a widget.
-    ctx.ui.setWidget("agent-views-tick", (t) => {
+    ctx.ui.setWidget("agent-view-tick", (t) => {
       tui = t;
       view.refresh = () => t.requestRender();
       return {
@@ -1284,9 +1284,9 @@ export default function agentViews(pi: ExtensionAPI): void {
     view.unfilter?.();
     view.unfilter = undefined;
     setOnChange(undefined);
-    ctx.ui.setWidget("agent-views", undefined);
-    ctx.ui.setWidget("agent-views-tick", undefined);
-    ctx.ui.setStatus("agent-views", undefined);
+    ctx.ui.setWidget("agent-view", undefined);
+    ctx.ui.setWidget("agent-view-tick", undefined);
+    ctx.ui.setStatus("agent-view", undefined);
     // Only release the pool when pi is really going away; a session switch or
     // extension reload must leave background agents running.
     if (event.reason === "quit") void disposeAll();

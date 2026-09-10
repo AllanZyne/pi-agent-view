@@ -1,5 +1,5 @@
 /**
- * Tiny test harness for the agent-views extension.
+ * Tiny test harness for the agent-view extension.
  *
  * Loads the extension's TypeScript modules with jiti (the same loader pi uses
  * for extensions), so tests exercise the real code with no build step.
@@ -69,7 +69,7 @@ export function assertEqual(actual, expected, message) {
 
 const tempDirs = [];
 
-export function tempDir(prefix = "agent-views-test-") {
+export function tempDir(prefix = "agent-view-test-") {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   tempDirs.push(dir);
   return dir;
