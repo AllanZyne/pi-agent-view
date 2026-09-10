@@ -1,9 +1,9 @@
 ---
-name: pi-agent-reviews-debug
+name: pi-agent-view-debug
 description: Use when a bug report is about how a TUI/interactive-CLI extension renders or behaves at runtime (rendering glitches, "looks different from the main session", module-loading failures that unit tests don't catch) and you need to reproduce it against the real program instead of guessing from source. Also use when a try/catch is silently swallowing an error that only happens in the real runtime.
 ---
 
-# pi-agent-reviews-debug: reproduce TUI bugs for real, in tmux
+# pi-agent-view-debug: reproduce TUI bugs for real, in tmux
 
 ## When unit tests are not enough
 
