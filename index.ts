@@ -151,6 +151,7 @@ import { parseAtMention, type LiveAgentInfo } from "./at-mention.ts";
 import { wrapWithAgentMentions } from "./autocomplete.ts";
 import { findChatContainer, installChatFilter, isOwnedChild, type RenderNode } from "./transcript-view.ts";
 import { initToolRenderers, toolRenderersFor } from "./tool-renderers.ts";
+import { registerSubagentTool } from "./subagent-tool.ts";
 import {
   attachTo,
   buildRows,
@@ -984,6 +985,11 @@ export default function agentViews(pi: ExtensionAPI): void {
   // factory must never run inside an agent session being constructed.
   if (isLoadingSubAgent()) return;
 
+  // The `@<slug>` picker is a human affordance (it intercepts typed prompts);
+  // this tool is the model-callable equivalent, sharing the same pool so a
+  // tool-spawned agent shows up live in the picker too.
+  registerSubagentTool(pi);
+
   const view = getView();
   /** Captured from the (invisible) tick widget so components can request renders. */
   let tui: TUI | undefined;
@@ -1411,7 +1417,7 @@ export default function agentViews(pi: ExtensionAPI): void {
       const catalog = loadCatalog(ctx.cwd);
       if (catalog.agents.size === 0 && catalog.diagnostics.length === 0) {
         ctx.ui.notify(
-          "No sub-agent definitions found under .pi/agents/ or ~/.pi/agents/",
+          "No sub-agent definitions found under .pi/agents/ or ~/.pi/agent/agents/",
           "info",
         );
         return;

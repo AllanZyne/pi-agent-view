@@ -116,8 +116,9 @@ leading `\`, which is dropped so it doesn't leak into the transcript.
 ## Sub-agent definitions (`.pi/agents/`)
 
 Drop Markdown files under `.pi/agents/` (project, higher priority) or
-`~/.pi/agents/` (user) to predefine reusable agents — same idea as Claude
-Code's `.claude/agents/`. Format:
+`~/.pi/agent/agents/` (user — `getAgentDir()/agents/`, so it moves with
+`PI_CODING_AGENT_DIR` or a rebrand) to predefine reusable agents — same idea
+as Claude Code's `.claude/agents/`. Format:
 
 ```markdown
 ---
@@ -160,7 +161,7 @@ Differences from Claude Code's `.claude/agents/`:
 
 | Claude Code | pi-agent-view v1 |
 | --- | --- |
-| `.claude/agents/` | `.pi/agents/` |
+| `.claude/agents/` | `.pi/agents/` (project) / `~/.pi/agent/agents/` (user) |
 | body **replaces** the system prompt | body **appends** to pi's base prompt |
 | `tools`, `disallowedTools`, `hooks`, `mcpServers`, `permissionMode`, `skills`, `isolation`, `color`, `memory`, `effort` | not in v1 |
 | built-in Explore/Plan/general-purpose auto-delegation | none — v1 is explicit summoning only |

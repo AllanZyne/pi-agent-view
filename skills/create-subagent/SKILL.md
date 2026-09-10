@@ -1,6 +1,6 @@
 ---
 name: create-subagent
-description: Author a new sub-agent definition file for pi-agent-view under .pi/agents/ (project) or ~/.pi/agents/ (user). Use when the user asks to create, add, define, or design a new sub-agent — for example "create a code-reviewer subagent" or "add an agent that writes commit messages". Gathers a name, description, and system-prompt body, optionally a model, writes the .md file, and shows how to summon it with @name.
+description: Author a new sub-agent definition file for pi-agent-view under .pi/agents/ (project) or ~/.pi/agent/agents/ (user). Use when the user asks to create, add, define, or design a new sub-agent — for example "create a code-reviewer subagent" or "add an agent that writes commit messages". Gathers a name, description, and system-prompt body, optionally a model, writes the .md file, and shows how to summon it with @name.
 ---
 
 # Create a sub-agent definition
@@ -8,7 +8,7 @@ description: Author a new sub-agent definition file for pi-agent-view under .pi/
 pi-agent-view discovers sub-agent definitions under two roots:
 
 - `<cwd>/.pi/agents/**/*.md` — **project scope** (checked into the repo, shared with the team; higher priority)
-- `~/.pi/agents/**/*.md` — **user scope** (personal, available in every project)
+- `~/.pi/agent/agents/**/*.md` — **user scope** (personal, available in every project; this is `getAgentDir()/agents/`, so it follows `$PI_CODING_AGENT_DIR` if the user has overridden or rebranded it — do not assume the literal `~/.pi/agent/` path without checking)
 
 Each file is Markdown with YAML frontmatter. The body is *appended* to pi's
 base system prompt (supplement, not replace), so `AGENTS.md`, skills and
@@ -27,9 +27,10 @@ When the user asks to create a new sub-agent:
    if the request is already specific.
 2. **Pick a scope.** Default to **project** (`<cwd>/.pi/agents/`) when the
    agent is codebase-specific (references files in this repo, this project's
-   conventions, this team's checklist). Default to **user** (`~/.pi/agents/`)
-   when it's a generic role the user would use anywhere. If unclear, ask
-   once. Never write to both.
+   conventions, this team's checklist). Default to **user**
+   (`~/.pi/agent/agents/`, i.e. `getAgentDir()/agents/`) when it's a generic
+   role the user would use anywhere. If unclear, ask once. Never write to
+   both.
 3. **Draft a slug.** Lowercase letters, digits, hyphens; starts with a
    letter; 2–3 words max. Examples: `code-reviewer`, `commit-writer`,
    `security-auditor`. Reject `agent` (reserved by pi-agent-view for the
@@ -50,7 +51,10 @@ When the user asks to create a new sub-agent:
 6. **Optional fields.** Only include `model` or `thinkingLevel` when the
    user has a real reason; otherwise omit them (the agent inherits main's
    model at spawn time, which is what most people want).
-7. **Write the file** with the `write` tool at the chosen path. Do not
+7. **Write the file** with the `write` tool at the chosen path. For user
+   scope, resolve the actual directory instead of assuming the literal
+   `~/.pi/agent/agents/` — check `$PI_CODING_AGENT_DIR` first (e.g. `echo
+   $PI_CODING_AGENT_DIR`); if unset, it's `~/.pi/agent/agents/`. Do not
    overwrite an existing file without confirming.
 8. **Verify** by asking the user to run `/agents` — it force-rescans both
    roots and prints what it found — and show them the invocation form:
@@ -133,7 +137,7 @@ type hints?"*
 
 User: *"personal, focus on type hints and obvious bugs"*
 
-Write `~/.pi/agents/py-reviewer.md`:
+Write `~/.pi/agent/agents/py-reviewer.md`:
 
 ```markdown
 ---
@@ -161,7 +165,7 @@ line, one sentence describing the problem, and a suggested fix in one line
 or a small code block. If there are no issues, say so in one sentence.
 ```
 
-Then tell the user: *"Written to `~/.pi/agents/py-reviewer.md`. Run
+Then tell the user: *"Written to `~/.pi/agent/agents/py-reviewer.md`. Run
 `/agents` to confirm pi-agent-view sees it, then summon it with
 `@py-reviewer <diff or file to review>` anywhere in your prompt."*
 
@@ -169,7 +173,9 @@ Then tell the user: *"Written to `~/.pi/agents/py-reviewer.md`. Run
 
 - If the slug already exists in the same scope, either pick a different
   slug or ask before overwriting. Use `read` on the target path first.
-- Never write to a file path outside `.pi/agents/` or `~/.pi/agents/`.
+- Never write to a file path outside `.pi/agents/` or `~/.pi/agent/agents/`
+  (the latter is `getAgentDir()/agents/` — resolve it, don't hardcode the
+  literal path, in case `PI_CODING_AGENT_DIR` is set).
 - Never invent fields the user asked about that aren't in the frontmatter
   reference above — reply with the unsupported-fields list instead.
 - If the user says "and give it access to bash / restrict it to read-only /

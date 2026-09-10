@@ -107,7 +107,8 @@ test("loadCatalog: reads project scope and yields SubAgentDef", () => {
     "reviewer.md",
     "---\nname: reviewer\ndescription: strict\n---\nsystem prompt body\n",
   );
-  // agentRoots also looks at ~/.pi/agents; the test tmp home isolates that in the next test.
+  // agentRoots also looks at getAgentDir()/agents (~/.pi/agent/agents by
+  // default); the test tmp home isolates that in the next test.
   const c = catalog.loadCatalog(cwd);
   const def = c.agents.get("reviewer");
   assert(def, `expected 'reviewer' to be loaded: ${JSON.stringify([...c.agents.keys()])}`);
@@ -128,7 +129,7 @@ test("loadCatalog: project scope wins over user scope on name collision", () => 
       "---\nname: shared\ndescription: project version\n---\nproject body\n",
     );
     writeDef(
-      path.join(fakeHome, ".pi", "agents"),
+      path.join(fakeHome, ".pi", "agent", "agents"),
       "shared.md",
       "---\nname: shared\ndescription: user version\n---\nuser body\n",
     );
@@ -173,7 +174,7 @@ test("loadCatalog: bad files become diagnostics, not exceptions", () => {
 test("loadCatalog: missing directories are simply empty (no crash)", () => {
   const cwd = tempDir(); // no .pi/agents inside
   const savedHome = process.env.HOME;
-  process.env.HOME = tempDir(); // no ~/.pi/agents inside either
+  process.env.HOME = tempDir(); // no ~/.pi/agent/agents inside either
   try {
     const c = catalog.loadCatalog(cwd);
     assertEqual(c.agents.size, 0, "no agents");

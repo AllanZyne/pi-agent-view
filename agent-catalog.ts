@@ -1,10 +1,20 @@
 /**
  * agent-catalog.ts — discover sub-agent definitions from `.pi/agents/`.
  *
- * Mirrors Claude Code's `.claude/agents/` convention:
+ * Mirrors Claude Code's `.claude/agents/` convention, and the built-in
+ * `examples/extensions/subagent`'s own layout:
  *
- *   <cwd>/.pi/agents/**\/*.md     (project scope, higher priority)
- *   ~/.pi/agents/**\/*.md         (user scope)
+ *   <cwd>/.pi/agents/**\/*.md        (project scope, higher priority)
+ *   getAgentDir()/agents/**\/*.md    (user scope; `~/.pi/agent/agents/` by
+ *                                     default, or `$PI_CODING_AGENT_DIR/agents/`)
+ *
+ * User scope lives under `getAgentDir()`, not bare `~/.pi/`, because `~/.pi/`
+ * is the shared root for every pi-branded tool (the coding agent, the RPC
+ * server, etc. — see `PI_SERVER_DIR` defaulting to `~/.pi/server`), while
+ * `~/.pi/agent/` (`PI_CODING_AGENT_DIR`) is this tool's own namespace inside
+ * it. A bare `~/.pi/agents/` would sit as a stray sibling of `~/.pi/agent/`
+ * instead of inside it, and would silently stop working for anyone who sets
+ * `PI_CODING_AGENT_DIR` to relocate or rebrand the coding agent's state.
  *
  * A definition is a Markdown file with YAML frontmatter. The frontmatter
  * declares who the agent is and how it should be spawned; the body is
@@ -21,9 +31,8 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
 
 // ── Types ──────────────────────────────────────────────────────────
@@ -76,7 +85,7 @@ export const NAME_RE = /^[a-z][a-z0-9-]*$/;
 export function agentRoots(cwd: string): Array<{ dir: string; scope: "project" | "user" }> {
   return [
     { dir: path.join(cwd, ".pi", "agents"), scope: "project" },
-    { dir: path.join(os.homedir(), ".pi", "agents"), scope: "user" },
+    { dir: path.join(getAgentDir(), "agents"), scope: "user" },
   ];
 }
 

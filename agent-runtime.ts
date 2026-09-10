@@ -438,6 +438,7 @@ export async function ensureAgent(
   model?: Model<any>,
   thinkingLevel?: ThinkingLevel,
   def?: SubAgentDef,
+  forcedModel?: Model<any>,
 ): Promise<LiveAgent> {
   const reg = registry();
   const existing = reg.agents.get(file);
@@ -453,7 +454,10 @@ export async function ensureAgent(
   // missing / unresolvable model falls through to the caller-supplied
   // inheritance default — same rule as when there's no def.
   const defModel = def?.model ? tryResolveModel(modelRuntime, def.model) : undefined;
-  const inheritModel = defModel ?? model;
+  // `forcedModel` is a caller's explicit choice (e.g. the `subagent` tool's
+  // `model` parameter) rather than an inheritance default, so it outranks
+  // both the def's model and the plain inherited one.
+  const inheritModel = forcedModel ?? defModel ?? model;
   const inheritThinking = def?.thinkingLevel ?? thinkingLevel;
 
   // `noExtensions` is the clean way to avoid recursively loading THIS
@@ -530,6 +534,22 @@ function tryResolveModel(runtime: ModelRuntime, id: string): Model<any> | undefi
 }
 
 /**
+ * Public, string-based variant of `tryResolveModel` for callers outside this
+ * module (e.g. the `subagent` tool's `model: "provider/id"` parameter) that
+ * don't otherwise need a `ModelRuntime` handle.
+ */
+export async function resolveModelId(id: string): Promise<Model<any> | undefined> {
+  const runtime = await getModelRuntime();
+  return tryResolveModel(runtime, id);
+}
+
+/** Every `provider/id` currently available (has auth configured), for error messages. */
+export async function availableModelIds(): Promise<string[]> {
+  const runtime = await getModelRuntime();
+  return runtime.getAvailableSnapshot().map((m) => `${m.provider}/${m.id}`);
+}
+
+/**
  * Start (or continue) an agent with a prompt. Runs concurrently; does not await
  * completion. Safe to call while other agents are running.
  */
@@ -540,8 +560,9 @@ export async function runAgent(
   model?: Model<any>,
   thinkingLevel?: ThinkingLevel,
   def?: SubAgentDef,
+  forcedModel?: Model<any>,
 ): Promise<void> {
-  const agent = await ensureAgent(file, cwd, model, thinkingLevel, def);
+  const agent = await ensureAgent(file, cwd, model, thinkingLevel, def, forcedModel);
   agent.state = "working";
   agent.error = undefined;
   notify();
@@ -554,6 +575,46 @@ export async function runAgent(
     agent.transcript.push({ kind: "error", text: String(err) });
     notify();
   });
+}
+
+/**
+ * Start (or continue) an agent with a prompt and wait for the turn to end.
+ *
+ * Same bookkeeping as `runAgent`, but awaits completion instead of firing and
+ * forgetting, so a caller that needs the result (e.g. the `subagent` tool)
+ * can read the final transcript as soon as this resolves. Because the agent
+ * is registered in the same pool as `runAgent` uses, it is a live entry in
+ * the picker for the whole time this promise is pending — a human can attach
+ * to it, watch it stream, or steer it, exactly like any other agent.
+ *
+ * `forcedModel`, if given, is an explicit caller choice (not merely an
+ * inheritance default) and outranks both the def's model and the plain
+ * inherited one — see `ensureAgent()`.
+ */
+export async function runAgentAndWait(
+  file: string,
+  prompt: string,
+  cwd: string,
+  model?: Model<any>,
+  thinkingLevel?: ThinkingLevel,
+  def?: SubAgentDef,
+  forcedModel?: Model<any>,
+): Promise<LiveAgent> {
+  const agent = await ensureAgent(file, cwd, model, thinkingLevel, def, forcedModel);
+  agent.state = "working";
+  agent.error = undefined;
+  notify();
+
+  try {
+    await agent.session.prompt(prompt);
+  } catch (err) {
+    // The turn never reached a verdict: the session itself blew up.
+    agent.state = "stopped";
+    agent.error = String(err);
+    agent.transcript.push({ kind: "error", text: String(err) });
+  }
+  notify();
+  return agent;
 }
 
 /** Send a steering message to a running agent. */
