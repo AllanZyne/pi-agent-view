@@ -40,6 +40,34 @@ test("registerAgent appends to an existing manifest", () => {
   assertEqual(names, ["a", "b"], "both agents are recorded in order");
 });
 
+test("registerAgent records the sub-agent def name when given one", () => {
+  const dir = tempDir();
+  const rootFile = path.join(dir, "root.jsonl");
+  fs.writeFileSync(rootFile, "");
+  const root = { rootId: "root-def", rootFile, sessionDir: dir };
+
+  storage.registerAgent(root, "plain", dir);
+  storage.registerAgent(root, "backed", dir, "code-reviewer");
+
+  const agents = storage.loadManifest(dir, "root-def").agents;
+  assertEqual(agents[0].def, undefined, "plain agent has no def field on disk");
+  assertEqual(agents[1].def, "code-reviewer", "def-backed agent records its def name");
+});
+
+test("listAgentEntries returns def fields through unchanged (forward-compat)", () => {
+  const dir = tempDir();
+  const rootFile = path.join(dir, "root.jsonl");
+  fs.writeFileSync(rootFile, "");
+  const root = { rootId: "root-def2", rootFile, sessionDir: dir };
+
+  const flushed = storage.registerAgent(root, "one", dir, "reviewer");
+  fs.writeFileSync(flushed, "");
+
+  const entries = storage.listAgentEntries(root);
+  assertEqual(entries.length, 1);
+  assertEqual(entries[0].def, "reviewer", "def is preserved through the read path");
+});
+
 test("resolveRoot treats a normal session file as its own root", () => {
   const dir = tempDir();
   const file = path.join(dir, "session.jsonl");

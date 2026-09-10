@@ -9,6 +9,9 @@
   "pi": {
     "extensions": [
       "./index.ts"
+    ],
+    "skills": [
+      "./skills/create-subagent/SKILL.md"
     ]
   },
   "scripts": {

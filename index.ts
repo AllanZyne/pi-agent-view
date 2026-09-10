@@ -41,8 +41,9 @@
  *   ←              open/close the agent picker (empty editor only)
  *   ↑ ↓            move selection (empty editor only)
  *   Enter / →      attach: stream that agent into the transcript
- *   Enter + text   picker open: new agent with that first prompt
- *                  attached:    steer the attached agent
+ *   Enter + text   picker open: spawn a background agent with that prompt
+ *                  attached:    `@<slug>` from another agent stays background,
+ *                               anything else steers the attached agent
  *   Esc            detach (agent keeps running)
  *   Ctrl+X         terminate that agent (main session: interrupt its turn)
  *   Ctrl+L         model selector for the conversation on screen
@@ -50,12 +51,39 @@
  *   ?              help
  *
  * Commands
- *   /agent <task>   start a background agent without leaving or interrupting
- *                   the session you are in
+ *   /agents         list sub-agent definitions discovered under .pi/agents/
+ *                   (rescans on every call — no explicit reload flag needed).
  *   /model [name]   while attached (or with the picker open): set that agent's
  *                   model. pi's own /model is intercepted by interactive mode
  *                   and always targets pi's session, so an agent view has to
  *                   recognise it itself.
+ *
+ * Summoning agents (replaces the old `/agent <task>` command)
+ *   `@<slug>` at the **start of a message** (leading whitespace allowed) is
+ *   a routing operator. Anywhere else in the message it's prose — the
+ *   tight position rule is what keeps "the @pinger def has a bug" from
+ *   accidentally spawning an agent. Resolution (see `at-mention.ts`):
+ *     1. `agent`                       — spawn a new adhoc agent (inherits main)
+ *     2. live agent whose name = slug   — route to that instance
+ *     3. live agent(s) whose def = slug — route to the most-recent one
+ *     4. catalog def named slug         — spawn a def-backed agent whose
+ *                                         Markdown body is appended to pi's
+ *                                         base system prompt
+ *     5. otherwise                      — not intercepted, chat as usual
+ *
+ *   Works from anywhere — detached main, picker open, and attached views.
+ *   In an attached view, the currently attached agent is excluded from
+ *   name/def matching so `@slug` addresses *another* agent; if the only
+ *   reachable target is self, the message falls through to `steer` and
+ *   goes to the current agent as chat.
+ *
+ *   Escape a leading `@` with backslash (`\@pinger`) if you want to write
+ *   it as literal text at the start of a message; the `\` is stripped
+ *   before send. Backticks and quotes also work as escapes.
+ *
+ *   Typing `@` at the start of the message opens an agent picker instead
+ *   of pi's file picker; mid-message `@` still opens pi's file picker
+ *   (see `autocomplete.ts`).
  *
  * Storage: agent sessions live in
  *   <sessionDir>/__agents__/<rootId>/<agentId>.jsonl
@@ -118,7 +146,10 @@ import {
   ROOT_AGENT_NAME,
   type RootCtx,
 } from "./storage.ts";
-import { findChatContainer, installChatFilter, type RenderNode } from "./transcript-view.ts";
+import { loadCatalog, type Catalog, type SubAgentDef } from "./agent-catalog.ts";
+import { parseAtMention, type LiveAgentInfo } from "./at-mention.ts";
+import { wrapWithAgentMentions } from "./autocomplete.ts";
+import { findChatContainer, installChatFilter, isOwnedChild, type RenderNode } from "./transcript-view.ts";
 import { initToolRenderers, toolRenderersFor } from "./tool-renderers.ts";
 import {
   attachTo,
@@ -142,6 +173,52 @@ import {
 
 function rootOf(ctx: ExtensionContext): RootCtx | null {
   return resolveRoot(ctx.sessionManager.getSessionFile(), ctx.sessionManager.getSessionId());
+}
+
+/**
+ * Best-effort mtime for ordering "most recently active" agents. A live agent
+ * whose session file pi has not flushed yet reads as "very recent" (Date.now)
+ * so a just-spawned agent tops the ordering — which is what a user typing
+ * `@name` right after spawning a sibling naturally expects.
+ */
+function statMtime(file: string): number {
+  try {
+    return fs.statSync(file).mtimeMs;
+  } catch {
+    return Date.now();
+  }
+}
+
+/**
+ * Strip a leading backslash from `@<slug>` escape sequences, Slack-style.
+ *
+ * Users who want to write `@pinger` as literal chat (e.g. discussing a bug
+ * in that def) type `\@pinger` to suppress interception. The backslash isn't
+ * whitespace, so `parseAtMention` sees it as prose and doesn't fire; this
+ * helper then removes the `\` before the message is sent so the escape is
+ * cosmetic and never leaks into main's transcript or a sub-agent's task.
+ *
+ * Only `\@<slug>` sequences are touched; other backslashes are left alone.
+ */
+function stripAtEscape(text: string): string {
+  return text.replace(/\\@([a-z][a-z0-9-]*)/g, "@$1");
+}
+
+/**
+ * Snapshot the live-agent pool for `@`-mention routing and completion.
+ *
+ * Ordered most-recently-active first (see `statMtime`) so both
+ * `parseAtMention` rule 3 and the `@` completion list surface the freshest
+ * instance when a def has several running siblings. Callers may further
+ * filter by `excludeFile` (typically `view.attached`) to drop "self".
+ */
+function computeLiveAgents(ctx: ExtensionContext): LiveAgentInfo[] {
+  const root = rootOf(ctx);
+  if (!root) return [];
+  return listAgentEntries(root, (f) => getAgent(f) !== undefined)
+    .filter((a) => getAgent(a.file) !== undefined)
+    .sort((a, b) => statMtime(b.file) - statMtime(a.file))
+    .map((a) => ({ file: a.file, name: a.name, ...(a.def ? { def: a.def } : {}) }));
 }
 
 // ── View state (survives per-session extension reloads) ────────────
@@ -262,13 +339,26 @@ export class AgentItemComponent implements Component {
     if (!item) return [];
     const pad = this.settings.outputPad;
 
+    // pi's `CustomEntryComponent` (the wrapper around every custom entry pi
+    // holds) unconditionally prepends `Spacer(1)` to whatever this renderer
+    // returns. That Spacer plays the same role as pi's native "blank between
+    // messages" convention — so if our render *also* starts with a Spacer's
+    // truly-empty `""` line (assistant and tool components both do), or if we
+    // add our own `""` prefix for a user message with preceding content, the
+    // two double up and every message pair grows an extra blank. `dropLeadingSpacer`
+    // borrows the CustomEntry Spacer as the between-messages gap: it strips
+    // one leading zero-width line (empty string, or a line containing only
+    // escape sequences like AssistantMessageComponent's OSC133 zone marker on
+    // top of its `Spacer(1)`), while leaving Box padding lines (from
+    // `applyBg("", w)`, which produce bg-tinted spaces — non-zero width)
+    // untouched so a user message keeps its box top-padding.
+    const dropLeadingSpacer = (lines: string[]): string[] =>
+      lines.length > 0 && visibleWidth(lines[0]!) === 0 ? lines.slice(1) : lines;
+
     switch (item.kind) {
       case "user": {
         this.user ??= new UserMessageComponent(item.text, this.settings.markdownTheme, pad);
-        const lines = this.user.render(width);
-        // pi separates a user message from whatever precedes it with a blank
-        // line (`Spacer(1)` when the chat is not empty).
-        return items.slice(0, this.ref.index).some(renderable) ? ["", ...lines] : lines;
+        return this.user.render(width);
       }
 
       case "assistant": {
@@ -286,7 +376,7 @@ export class AgentItemComponent implements Component {
           this.lastSignature = signature;
           this.assistant.updateContent(item.message, item.streaming);
         }
-        return this.assistant.render(width);
+        return dropLeadingSpacer(this.assistant.render(width));
       }
 
       case "toolCall": {
@@ -327,7 +417,7 @@ export class AgentItemComponent implements Component {
             false,
           );
         }
-        return this.tool.render(width);
+        return dropLeadingSpacer(this.tool.render(width));
       }
 
       // Results are rendered together with their call.
@@ -379,12 +469,14 @@ function renderPicker(view: ViewState, th: Theme, width: number): string[] {
     for (const [k, d] of [
       ["↑ ↓", "Select agent"],
       ["Enter / →", "Attach: stream it into the transcript"],
-      ["Enter + text", "New agent (picker) · steer (attached)"],
+      ["Enter + text", "Background spawn (picker) · steer / @-route (attached)"],
       ["Esc", "Detach (agent keeps running)"],
       ["Ctrl+X", "Terminate that agent (main: interrupt the turn)"],
       ["/model [name]", "Set that agent's model (Ctrl+L when attached)"],
       ["←", "Close the picker (reopen to refresh the list)"],
-      ["/agent <task>", "Start a background agent"],
+      ["@agent <task>", "Spawn a background agent (inherits main)"],
+      ["@<name> <task>", "Route to a live agent, else spawn from .pi/agents/<name>.md"],
+      ["/agents", "List sub-agent definitions (rescans)"],
     ] as const) {
       out.push(truncateToWidth(`    ${th.fg("accent", k.padEnd(15))}${th.fg("text", d)}`, width));
     }
@@ -433,8 +525,9 @@ function renderPicker(view: ViewState, th: Theme, width: number): string[] {
     // The state icon + group header already say everything about the agent's
     // status, so no "(live)" tag and no ticking mtime column.
     // No "[main]" tag: the root session is just the agent called "main".
+    const badge = row.def ? th.fg("muted", ` [${row.def}]`) : "";
     const tags = row.isAttached ? th.fg("success", " (attached)") : "";
-    out.push(truncateToWidth(`${pointer}${icon} ${nameStr}${tags}`, width));
+    out.push(truncateToWidth(`${pointer}${icon} ${nameStr}${badge}${tags}`, width));
 
     const meta = th.fg("muted", `${row.messageCount} msg${row.messageCount === 1 ? "" : "s"}`);
     const model = row.model ? th.fg("dim", ` · ${clip(row.model, 28)}`) : "";
@@ -464,8 +557,18 @@ type Action =
   | { t: "help" }
   | { t: "attach"; key: string }
   | { t: "detach" }
-  | { t: "spawn"; prompt: string }
+  /** `def` is set when a `@<def-name>` mention resolved into a catalog entry. */
+  | { t: "spawn"; prompt: string; def?: SubAgentDef; fromAttached?: string }
   | { t: "steer"; key: string; text: string }
+  /**
+   * Route a message to an existing live agent addressed by `@<slug>`.
+   *
+   * Distinct from `steer` so the handler can show a "sent to …" toast when
+   * the current view isn't that agent, and so the semantics stay readable at
+   * the call site: `steer` is the attached view's normal Enter path, `route`
+   * is a mention-driven summon of a sibling agent.
+   */
+  | { t: "route"; key: string; name: string; text: string; fromAttached?: string }
   | { t: "model"; key: string; search?: string }
   | { t: "cycleModel"; key: string; direction: "forward" | "backward" }
   /** Ctrl+X: interrupt the main session's turn, terminate an agent outright. */
@@ -578,6 +681,19 @@ class AgentViewEditor extends CustomEditor {
     private readonly act: (a: Action) => void,
     /** What to draw on the frame: the view's name and *its* working state. */
     private readonly status: () => ViewStatus,
+    /**
+     * Scan a submitted prompt for a `@<slug>` mention. Returns a mention that
+     * routes to an existing live agent, spawns a new one from a def, spawns
+     * an adhoc agent, or null if nothing matches — exactly per
+     * `parseAtMention`'s priority order.
+     *
+     * The editor tells the resolver whether it should exclude a specific
+     * file from live-agent matching (the currently attached agent, so a
+     * mention there addresses *another* agent, not itself). Injected as a
+     * function so the editor stays UI-only and knows nothing about
+     * `agent-catalog.ts` or the live agent pool.
+     */
+    private readonly resolveMention: (text: string, opts?: { excludeFile?: string }) => ReturnType<typeof parseAtMention>,
   ) {
     super(tui, theme, kb, { embedWorkingStatus: true });
     this.tuiRef = tui as TUI;
@@ -703,14 +819,84 @@ class AgentViewEditor extends CustomEditor {
           return;
         }
         if (matchesKey(data, "return") || matchesKey(data, "enter")) {
-          const text = this.getText().trim();
+          // Users escape a literal `@name` in an attached-view message the
+          // same way they'd escape one in a main-session message: with a
+          // backslash (Slack-style). Strip that `\` before doing anything
+          // with the text — mention parsing, /model, or steer — so the
+          // escape is cosmetic and never leaks into the sent message.
+          const raw = this.getText();
+          const text = stripAtEscape(raw).trim();
           if (text) {
             const model = parseModelCommand(text);
             this.setText("");
-            if (model) this.act({ t: "model", key: view.attached, search: model.search });
-            else this.act({ t: "steer", key: view.attached, text });
+            if (model) {
+              this.act({ t: "model", key: view.attached, search: model.search });
+              return;
+            }
+            // `@<slug>` from within an attached view addresses *another*
+            // agent — either an existing live sibling (route) or a fresh
+            // spawn. The currently attached agent is passed as excludeFile
+            // so it doesn't match itself; if the slug's only reachable
+            // target is self, `resolveMention` returns null and we fall
+            // through to `steer` (i.e. the mention is treated as chat, and
+            // the current agent gets the message as before).
+            const mention = this.resolveMention(text, { excludeFile: view.attached });
+            if (mention) {
+              this.act(
+                mention.target.kind === "route"
+                  ? {
+                      t: "route",
+                      key: mention.target.file,
+                      name: mention.target.name,
+                      text: mention.task,
+                      fromAttached: view.attached,
+                    }
+                  : {
+                      t: "spawn",
+                      prompt: mention.task,
+                      def: mention.target.kind === "def" ? mention.target.def : undefined,
+                      fromAttached: view.attached,
+                    },
+              );
+              return;
+            }
+            this.act({ t: "steer", key: view.attached, text });
             return;
           }
+        }
+      } else if (matchesKey(data, "return") || matchesKey(data, "enter")) {
+        // Detached (main), list closed. `@<slug>` at the *start* of the
+        // message routes to a sibling agent or spawns a new one;
+        // everything else falls through to pi so ordinary chat works. If
+        // the user escaped a leading `@` with a backslash (`\@pinger has a
+        // bug`), strip the backslash before pi sees the text — so `main`
+        // gets clean prose and the escape stays cosmetic.
+        const raw = this.getText();
+        if (raw.trim().length > 0) {
+          const text = stripAtEscape(raw);
+          const mention = this.resolveMention(text);
+          if (mention) {
+            this.setText("");
+            this.act(
+              mention.target.kind === "route"
+                ? {
+                    t: "route",
+                    key: mention.target.file,
+                    name: mention.target.name,
+                    text: mention.task,
+                  }
+                : {
+                    t: "spawn",
+                    prompt: mention.task,
+                    def: mention.target.kind === "def" ? mention.target.def : undefined,
+                  },
+            );
+            return;
+          }
+          // Fall through to pi: it reads from the editor buffer on Enter,
+          // so overwrite the buffer with the stripped version so pi (main)
+          // never sees the escape character.
+          if (text !== raw) this.setText(text);
         }
       }
       super.handleInput(data);
@@ -743,7 +929,8 @@ class AgentViewEditor extends CustomEditor {
     }
 
     if (matchesKey(data, "return") || matchesKey(data, "enter")) {
-      const text = this.getText().trim();
+      const raw = this.getText();
+      const text = stripAtEscape(raw).trim();
       if (text) {
         const model = parseModelCommand(text);
         this.setText("");
@@ -754,7 +941,25 @@ class AgentViewEditor extends CustomEditor {
           if (row) this.act({ t: "model", key: row.key, search: model.search });
           return;
         }
-        this.act({ t: "spawn", prompt: text });
+        // With the picker open, Enter+text spawns or routes. A `@<slug>`
+        // mention picks the target: an existing live agent gets routed to,
+        // a catalog def is spawned, `@agent` spawns adhoc. No mention
+        // = adhoc spawn with the typed text (historical picker behaviour).
+        const mention = this.resolveMention(text);
+        if (mention?.target.kind === "route") {
+          this.act({
+            t: "route",
+            key: mention.target.file,
+            name: mention.target.name,
+            text: mention.task,
+          });
+          return;
+        }
+        this.act({
+          t: "spawn",
+          prompt: mention ? mention.task : text,
+          def: mention && mention.target.kind === "def" ? mention.target.def : undefined,
+        });
       } else {
         const row = this.row();
         if (row) this.act(row.isRoot ? { t: "detach" } : { t: "attach", key: row.key });
@@ -806,7 +1011,20 @@ export default function agentViews(pi: ExtensionAPI): void {
     if (view.unfilter) return;
     const chat = findChatContainer(tui as unknown as RenderNode | undefined, OWNED_ENTRIES);
     if (!chat) return;
-    view.unfilter = installChatFilter(chat, () => view.attached !== undefined, OWNED_ENTRIES);
+    view.unfilter = installChatFilter(chat, (child) => {
+      if (isOwnedChild(child, OWNED_ENTRIES)) {
+        // Our custom entry. Draw only when attached and it belongs to that
+        // agent. Any other case (not-attached, or attached to someone else)
+        // must skip the whole child so pi's `CustomEntryComponent` wrapper
+        // doesn't leak its own `Spacer(1)` padding as a mystery blank line.
+        if (view.attached === undefined) return false;
+        const ref = (child as { entry?: { data?: ItemRef } } | null)?.entry?.data;
+        return ref?.file === view.attached;
+      }
+      // pi's own child (main-session content). Show only when detached; hide
+      // when attached so the agent view is exclusively that agent's stream.
+      return view.attached === undefined;
+    });
     // The current frame may already have drawn the unfiltered container.
     tui?.requestRender(true);
   }
@@ -835,9 +1053,44 @@ export default function agentViews(pi: ExtensionAPI): void {
       : undefined,
   );
 
+  /**
+   * Best-effort display name for an agent (or the main session).
+   *
+   * Sources, in order:
+   *   1. Freshly-built picker rows, when the list was recently open. These
+   *      also carry live-only bits (state, model, def badge), but for the
+   *      label all we need is the slug.
+   *   2. The manifest under `__agents__/<rootId>/manifest.json`. Written
+   *      *synchronously* by `registerAgent` before `runAgent` starts, so
+   *      the name is available immediately after spawn — which is what
+   *      keeps the editor label from flashing the raw session-file basename
+   *      after `spawn + attach`, before the picker has ever been opened.
+   *   3. `SessionManager.getSessionName()`. Empty until pi flushes an
+   *      assistant message with a `session_info` entry.
+   *   4. Bare `path.basename(file)` as a last resort.
+   *
+   * `resolveRoot(file, "")` recovers the root purely from the file path
+   * (agent files live under `__agents__/<rootId>/`), so this stays a pure
+   * helper with no `ctx` dependency.
+   */
   function nameOf(file: string): string {
     const row = view.rows.find((r) => r.key === file);
     if (row) return row.name;
+    try {
+      const root = resolveRoot(file, "");
+      if (root) {
+        // Pass `getAgent` as the live-check so a just-spawned agent — whose
+        // session file pi hasn't flushed yet — is not filtered out by
+        // `listAgentEntries`. Without it, the toast after a fresh spawn
+        // would show the raw session-file basename instead of the slug.
+        const entry = listAgentEntries(root, (f) => getAgent(f) !== undefined).find(
+          (a) => a.file === file,
+        );
+        if (entry) return entry.name;
+      }
+    } catch {
+      /* manifest is best-effort; fall through */
+    }
     try {
       return SessionManager.open(file).getSessionName() ?? path.basename(file);
     } catch {
@@ -948,7 +1201,7 @@ export default function agentViews(pi: ExtensionAPI): void {
       return;
     }
     try {
-      await ensureAgent(file, ctx.cwd, ctx.model, ctx.thinkingLevel);
+      await ensureAgent(file, ctx.cwd, ctx.model, ctx.thinkingLevel, defForFile(ctx, file));
     } catch (err) {
       ctx.ui.notify(`Could not open agent: ${String(err)}`, "error");
       return;
@@ -996,10 +1249,19 @@ export default function agentViews(pi: ExtensionAPI): void {
    * Create a new agent and hand it the prompt. Returns as soon as the turn is
    * queued: the session you are in is never blocked or interrupted.
    */
+  /**
+   * Create a new agent and hand it the prompt. Returns as soon as the turn is
+   * queued: the session you are in is never blocked or interrupted.
+   *
+   * `def` (if set) applies a `.pi/agents/<name>.md` sub-agent definition:
+   * the Markdown body is appended to the base system prompt, and the def's
+   * model / thinking level are used as inheritance defaults. Undefined means
+   * a plain adhoc agent (the old `/agent <task>` behaviour).
+   */
   async function spawn(
     ctx: ExtensionContext,
     prompt: string,
-    options: { attach: boolean },
+    options: { attach: boolean; def?: SubAgentDef },
   ): Promise<string | undefined> {
     const root = rootOf(ctx);
     if (!root) {
@@ -1009,9 +1271,9 @@ export default function agentViews(pi: ExtensionAPI): void {
 
     const existing = listAgentEntries(root, (f) => getAgent(f) !== undefined);
     const name = agentName(prompt, existing.map((a) => a.name));
-    const file = registerAgent(root, name, ctx.cwd);
+    const file = registerAgent(root, name, ctx.cwd, options.def?.name);
     try {
-      await runAgent(file, prompt, ctx.cwd, ctx.model, ctx.thinkingLevel);
+      await runAgent(file, prompt, ctx.cwd, ctx.model, ctx.thinkingLevel, options.def);
     } catch (err) {
       ctx.ui.notify(`Could not start agent: ${String(err)}`, "error");
       return undefined;
@@ -1061,7 +1323,7 @@ export default function agentViews(pi: ExtensionAPI): void {
   async function chooseModel(ctx: ExtensionContext, file: string, search?: string): Promise<void> {
     if (!isRoot(ctx, file)) {
       try {
-        await ensureAgent(file, ctx.cwd, ctx.model, ctx.thinkingLevel);
+        await ensureAgent(file, ctx.cwd, ctx.model, ctx.thinkingLevel, defForFile(ctx, file));
       } catch (err) {
         ctx.ui.notify(`Could not open agent: ${String(err)}`, "error");
         return;
@@ -1124,16 +1386,45 @@ export default function agentViews(pi: ExtensionAPI): void {
   // Extension commands execute immediately even while the agent is streaming,
   // so they never have to interrupt a turn.
 
-  pi.registerCommand("agent", {
-    description: "Start a background agent for a task — /agent <task>",
-    handler: async (args, ctx) => {
-      const task = args.trim();
-      if (!task) {
-        ctx.ui.notify("Usage: /agent <task>", "error");
+  /**
+   * Look up the sub-agent def recorded for `file` in the group's manifest.
+   *
+   * Returns undefined for a plain agent (no def field), the root/main session,
+   * or a def whose file has since been removed from `.pi/agents/`. The latter
+   * case is intentionally silent: the agent still revives as a plain agent and
+   * keeps its recorded model — deleting a def shouldn't break running agents.
+   */
+  function defForFile(ctx: ExtensionContext, file: string): SubAgentDef | undefined {
+    const root = rootOf(ctx);
+    if (!root) return undefined;
+    if (file === root.rootFile) return undefined;
+    const entry = listAgentEntries(root).find((a) => a.file === file);
+    if (!entry?.def) return undefined;
+    return loadCatalog(ctx.cwd).agents.get(entry.def);
+  }
+
+  pi.registerCommand("agents", {
+    description: "List sub-agent definitions discovered under .pi/agents/",
+    handler: async (_args, ctx) => {
+      // Force a rescan every time: users edit files while pi is running and
+      // expect the next `/agents` to see the change without a reload flag.
+      const catalog = loadCatalog(ctx.cwd);
+      if (catalog.agents.size === 0 && catalog.diagnostics.length === 0) {
+        ctx.ui.notify(
+          "No sub-agent definitions found under .pi/agents/ or ~/.pi/agents/",
+          "info",
+        );
         return;
       }
-      const file = await spawn(ctx, task, { attach: false });
-      if (file) ctx.ui.notify("Agent started in the background. Press ← to see it.", "info");
+      const lines: string[] = [];
+      for (const def of [...catalog.agents.values()].sort((a, b) => a.name.localeCompare(b.name))) {
+        lines.push(`@${def.name}  [${def.scope}]  ${def.description}`);
+        lines.push(`  ${def.source}`);
+      }
+      for (const diag of catalog.diagnostics) {
+        lines.push(`(skipped) ${diag.path}: ${diag.error}`);
+      }
+      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 
@@ -1153,7 +1444,23 @@ export default function agentViews(pi: ExtensionAPI): void {
     void initToolRenderers().then((ok) => {
       if (ok) tui?.requestRender();
     });
-    ctx.ui.addAutocompleteProvider((current) => withAttachedCommandFilter(current, view));
+    ctx.ui.addAutocompleteProvider((current) =>
+      // `wrapWithAgentMentions` must be innermost so its
+      // `shouldTriggerFileCompletion` override reaches the base provider (the
+      // outer filter only touches `/`-suggestions).
+      withAttachedCommandFilter(
+        wrapWithAgentMentions(current, () => {
+          // Same snapshot logic as `resolveMention`, but also drop the
+          // currently attached agent — you don't `@` yourself from your own
+          // view, and rule 2 in at-mention.ts would exclude it at submit
+          // time anyway.
+          const catalog = loadCatalog(ctx.cwd);
+          const liveAgents = computeLiveAgents(ctx).filter((a) => a.file !== view.attached);
+          return { catalog, liveAgents };
+        }),
+        view,
+      ),
+    );
 
     view.open = false;
     if (!reloaded) {
@@ -1177,7 +1484,12 @@ export default function agentViews(pi: ExtensionAPI): void {
         render: () => {
           // Cheap once installed; the container can only be found after pi has
           // built a child for one of our entries.
-          if (view.attached) ensureChatFilter();
+          // Install the chat filter as soon as we have entries to filter,
+          // whether attached or not. On main it hides our custom entries so
+          // they don't contribute pi-Spacer blank lines; on attached views
+          // it's what separates the agent's stream from main's. Cheap once
+          // installed (single container lookup, cached via `view.unfilter`).
+          ensureChatFilter();
           return [];
         },
         invalidate: () => {},
@@ -1229,11 +1541,54 @@ export default function agentViews(pi: ExtensionAPI): void {
             detach();
             break;
           case "spawn":
-            void spawn(ctx, action.prompt, { attach: true });
+            // Every `@<slug> <task>` runs in the background — no auto-attach,
+            // no matter which view dispatched the spawn. The user's current
+            // conversation stays put (main, or an attached agent); the new
+            // sibling appears in the picker on next `←`. A toast confirms
+            // where the message went, so it's obvious nothing got hijacked.
+            //
+            // Rationale: attaching-on-spawn was surprising for the common
+            // "fire-and-forget" case (typing `@agent do X` while chatting
+            // with main). It also broke symmetry with `route`, which
+            // already stays background and just toasts.
+            void spawn(ctx, action.prompt, { attach: false, def: action.def }).then((file) => {
+              if (!file) return;
+              // Prefer the agent's real slug (from the manifest, written
+              // synchronously by registerAgent) over the def's name in the
+              // toast — that's what the picker will show for the new row,
+              // so the user can look for it later without translation.
+              const target = `@${nameOf(file)}`;
+              if (action.fromAttached && action.fromAttached !== file) {
+                const current = `@${nameOf(action.fromAttached)}`;
+                ctx.ui.notify(`Started ${target} in the background · ${current} keeps working`, "info");
+              } else {
+                ctx.ui.notify(`Started ${target} in the background`, "info");
+              }
+            });
             break;
           case "steer":
             void steerAgent(action.key, action.text).then((ok) => {
               if (!ok) ctx.ui.notify("That agent is not live", "warning");
+            });
+            break;
+          case "route":
+            // Sibling agent addressed by `@<slug>`. Same routing primitive
+            // as `steer` (steerAgent handles both streaming and idle live
+            // agents), but from any view, and with a toast when the current
+            // view is somebody else so the user knows their message did
+            // not go there.
+            void steerAgent(action.key, action.text).then((ok) => {
+              if (!ok) {
+                ctx.ui.notify(`@${action.name} is not live — attach to revive it`, "warning");
+                return;
+              }
+              if (action.fromAttached && action.fromAttached !== action.key) {
+                const current = `@${nameOf(action.fromAttached)}`;
+                ctx.ui.notify(`Sent to @${action.name} · ${current} keeps working`, "info");
+              } else if (!action.fromAttached) {
+                ctx.ui.notify(`Sent to @${action.name} in the background`, "info");
+              }
+              refreshRowsIfOpen(ctx);
             });
             break;
           case "model":
@@ -1252,7 +1607,19 @@ export default function agentViews(pi: ExtensionAPI): void {
       // Stop the previous editor's spinner: pi builds a new editor on every
       // session start and never renders the old one again.
       view.stopStatus?.();
-      const editor = new AgentViewEditor(t, theme, kb, view, act, viewStatus);
+      // Every submitted prompt is scanned against a freshly-loaded catalog
+      // and the current live-agent pool, so users don't need to reload after
+      // adding a new .pi/agents/*.md or after spawning a sibling agent.
+      //
+      // Live agents are ordered most-recently-active first: when several
+      // share a def (rule 3 in at-mention.ts), the freshest wins — that's
+      // usually "the one I was just working with".
+      const resolveMention = (text: string, opts?: { excludeFile?: string }) => {
+        const catalog = loadCatalog(ctx.cwd);
+        const liveAgents = computeLiveAgents(ctx);
+        return parseAtMention(text, { catalog, liveAgents, excludeFile: opts?.excludeFile });
+      };
+      const editor = new AgentViewEditor(t, theme, kb, view, act, viewStatus, resolveMention);
       view.stopStatus = () => editor.stopStatus();
 
       // Restore prompt history so ↑/↓ recall still works.

@@ -2,20 +2,30 @@
  * transcript-view.ts — keep the two directions of the transcript separate.
  *
  * pi owns one chat container per session and appends *everything* to it: the
- * main session's own messages and the custom entries this extension mirrors for
- * an agent. Custom entries are persisted and cannot be removed, and pi has no
- * API to hide its own messages, so separation has to happen at render time:
+ * main session's own messages and the custom entries this extension mirrors
+ * for an agent. Custom entries are persisted and cannot be removed, and pi
+ * has no API to hide its own messages, so separation has to happen at render
+ * time.
  *
- *   detached (main session)  →  agent entries render nothing
- *                               (see `isVisible()` in view-model.ts)
- *   attached (agent view)    →  pi's own chat children render nothing,
- *                               only this extension's entries draw
+ * The filter installed here is **always active** once discovered, and decides
+ * per child whether to render. Two rules:
  *
- * The second half is what this module does: it finds pi's chat container
- * through the TUI tree and installs a render filter on it. Nothing is removed
- * or reordered — pi keeps mutating its container exactly as before, we only
- * decide which children are drawn in the current frame. Detaching restores the
- * full main transcript untouched.
+ *   attached (agent view)   →  draw only owned entries whose ref belongs to
+ *                              `view.attached`; skip everything else
+ *   detached (main session) →  draw pi's own children; skip *all* owned
+ *                              entries
+ *
+ * Nothing is removed or reordered \u2014 pi keeps mutating its container exactly
+ * as before, we only decide which children are drawn in the current frame.
+ *
+ * Why per-child skipping matters (not just "return `[]` from the inner
+ * renderer"): pi wraps every custom entry in a `CustomEntryComponent` that
+ * unconditionally prepends `Spacer(1)` to whatever the entry renders. An
+ * inner `render()` that returns `[]` still leaves that Spacer, so a hidden
+ * entry would contribute one blank line to whatever transcript is on screen.
+ * With N hidden entries in the current chat, that's N unexplained blank lines.
+ * Skipping the *whole child* at the container level is the only way to
+ * eliminate them.
  *
  * Headless on purpose: `render`/`children` duck typing only, so it is unit
  * testable with plain objects.
@@ -75,15 +85,20 @@ const PATCH = Symbol.for("piAgentViews.chatFilter");
 type Patched = RenderNode & { [PATCH]?: () => void };
 
 /**
- * Draw only this extension's entries while `filtering()` is true.
+ * Draw only the children `include(child)` returns `true` for.
  *
  * Returns an uninstall function. Installing twice on the same container is
  * safe: the previous patch is removed first (extensions reload per session).
+ *
+ * The filter re-implements pi's `Container.render` \u2014 concatenating child
+ * renders \u2014 but skips excluded children *entirely* (not calling `.render`),
+ * so wrapper components like `CustomEntryComponent` cannot leak their own
+ * padding lines for a hidden entry. `mouseLayout` is still populated with
+ * height=0 for excluded children so pi's hit testing stays coherent.
  */
 export function installChatFilter(
   container: RenderNode,
-  filtering: () => boolean,
-  owned: OwnedTypes,
+  include: (child: unknown) => boolean,
 ): () => void {
   const target = container as Patched;
   target[PATCH]?.();
@@ -92,19 +107,30 @@ export function installChatFilter(
   const originalMouse = container.handleMouse?.bind(container);
 
   container.render = (width: number): string[] => {
-    if (!filtering()) return originalRender(width);
     const lines: string[] = [];
+    const mouseChildren: Array<{ component: unknown; height: number }> = [];
     for (const child of container.children ?? []) {
-      if (!isOwnedChild(child, owned)) continue;
-      for (const line of (child as RenderNode).render(width)) lines.push(line);
+      if (!include(child)) {
+        mouseChildren.push({ component: child, height: 0 });
+        continue;
+      }
+      const childLines = (child as RenderNode).render(width);
+      mouseChildren.push({ component: child, height: childLines.length });
+      for (const line of childLines) lines.push(line);
     }
+    // Preserve pi's mouse-layout tracking so hit testing (via the original
+    // handleMouse) still resolves the right component under the cursor.
+    (container as unknown as { mouseLayout: unknown }).mouseLayout = {
+      width,
+      children: mouseChildren,
+    };
     return lines;
   };
 
-  // Hit testing assumes every child is drawn, which is no longer true while
-  // filtering; agent views are read-only anyway.
+  // Original mouse handling stays: children we hid render at height 0, so hit
+  // tests never resolve onto them.
   if (originalMouse) {
-    container.handleMouse = (event: unknown) => (filtering() ? undefined : originalMouse(event));
+    container.handleMouse = (event: unknown) => originalMouse(event);
   }
 
   const uninstall = () => {

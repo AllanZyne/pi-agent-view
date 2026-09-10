@@ -19,6 +19,15 @@ export interface AgentEntry {
   name: string;
   file: string;
   createdAt: string;
+  /**
+   * Sub-agent def name that spawned this agent, if any.
+   *
+   * Present when the agent was summoned via `@<def-name>`. Used to badge the
+   * row and to re-apply the def's `appendSystemPrompt`/model on revive. A
+   * missing field means "plain agent" (forward-compatible with manifests
+   * written by earlier builds).
+   */
+  def?: string;
 }
 
 export interface AgentManifest {
@@ -144,7 +153,7 @@ function letterSuffix(n: number): string {
  * The returned path may not exist on disk yet: pi flushes a session file only
  * once it holds an assistant message.
  */
-export function registerAgent(root: RootCtx, name: string, cwd: string): string {
+export function registerAgent(root: RootCtx, name: string, cwd: string, def?: string): string {
   const dir = groupDir(root.sessionDir, root.rootId);
   fs.mkdirSync(dir, { recursive: true });
   const sm = SessionManager.create(cwd, dir, { parentSession: root.rootFile });
@@ -156,7 +165,13 @@ export function registerAgent(root: RootCtx, name: string, cwd: string): string 
     rootFile: root.rootFile,
     agents: [],
   };
-  m.agents.push({ id: sm.getSessionId(), name, file, createdAt: new Date().toISOString() });
+  m.agents.push({
+    id: sm.getSessionId(),
+    name,
+    file,
+    createdAt: new Date().toISOString(),
+    ...(def ? { def } : {}),
+  });
   saveManifest(root.sessionDir, m);
 
   // Name it up front so the picker shows something useful immediately.

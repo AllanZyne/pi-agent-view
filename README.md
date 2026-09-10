@@ -52,9 +52,119 @@ pi install git:github.com/AllanZyne/pi-agent-view
 `↑`/`↓` only drive the list while the prompt is empty, so prompt history still
 works as soon as you type.
 
-The one command is `/agent <task>`: it starts a background agent and returns
-immediately, without leaving or interrupting the session you are in (extension
-commands are dispatched before pi's streaming guard, so it works mid-response).
+## Summoning agents
+
+There is **no `/agent` command** — `@<slug>` mentions do the job. `@<slug>` is
+a **routing operator**: it addresses an agent by priority, spawning a new
+one only as a fallback.
+
+### Position rule (message-start)
+
+Interception only fires when the `@` is at the **start of the message**,
+with at most whitespace before it. Any non-whitespace character before `@`
+turns it into prose — no interception, no accidental redirect. This is the
+difference between *addressing* an agent and *talking about* one:
+
+| you type | what happens |
+| --- | --- |
+| `@pinger ping 3` | intercept → route/spawn |
+| `   @pinger ping 3` | intercept (leading spaces are fine) |
+| `let me look at @pinger's config` | prose → goes to main |
+| `please @pinger help` | prose → goes to main |
+| `first do X, then @pinger take over` | prose → goes to main |
+
+### Slug resolution (once the position check passes)
+
+1. `@agent` — always spawn a new adhoc agent (inherits main's model).
+2. **Live agent whose picker name equals the slug** — route to that
+   instance. Use this to address a specific running agent by its slug
+   (`@review-storage-ts add view-model.ts too`).
+3. **Live agents whose `def` equals the slug** — route to the most
+   recently active one. Natural `@reviewer` shorthand: "give more work to
+   the reviewer I have running".
+4. **Catalog def named slug** — spawn a new def-backed agent from
+   `.pi/agents/<slug>.md`.
+5. Otherwise — not intercepted, message flows to main / the attached agent
+   as normal chat.
+
+The whole message goes to the target **verbatim**; the `@` mention is not
+stripped, so the target sees who was addressed and multi-mention messages
+are safe (the first that resolves wins, the rest are text).
+
+**Attached views work the same way.** If you're attached to agent A and
+type `@reviewer next diff`, `A` keeps working on its current task and
+`reviewer` gets the new message — spawned or routed as above. The
+attached agent is excluded from name/def matching so `@slug` addresses
+*another* agent; if the only reachable target would be self, the message
+falls through to A as normal chat.
+
+### Escaping a leading `@`
+
+Sometimes you *want* to write `@name` at the start of a message and have
+it go to main as plain text — e.g. "the `@pinger` def has a bug". Any of
+these work:
+
+- **Backslash**: `\@pinger has a bug` — the `\` is stripped before send,
+  so main sees clean `@pinger has a bug`. Slack-style, easiest to type.
+- **Backticks**: `` `@pinger` has a bug `` — inline code, most natural in
+  code discussion.
+- **Quotes**: `"@pinger" is the def name`.
+
+The first form is preserved as-is in the sent message except for the
+leading `\`, which is dropped so it doesn't leak into the transcript.
+
+## Sub-agent definitions (`.pi/agents/`)
+
+Drop Markdown files under `.pi/agents/` (project, higher priority) or
+`~/.pi/agents/` (user) to predefine reusable agents — same idea as Claude
+Code's `.claude/agents/`. Format:
+
+```markdown
+---
+name: code-reviewer
+description: Reviews diffs for correctness, style, and obvious bugs.
+model: anthropic/claude-sonnet-4-5
+thinkingLevel: medium
+---
+
+You are a strict code reviewer. When invoked, analyse the code and provide
+specific, actionable feedback on quality, security, and best practices.
+```
+
+Only `name` and `description` are required. The Markdown body is *appended*
+to pi's base system prompt (via `DefaultResourceLoader.appendSystemPrompt`),
+so `AGENTS.md`, skills, prompt templates etc. all still load — the def
+supplements, it doesn't replace. `model` (`provider/id` or `inherit`) and
+`thinkingLevel` are inheritance defaults for a fresh agent; a revived agent
+keeps its own recorded model. Discovery is recursive; project overrides user
+on `name` collisions; files without `name`/`description`, with unparseable
+YAML, or claiming the reserved `agent` slug are skipped silently (and
+listed as diagnostics by `/agents`).
+
+`/agents` force-rescans both scopes and prints what it found; every
+`@<name>` interception also rescans, so newly added files show up without
+reload.
+
+Don't want to hand-write the frontmatter? This extension ships a
+**`create-subagent` skill**: ask pi something like *"create a code-reviewer
+subagent"* and the skill walks it through picking a name, description, and
+system prompt, then writes the file for you. Run `/skill:create-subagent`
+to invoke it explicitly.
+
+**Editor autocomplete:** typing `@` in the editor opens an **agent picker**
+(not pi's file picker) while this extension is loaded — the list includes
+`agent` and every discovered def, and selecting one inserts `@<name> ` at
+the cursor.
+
+Differences from Claude Code's `.claude/agents/`:
+
+| Claude Code | pi-agent-view v1 |
+| --- | --- |
+| `.claude/agents/` | `.pi/agents/` |
+| body **replaces** the system prompt | body **appends** to pi's base prompt |
+| `tools`, `disallowedTools`, `hooks`, `mcpServers`, `permissionMode`, `skills`, `isolation`, `color`, `memory`, `effort` | not in v1 |
+| built-in Explore/Plan/general-purpose auto-delegation | none — v1 is explicit summoning only |
+| `@` completes files | `@` completes agents; pi's file completion is suppressed |
 
 `Ctrl+X` is a hard stop, not a pause: the agent's session is disposed, so
 nothing of it keeps running. Its transcript stays on disk, so it stays in the
@@ -74,7 +184,8 @@ Agents are named after their first prompt, slugified to lowercase letters and
 single hyphens (`agentName()` in `storage.ts`): no spaces, underscores or digits.
 Collisions get a letter suffix (`run-tests`, `run-tests-b`, …). pi's own session
 is listed as the agent called `main`, whatever the session name is — one flat
-list of slugs. Selecting it detaches, exactly like `Esc`.
+list of slugs. Selecting it detaches, exactly like `Esc`. Agents spawned via
+`@<name>` show a `[<def>]` badge next to their name in the picker.
 
 | icon | group | meaning |
 | --- | --- | --- |
@@ -238,10 +349,14 @@ new agents always join the same group.
 | --- | --- |
 | `agent-runtime.ts` | in-process concurrent agent pool (headless) |
 | `storage.ts` | `__agents__/<rootId>/*.jsonl` + manifest, agent naming (headless) |
+| `agent-catalog.ts` | discover `.pi/agents/*.md` sub-agent definitions (headless) |
+| `at-mention.ts` | parse `@<slug>` mentions in submitted prompts (headless) |
+| `autocomplete.ts` | swap pi's `@` file completion for agent completion (headless) |
 | `view-model.ts` | list rows, selection, mirror bookkeeping (headless) |
 | `transcript-view.ts` | main-vs-agent transcript separation (headless) |
 | `tool-renderers.ts` | pi's built-in tool renderers, for agent tool calls (headless) |
 | `index.ts` | rendering, key handling, extension wiring (TUI) |
+| `skills/create-subagent/` | packaged skill: walk the user through authoring a new `.pi/agents/*.md` |
 | `tests/` | test harness and tests |
 
 Everything except `index.ts` is free of TUI/extension-context dependencies so it

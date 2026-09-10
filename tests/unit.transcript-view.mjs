@@ -24,13 +24,15 @@ function container(children = []) {
 const piChild = (text) => ({ render: () => [text] });
 
 /** A pi CustomEntryComponent wrapping one of our entries. */
-const ourChild = (text, customType = "agent-view-item") => ({
-  entry: { customType, data: {} },
+const ourChild = (text, customType = "agent-view-item", file = "/tmp/agent.jsonl") => ({
+  entry: { customType, data: { file, index: 0 } },
   render: () => [text],
 });
 
 /** A custom entry from some other extension. */
 const otherExtensionChild = (text) => ({ entry: { customType: "todo-list" }, render: () => [text] });
+
+// ── isOwnedChild / findChatContainer (unchanged shape) ────────────
 
 test("isOwnedChild only claims this extension's entries", () => {
   assert(tv.isOwnedChild(ourChild("a"), OWNED), "our item entry");
@@ -48,55 +50,94 @@ test("findChatContainer locates the container holding our entries", () => {
   assertEqual(tv.findChatContainer(undefined, OWNED), undefined, "no tui yet");
 });
 
-test("the filter hides pi's own children only while an agent is attached", () => {
-  const chat = container([piChild("you: main question"), piChild("main answer"), ourChild("agent answer")]);
-  let attached = false;
+// ── installChatFilter (per-child include predicate) ──────────────
 
-  const uninstall = tv.installChatFilter(chat, () => attached, OWNED);
+test("filter hides ALL our entries on main (detached) and pi's own content when attached", () => {
+  const chat = container([
+    piChild("main line 1"),
+    ourChild("agent A line", "agent-view-item", "/tmp/a.jsonl"),
+    piChild("main line 2"),
+    ourChild("agent B line", "agent-view-item", "/tmp/b.jsonl"),
+  ]);
+  let attached; // undefined | file
 
-  assertEqual(chat.render(80), ["you: main question", "main answer", "agent answer"], "detached: pi renders everything");
+  const include = (child) => {
+    if (tv.isOwnedChild(child, OWNED)) {
+      if (!attached) return false;
+      return child.entry.data.file === attached;
+    }
+    return !attached;
+  };
 
-  attached = true;
-  assertEqual(chat.render(80), ["agent answer"], "attached: only the agent's entries draw");
-  assertEqual(chat.handleMouse({}), undefined, "hit testing is off while filtered");
+  tv.installChatFilter(chat, include);
 
-  // Main session output arriving while we look at an agent must stay invisible.
+  // Detached: only pi's own children draw.
+  attached = undefined;
+  assertEqual(chat.render(80), ["main line 1", "main line 2"], "on main: hidden agent entries do not contribute a single blank line");
+
+  // Attached to A: only A's entries.
+  attached = "/tmp/a.jsonl";
+  assertEqual(chat.render(80), ["agent A line"], "only the current agent's entries draw");
+
+  // Attached to B: only B's entries.
+  attached = "/tmp/b.jsonl";
+  assertEqual(chat.render(80), ["agent B line"], "switching agents changes the visible set");
+});
+
+test("filter tracks child height=0 for skipped children so mouseLayout stays coherent", () => {
+  const chat = container([piChild("visible"), ourChild("hidden")]);
+  tv.installChatFilter(chat, (c) => !tv.isOwnedChild(c, OWNED));
+  chat.render(80);
+  const layout = chat.mouseLayout;
+  assert(layout, "mouseLayout was populated");
+  assertEqual(layout.children.length, 2, "one entry per child, hidden ones included");
+  const heights = layout.children.map((c) => c.height);
+  assertEqual(heights, [1, 0], "visible child has its height, hidden child has height 0");
+});
+
+test("main-session output arriving while attached stays hidden; detaching restores it", () => {
+  const chat = container([piChild("you: hi"), ourChild("agent answer", "agent-view-item", "/tmp/a.jsonl")]);
+  let attached = "/tmp/a.jsonl";
+  const include = (child) =>
+    tv.isOwnedChild(child, OWNED) ? attached && child.entry.data.file === attached : !attached;
+
+  tv.installChatFilter(chat, include);
+  assertEqual(chat.render(80), ["agent answer"], "attached: only agent draws");
+
   chat.children.push(piChild("main streaming delta"));
   assertEqual(chat.render(80), ["agent answer"], "main output does not leak into the agent view");
 
-  attached = false;
+  attached = undefined;
   assertEqual(
     chat.render(80),
-    ["you: main question", "main answer", "agent answer", "main streaming delta"],
-    "detaching restores the main transcript, including what arrived meanwhile",
+    ["you: hi", "main streaming delta"],
+    "detaching shows main's children, still hides the agent's",
   );
-  assertEqual(chat.handleMouse({}), "mouse", "hit testing is back");
-
-  uninstall();
-  attached = true;
-  assertEqual(chat.render(80).length, 4, "uninstalled: pi's container behaves exactly as before");
-  assertEqual(chat.handleMouse({}), "mouse", "mouse handler restored");
 });
 
 test("installing twice replaces the previous patch instead of nesting", () => {
   const chat = container([piChild("main"), ourChild("agent")]);
-  const filtering = () => true;
+  const keepAll = () => true;
+  const hideOurs = (c) => !tv.isOwnedChild(c, OWNED);
 
-  const first = tv.installChatFilter(chat, filtering, OWNED);
-  const second = tv.installChatFilter(chat, filtering, OWNED);
-  assertEqual(chat.render(80), ["agent"], "still filtered once");
+  const first = tv.installChatFilter(chat, hideOurs);
+  const second = tv.installChatFilter(chat, keepAll);
+  assertEqual(chat.render(80), ["main", "agent"], "the second predicate is in effect");
 
   second();
-  assertEqual(chat.render(80), ["main", "agent"], "one uninstall is enough to fully restore");
-  first(); // must not resurrect the filter
+  assertEqual(chat.render(80), ["main", "agent"], "uninstalled: pi's container behaves exactly as before");
+  first(); // stale
   assertEqual(chat.render(80), ["main", "agent"], "stale uninstall is harmless");
 });
 
-test("another extension's entries stay with the main transcript", () => {
+test("another extension's entries always pass through as pi content (never treated as ours)", () => {
   const chat = container([otherExtensionChild("todo"), ourChild("agent")]);
-  let attached = true;
-  tv.installChatFilter(chat, () => attached, OWNED);
-  assertEqual(chat.render(80), ["agent"], "only ours in the agent view");
-  attached = false;
-  assertEqual(chat.render(80), ["todo", "agent"], "untouched in the main view");
+  let attached = "/tmp/agent.jsonl";
+  const include = (child) =>
+    tv.isOwnedChild(child, OWNED) ? attached && child.entry.data.file === attached : !attached;
+
+  tv.installChatFilter(chat, include);
+  assertEqual(chat.render(80), ["agent"], "attached: agent-view entries, no other extensions");
+  attached = undefined;
+  assertEqual(chat.render(80), ["todo"], "detached: the other extension is there, ours is hidden");
 });

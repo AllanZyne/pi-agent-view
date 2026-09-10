@@ -21,6 +21,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Model, ThinkingLevel } from "@earendil-works/pi-ai";
+import type { SubAgentDef } from "./agent-catalog.ts";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -416,17 +417,27 @@ function ownSettings(sm: SessionManager): { model: boolean; thinkingLevel: boole
 }
 
 /**
- * Ensure an in-process AgentSession exists for `file`, creating it if needed.
+ * Ensure the agent is live (create or revive its `AgentSession`).
+ *
  * Does not send any prompt.
  *
  * `model`/`thinkingLevel` are only an *inheritance* default, used for a brand
  * new agent. An agent that already recorded its own model keeps it.
+ *
+ * `def` supplies a catalog-backed sub-agent's `appendSystemPrompt`, model, and
+ * thinking level. It's an inheritance default too: the def's values apply
+ * only to a fresh agent; on revive, the session file wins for model/thinking
+ * (existing `ownSettings()` logic). The `appendSystemPrompt` is applied every
+ * time because it goes through the resource loader, not the session file —
+ * the caller re-supplies the def on revive so a def-backed agent keeps its
+ * system-prompt supplement across restarts.
  */
 export async function ensureAgent(
   file: string,
   cwd: string,
   model?: Model<any>,
   thinkingLevel?: ThinkingLevel,
+  def?: SubAgentDef,
 ): Promise<LiveAgent> {
   const reg = registry();
   const existing = reg.agents.get(file);
@@ -437,6 +448,13 @@ export async function ensureAgent(
   const own = ownSettings(sm);
 
   const modelRuntime = await getModelRuntime();
+
+  // Resolve the def's model to a concrete `Model<any>` if one is declared. A
+  // missing / unresolvable model falls through to the caller-supplied
+  // inheritance default — same rule as when there's no def.
+  const defModel = def?.model ? tryResolveModel(modelRuntime, def.model) : undefined;
+  const inheritModel = defModel ?? model;
+  const inheritThinking = def?.thinkingLevel ?? thinkingLevel;
 
   // `noExtensions` is the clean way to avoid recursively loading THIS
   // extension inside every sub-agent. Skills/prompts/context files are still
@@ -449,14 +467,19 @@ export async function ensureAgent(
       cwd,
       agentDir: getAgentDir(),
       noExtensions: true,
+      // A def's Markdown body is *appended* to pi's base system prompt, so
+      // AGENTS.md, skills, prompt templates etc. still load — the def
+      // supplements, it does not replace. Undefined leaves the loader with
+      // pi's default behaviour, exactly like a plain agent.
+      ...(def?.appendSystemPrompt ? { appendSystemPrompt: [def.appendSystemPrompt] } : {}),
     });
     await loader.reload();
 
     const created = await createAgentSession({
       cwd,
       // Undefined lets the SDK restore the agent's own recorded model/level.
-      model: own.model ? undefined : model,
-      thinkingLevel: own.thinkingLevel ? undefined : thinkingLevel,
+      model: own.model ? undefined : inheritModel,
+      thinkingLevel: own.thinkingLevel ? undefined : inheritThinking,
       modelRuntime,
       sessionManager: sm,
       resourceLoader: loader,
@@ -491,6 +514,22 @@ export async function ensureAgent(
 }
 
 /**
+ * Resolve a `provider/id` string against the model runtime.
+ *
+ * Returns undefined when the model isn't known (no auth, wrong id, etc.),
+ * matching how a missing def field would behave: the caller falls back to the
+ * inherited model rather than crashing. The agent still spawns, and the user
+ * can `/model` later.
+ */
+function tryResolveModel(runtime: ModelRuntime, id: string): Model<any> | undefined {
+  const slash = id.indexOf("/");
+  if (slash <= 0) return undefined;
+  const provider = id.slice(0, slash);
+  const modelId = id.slice(slash + 1);
+  return runtime.getAvailableSnapshot().find((m) => m.provider === provider && m.id === modelId);
+}
+
+/**
  * Start (or continue) an agent with a prompt. Runs concurrently; does not await
  * completion. Safe to call while other agents are running.
  */
@@ -500,8 +539,9 @@ export async function runAgent(
   cwd: string,
   model?: Model<any>,
   thinkingLevel?: ThinkingLevel,
+  def?: SubAgentDef,
 ): Promise<void> {
-  const agent = await ensureAgent(file, cwd, model, thinkingLevel);
+  const agent = await ensureAgent(file, cwd, model, thinkingLevel, def);
   agent.state = "working";
   agent.error = undefined;
   notify();

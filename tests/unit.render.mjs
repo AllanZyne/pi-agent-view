@@ -11,6 +11,7 @@ import { assert, assertEqual, load, pi, test } from "./harness.mjs";
 
 const { AgentItemComponent, defaultRenderSettings } = await load("index.ts");
 const toolRenderers = await load("tool-renderers.ts");
+const { visibleWidth } = await import(`${(await import("./harness.mjs")).PI_DIR}/node_modules/@earendil-works/pi-tui/dist/index.js`);
 
 const WIDTH = 80;
 const settings = defaultRenderSettings();
@@ -53,30 +54,35 @@ function renderItem(items, index, options = {}) {
   return component.render(WIDTH);
 }
 
-test("a user message renders exactly like pi's", () => {
+test("a user message renders like pi's UserMessageComponent (padding preserved, no extra leading blank)", () => {
   const items = [{ kind: "user", text: "**hello** agent" }];
   const expected = new pi.UserMessageComponent("**hello** agent", settings.markdownTheme, settings.outputPad).render(
     WIDTH,
   );
-  assertEqual(renderItem(items, 0), expected, "same lines as pi's own user message");
+  // pi's `CustomEntryComponent` (the wrapper around every custom entry pi
+  // holds) already prepends `Spacer(1)` to whatever we return — that Spacer
+  // is what plays pi native's "Spacer(1) before user" role in chatContainer.
+  // Our render must NOT emit its own leading blank, or the two would stack
+  // and every user message would grow an extra blank line.
+  assertEqual(renderItem(items, 0), expected, "raw component output, no leading blank added by us");
 });
 
-test("a user message after other output gets pi's separating blank line", () => {
+test("user renders identically whether or not there is preceding content — CustomEntry's Spacer handles the gap", () => {
   const items = [
     { kind: "assistant", message: assistantMessage([{ type: "text", text: "done" }]), streaming: false },
     { kind: "user", text: "and now this" },
   ];
   const alone = renderItem([items[1]], 0);
   const after = renderItem(items, 1);
-  assertEqual(after, ["", ...alone], "pi adds a Spacer(1) when the chat is not empty");
+  assertEqual(after, alone, "our AgentItemComponent output is position-independent (pi's wrapper adds the separator)");
 });
 
-test("an assistant message with thinking renders exactly like pi's", () => {
+test("an assistant message renders pi's output MINUS its leading Spacer (which CustomEntry provides)", () => {
   const message = assistantMessage([
     { type: "thinking", thinking: "let me think" },
     { type: "text", text: "the answer is `42`" },
   ]);
-  const expected = new pi.AssistantMessageComponent(
+  const piNative = new pi.AssistantMessageComponent(
     message,
     settings.hideThinkingBlock,
     settings.markdownTheme,
@@ -85,7 +91,16 @@ test("an assistant message with thinking renders exactly like pi's", () => {
   ).render(WIDTH);
 
   const actual = renderItem([{ kind: "assistant", message, streaming: false }], 0);
-  assertEqual(actual, expected, "thinking block and markdown both come from pi");
+
+  // `AssistantMessageComponent.updateContent` unconditionally adds a leading
+  // `Spacer(1)` (`contentContainer.addChild(new Spacer(1))` when the message
+  // has visible content), and then its own `render` wraps the first line in
+  // an OSC133 shell-integration prefix (`\x1b]133;A\x07`) — so the first line
+  // has visibleWidth 0 but is not the empty string. CustomEntry adds another
+  // Spacer above the whole thing. Dropping one leading zero-width line is
+  // the fix.
+  assert(visibleWidth(piNative[0]) === 0, `pi's native render starts with a zero-width line: ${JSON.stringify(piNative.slice(0, 2))}`);
+  assertEqual(actual, piNative.slice(1), "same content, one fewer leading blank");
   assert(
     actual.join("\n").includes("42"),
     `the answer is rendered: ${JSON.stringify(actual)}`,
@@ -124,7 +139,12 @@ test("a tool call renders with pi's built-in renderers, not a bare name", async 
   })();
 
   const actual = renderItem(items, 0);
-  assertEqual(actual, expected, "same box as the main session's bash call");
+  // ToolExecutionComponent also unconditionally prepends `Spacer(1)` to
+  // itself (see `tool-execution.js`), same double-Spacer problem as
+  // AssistantMessageComponent — we drop one and let CustomEntry's Spacer
+  // fill that role.
+  assert(expected[0] === "", `pi's native tool render starts with a Spacer: ${JSON.stringify(expected.slice(0, 2))}`);
+  assertEqual(actual, expected.slice(1), "same box as the main session's bash call, minus the leading Spacer");
   assert(actual.join("\n").includes("ls -la"), `the command itself is shown: ${JSON.stringify(actual)}`);
   assertEqual(renderItem(items, 1), [], "the result is drawn inside the call, never on its own");
 });

@@ -170,6 +170,24 @@ test("noteMirrored restores progress from a reloaded session", () => {
   assertEqual(appended, [2], "the reloaded entries are not duplicated");
 });
 
+test("buildRows carries the def name through from the manifest entry to the row", () => {
+  vm.resetGroupOrder();
+  const rows = vm.buildRows({
+    rootFile: "/tmp/root.jsonl",
+    rootName: "main",
+    rootBusy: false,
+    agents: [
+      { id: "1", name: "plain-agent", file: "/tmp/plain.jsonl", createdAt: "" },
+      { id: "2", name: "backed-agent", file: "/tmp/backed.jsonl", createdAt: "", def: "reviewer" },
+    ],
+  });
+
+  const plain = rows.find((r) => r.key === "/tmp/plain.jsonl");
+  const backed = rows.find((r) => r.key === "/tmp/backed.jsonl");
+  assertEqual(plain.def, undefined, "plain agent has no def badge");
+  assertEqual(backed.def, "reviewer", "def-backed agent surfaces its def name for the badge");
+});
+
 test("buildRows puts working agents first and marks the attached one", () => {
   const rows = vm.buildRows({
     rootFile: "/tmp/root.jsonl",

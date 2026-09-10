@@ -34,6 +34,12 @@ export interface AgentRow {
   lastModified: Date;
   summary?: string;
   model?: string;
+  /**
+   * Sub-agent def name (from `.pi/agents/<def>.md`) that spawned this agent, if
+   * any. The picker draws it as a `[def]` badge next to the name so a
+   * catalog-backed agent is immediately recognisable.
+   */
+  def?: string;
 }
 
 export interface AgentFileInfo {
@@ -143,7 +149,7 @@ export function resetGroupOrder(): void {
 }
 
 export function buildRows(input: BuildRowsInput): AgentRow[] {
-  const make = (file: string, name: string, isRoot: boolean): AgentRow => {
+  const make = (entry: AgentEntry | undefined, file: string, name: string, isRoot: boolean): AgentRow => {
     const info = readAgentFile(file);
     const live = getAgent(file);
     const liveState = stateOf(file);
@@ -162,11 +168,14 @@ export function buildRows(input: BuildRowsInput): AgentRow[] {
       // A live agent's session knows its model right away; the file only learns
       // it from the next assistant message, so `/model` would look like a no-op.
       model: (isRoot ? undefined : modelOf(file)?.id) ?? info.model,
+      // Def name comes from the manifest, not the session file: the def is a
+      // spawn-time input, so revived agents keep the same badge.
+      ...(entry?.def ? { def: entry.def } : {}),
     };
   };
 
-  const rows = [make(input.rootFile, input.rootName, true)];
-  for (const agent of input.agents) rows.push(make(agent.file, agent.name, false));
+  const rows = [make(undefined, input.rootFile, input.rootName, true)];
+  for (const agent of input.agents) rows.push(make(agent, agent.file, agent.name, false));
 
   pruneTickets(new Set(rows.map((r) => r.key)));
   const tickets = new Map(rows.map((r) => [r.key, groupTicket(r.key, r.state)]));
