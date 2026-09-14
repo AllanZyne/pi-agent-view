@@ -26,7 +26,7 @@ agent keeps working while you look at another one.
      ✓ update-the-unit-tests
        9 msgs · claude-sonnet-4-5   Updated 12 test files.
   ──────────────────────────────────────────────────────────
-  ↑↓ select · ⏎ attach · type+⏎ new agent · ctrl+x abort · ← close · ? help
+  ↑↓ select · ⏎ attach · type+⏎ new agent · ctrl+x delete · ← close · ? help
 ```
 
 ## Install
@@ -44,7 +44,7 @@ pi install git:github.com/AllanZyne/pi-agent-view
 | `Enter` / `→` | attach to the selected agent |
 | `Enter` + text | list open: new agent with that first prompt · attached: steer the agent |
 | `Esc` | detach — back to `main`, the agent keeps running |
-| `Ctrl+X` | terminate that agent — abort its turn and drop its session (on `main`: pi's interrupt) |
+| `Ctrl+X` | delete that agent outright — abort its turn, drop its session and erase its record (on `main`: pi's interrupt) |
 | `Ctrl+L` | model selector for the agent you are looking at |
 | `Ctrl+P` / `Shift+Ctrl+P` | cycle the attached agent's model |
 | `?` | help |
@@ -147,10 +147,26 @@ listed as diagnostics by `/agents`).
 reload.
 
 Don't want to hand-write the frontmatter? This extension ships a
-**`create-subagent` skill**: ask pi something like *"create a code-reviewer
-subagent"* and the skill walks it through picking a name, description, and
-system prompt, then writes the file for you. Run `/skill:create-subagent`
-to invoke it explicitly.
+**`create-agent` skill**: ask pi something like *"create a agent"*,
+*"create an agent"*, or *"create a code-reviewer subagent"* and the skill
+walks it through picking a name, description, and system prompt, then
+writes the file for you. Run `/skill:create-agent` to invoke it explicitly.
+
+**Gotcha:** the `pi.skills` entry in this extension's `package.json` only
+feeds the *pi package* resource-manifest loader — i.e. it only takes effect
+if this extension were installed via `pi install`/tracked in
+`settings.json`. Dropped straight into `~/.pi/agent/extensions/agent-view/`
+(the setup this repo actually uses), pi's extension auto-discovery loads
+`index.ts` but never reads `package.json`'s `pi` manifest, so the skill is
+silently invisible (`/agents` still works; skills just don't show up in the
+system prompt or `/skill:` completion — verified with `pi -p '...' --mode
+json` in a scratch dir). Fix: symlink it into a root that *is*
+auto-scanned:
+```bash
+ln -s ../extensions/agent-view/skills/create-agent ~/.pi/agent/skills/create-agent
+```
+Keep the skill's source of truth here under `skills/create-agent/`; the
+symlink is just what makes it live.
 
 **Editor autocomplete:** typing `@` in the editor opens an **agent picker**
 (not pi's file picker) while this extension is loaded — the list includes
@@ -167,9 +183,11 @@ Differences from Claude Code's `.claude/agents/`:
 | built-in Explore/Plan/general-purpose auto-delegation | none — v1 is explicit summoning only |
 | `@` completes files | `@` completes agents; pi's file completion is suppressed |
 
-`Ctrl+X` is a hard stop, not a pause: the agent's session is disposed, so
-nothing of it keeps running. Its transcript stays on disk, so it stays in the
-list as **Stopped** and attaching to it revives it.
+`Ctrl+X` is not a pause, it is a delete: the agent's session is aborted and
+disposed, its manifest entry removed, and its `.jsonl` erased from disk.
+Unlike a Stopped agent, there is nothing left afterwards — it drops off the
+list entirely and cannot be revived. If you were attached to it, you land
+back on `main`.
 
 Which conversation you are talking to is shown on the editor frame, always, next
 to *that conversation's* working state — an idle agent never inherits "Working"
@@ -192,7 +210,7 @@ list of slugs. Selecting it detaches, exactly like `Esc`. Agents spawned via
 | --- | --- | --- |
 | `✽` | Working | streaming right now |
 | `✗` | Failed | the task ended with an error |
-| `⊘` | Stopped | not running and never reached a verdict: terminated with `Ctrl+X`, aborted, or died mid-turn |
+| `⊘` | Stopped | not running and never reached a verdict: aborted or died mid-turn (Ctrl+X now deletes the agent outright instead of leaving it Stopped) |
 | `∙` | Idle | nothing has run yet |
 | `✓` | Completed | the task finished successfully |
 
@@ -357,7 +375,7 @@ new agents always join the same group.
 | `transcript-view.ts` | main-vs-agent transcript separation (headless) |
 | `tool-renderers.ts` | pi's built-in tool renderers, for agent tool calls (headless) |
 | `index.ts` | rendering, key handling, extension wiring (TUI) |
-| `skills/create-subagent/` | packaged skill: walk the user through authoring a new `.pi/agents/*.md` |
+| `skills/create-agent/` | packaged skill: walk the user through authoring a new `.pi/agents/*.md` |
 | `tests/` | test harness and tests |
 
 Everything except `index.ts` is free of TUI/extension-context dependencies so it

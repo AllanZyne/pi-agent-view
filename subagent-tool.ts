@@ -53,6 +53,20 @@ const SubagentParams = Type.Object({
   ),
 });
 
+/**
+ * The model catalog only knows `provider/id` model ids. Some models
+ * (mis)read the "omit to inherit" wording in the tool/param descriptions as
+ * license to pass the literal string `"inherit"` instead of actually
+ * omitting the field. Normalize that (and empty-string) back to "omitted"
+ * before it ever reaches `resolveModelId`, so it inherits as intended
+ * instead of failing with "Unknown or unavailable model(s): inherit".
+ */
+function normalizeModelParam(model: string | undefined): string | undefined {
+  if (!model) return undefined;
+  const trimmed = model.trim();
+  return trimmed && trimmed.toLowerCase() !== "inherit" ? trimmed : undefined;
+}
+
 /** The most recent assistant message text in a live agent's transcript. */
 function lastAssistantText(agent: LiveAgent): string {
   for (let i = agent.transcript.length - 1; i >= 0; i--) {
@@ -95,12 +109,13 @@ export function registerSubagentTool(pi: ExtensionAPI): void {
         };
       }
 
-      const requested =
+      const requested = (
         params.tasks && params.tasks.length > 0
           ? params.tasks
           : params.task
             ? [{ agent: params.agent, task: params.task, model: params.model }]
-            : [];
+            : []
+      ).map((t) => ({ ...t, model: normalizeModelParam(t.model) }));
 
       if (requested.length === 0) {
         return {

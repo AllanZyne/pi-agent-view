@@ -11,7 +11,7 @@
       "./index.ts"
     ],
     "skills": [
-      "./skills/create-subagent/SKILL.md"
+      "./skills/create-agent/SKILL.md"
     ]
   },
   "scripts": {

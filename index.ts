@@ -45,7 +45,7 @@
  *                  attached:    `@<slug>` from another agent stays background,
  *                               anything else steers the attached agent
  *   Esc            detach (agent keeps running)
- *   Ctrl+X         terminate that agent (main session: interrupt its turn)
+ *   Ctrl+X         delete that agent outright (main session: interrupt its turn)
  *   Ctrl+L         model selector for the conversation on screen
  *   Ctrl+P         cycle the attached agent's model
  *   ?              help
@@ -125,23 +125,26 @@ import {
   cycleAgentModel,
   disposeAll,
   ensureAgent,
+  forgetAgent,
   getAgent,
   isLoadingSubAgent,
   modelOf,
   readTranscript,
   runAgent,
+  seedTranscript,
   setAgentModel,
   setOnChange,
   sharedModelRuntime,
   stateOf,
   steerAgent,
-  terminateAgent,
+  summarizeContext,
   type TranscriptItem,
 } from "./agent-runtime.ts";
 import {
   agentName,
   listAgentEntries,
   registerAgent,
+  removeAgentEntry,
   resolveRoot,
   ROOT_AGENT_NAME,
   type RootCtx,
@@ -195,9 +198,13 @@ function statMtime(file: string): number {
  *
  * Users who want to write `@pinger` as literal chat (e.g. discussing a bug
  * in that def) type `\@pinger` to suppress interception. The backslash isn't
- * whitespace, so `parseAtMention` sees it as prose and doesn't fire; this
- * helper then removes the `\` before the message is sent so the escape is
- * cosmetic and never leaks into main's transcript or a sub-agent's task.
+ * whitespace, so `parseAtMention` sees it as prose and doesn't fire — but
+ * only if it still sees the backslash: every call site here resolves the
+ * mention against the *raw* text first, then calls this helper to remove the
+ * `\` from whichever text is actually sent (chat, or the routed/spawned
+ * task), so the escape is cosmetic and never leaks into main's transcript or
+ * a sub-agent's task. Stripping before resolving would silently defeat the
+ * escape instead of honouring it.
  *
  * Only `\@<slug>` sequences are touched; other backslashes are left alone.
  */
@@ -472,7 +479,7 @@ function renderPicker(view: ViewState, th: Theme, width: number): string[] {
       ["Enter / →", "Attach: stream it into the transcript"],
       ["Enter + text", "Background spawn (picker) · steer / @-route (attached)"],
       ["Esc", "Detach (agent keeps running)"],
-      ["Ctrl+X", "Terminate that agent (main: interrupt the turn)"],
+      ["Ctrl+X", "Delete that agent outright (main: interrupt the turn)"],
       ["/model [name]", "Set that agent's model (Ctrl+L when attached)"],
       ["←", "Close the picker (reopen to refresh the list)"],
       ["@agent <task>", "Spawn a background agent (inherits main)"],
@@ -572,7 +579,7 @@ type Action =
   | { t: "route"; key: string; name: string; text: string; fromAttached?: string }
   | { t: "model"; key: string; search?: string }
   | { t: "cycleModel"; key: string; direction: "forward" | "backward" }
-  /** Ctrl+X: interrupt the main session's turn, terminate an agent outright. */
+  /** Ctrl+X: interrupt the main session's turn, delete an agent outright. */
   | { t: "terminate"; key: string };
 
 /**
@@ -841,20 +848,28 @@ class AgentViewEditor extends CustomEditor {
             // target is self, `resolveMention` returns null and we fall
             // through to `steer` (i.e. the mention is treated as chat, and
             // the current agent gets the message as before).
-            const mention = this.resolveMention(text, { excludeFile: view.attached });
+            //
+            // Resolved against `raw`, not `text`: `parseAtMention`'s
+            // position rule relies on a leading backslash still being
+            // present to defeat interception (`\@pinger …` must NOT match).
+            // Resolving against the already-stripped `text` would silently
+            // undo the escape. `mention.task` is stripped afterwards so the
+            // backslash still never leaks into the routed/spawned message.
+            const mention = this.resolveMention(raw, { excludeFile: view.attached });
             if (mention) {
+              const task = stripAtEscape(mention.task);
               this.act(
                 mention.target.kind === "route"
                   ? {
                       t: "route",
                       key: mention.target.file,
                       name: mention.target.name,
-                      text: mention.task,
+                      text: task,
                       fromAttached: view.attached,
                     }
                   : {
                       t: "spawn",
-                      prompt: mention.task,
+                      prompt: task,
                       def: mention.target.kind === "def" ? mention.target.def : undefined,
                       fromAttached: view.attached,
                     },
@@ -874,21 +889,24 @@ class AgentViewEditor extends CustomEditor {
         // gets clean prose and the escape stays cosmetic.
         const raw = this.getText();
         if (raw.trim().length > 0) {
-          const text = stripAtEscape(raw);
-          const mention = this.resolveMention(text);
+          // Resolved against `raw` (escape intact) for the same reason as the
+          // attached-view handler above: stripping before resolution would
+          // defeat a leading `\@` escape instead of honouring it.
+          const mention = this.resolveMention(raw);
           if (mention) {
             this.setText("");
+            const task = stripAtEscape(mention.task);
             this.act(
               mention.target.kind === "route"
                 ? {
                     t: "route",
                     key: mention.target.file,
                     name: mention.target.name,
-                    text: mention.task,
+                    text: task,
                   }
                 : {
                     t: "spawn",
-                    prompt: mention.task,
+                    prompt: task,
                     def: mention.target.kind === "def" ? mention.target.def : undefined,
                   },
             );
@@ -897,6 +915,7 @@ class AgentViewEditor extends CustomEditor {
           // Fall through to pi: it reads from the editor buffer on Enter,
           // so overwrite the buffer with the stripped version so pi (main)
           // never sees the escape character.
+          const text = stripAtEscape(raw);
           if (text !== raw) this.setText(text);
         }
       }
@@ -946,20 +965,25 @@ class AgentViewEditor extends CustomEditor {
         // mention picks the target: an existing live agent gets routed to,
         // a catalog def is spawned, `@agent` spawns adhoc. No mention
         // = adhoc spawn with the typed text (historical picker behaviour).
-        const mention = this.resolveMention(text);
+        //
+        // Resolved against `raw` (escape intact), same reasoning as the
+        // other two handlers: stripping first would defeat a leading `\@`.
+        const mention = this.resolveMention(raw);
+        const task = mention ? stripAtEscape(mention.task) : undefined;
         if (mention?.target.kind === "route") {
           this.act({
             t: "route",
             key: mention.target.file,
             name: mention.target.name,
-            text: mention.task,
+            text: task!,
           });
           return;
         }
         this.act({
           t: "spawn",
-          prompt: mention ? mention.task : text,
+          prompt: task ?? text,
           def: mention && mention.target.kind === "def" ? mention.target.def : undefined,
+          fromAttached: view.attached,
         });
       } else {
         const row = this.row();
@@ -1235,9 +1259,11 @@ export default function agentViews(pi: ExtensionAPI): void {
 
   /**
    * Ctrl+X. On the main session this is pi's interrupt; on an agent it is a
-   * hard stop: the turn is aborted and the session dropped, so nothing of that
-   * agent is left running. Its transcript stays on disk, so the agent remains
-   * in the list and attaching to it revives it.
+   * hard delete: the turn is aborted, the session dropped, its manifest entry
+   * removed and its `.jsonl` erased from disk. Unlike a stopped agent, there
+   * is no record left afterwards — the agent disappears from the list and
+   * attaching to it again is not possible; if you were looking at it, you are
+   * dropped back to `main`.
    */
   async function terminate(ctx: ExtensionContext, file: string): Promise<void> {
     if (file === ctx.sessionManager.getSessionFile()) {
@@ -1245,16 +1271,31 @@ export default function agentViews(pi: ExtensionAPI): void {
       return;
     }
     const name = nameOf(file);
-    const wasLive = await terminateAgent(file);
-    ctx.ui.notify(wasLive ? `Terminated ${name}` : `${name} was not running`, wasLive ? "info" : "warning");
+    await forgetAgent(file);
+    const root = rootOf(ctx);
+    if (root) removeAgentEntry(root, file);
+    if (view.attached === file) {
+      attachTo(view, undefined);
+      redrawTranscript();
+    }
+    ctx.ui.notify(`Deleted ${name}`, "info");
     refreshRowsIfOpen(ctx);
     tui?.requestRender();
   }
 
   /**
-   * Create a new agent and hand it the prompt. Returns as soon as the turn is
-   * queued: the session you are in is never blocked or interrupted.
+   * The tail of the conversation `@<slug>` was typed into — the attached
+   * agent's transcript, or main's own session when nothing is attached.
+   * Handed to `spawn` so a freshly-created agent isn't dropped into a task
+   * with zero background: it sees a few of the turns that led up to it
+   * being summoned, the same way a human would fill someone in before
+   * handing off work.
    */
+  function spawnContext(ctx: ExtensionContext, fromAttached?: string): string {
+    const items = fromAttached ? readTranscript(fromAttached) : seedTranscript(ctx.sessionManager);
+    return summarizeContext(items);
+  }
+
   /**
    * Create a new agent and hand it the prompt. Returns as soon as the turn is
    * queued: the session you are in is never blocked or interrupted.
@@ -1263,11 +1304,18 @@ export default function agentViews(pi: ExtensionAPI): void {
    * the Markdown body is appended to the base system prompt, and the def's
    * model / thinking level are used as inheritance defaults. Undefined means
    * a plain adhoc agent (the old `/agent <task>` behaviour).
+   *
+   * `contextFrom` is the file of the agent whose recent transcript should be
+   * summarized and prepended to `prompt` (see `spawnContext`) — omit it to
+   * pull context from main's own session instead of an attached agent's. The
+   * agent's *name* is still derived from the bare `prompt`, so the picker
+   * slug stays short and readable instead of being built from the context
+   * blob.
    */
   async function spawn(
     ctx: ExtensionContext,
     prompt: string,
-    options: { attach: boolean; def?: SubAgentDef },
+    options: { attach: boolean; def?: SubAgentDef; contextFrom?: string },
   ): Promise<string | undefined> {
     const root = rootOf(ctx);
     if (!root) {
@@ -1278,8 +1326,12 @@ export default function agentViews(pi: ExtensionAPI): void {
     const existing = listAgentEntries(root, (f) => getAgent(f) !== undefined);
     const name = agentName(prompt, existing.map((a) => a.name));
     const file = registerAgent(root, name, ctx.cwd, options.def?.name);
+    const context = spawnContext(ctx, options.contextFrom);
+    const task = context
+      ? `Context from the conversation this task was spawned from (for background only — you were not part of it):\n\n${context}\n\n---\n\nYour task:\n${prompt}`
+      : prompt;
     try {
-      await runAgent(file, prompt, ctx.cwd, ctx.model, ctx.thinkingLevel, options.def);
+      await runAgent(file, task, ctx.cwd, ctx.model, ctx.thinkingLevel, options.def);
     } catch (err) {
       ctx.ui.notify(`Could not start agent: ${String(err)}`, "error");
       return undefined;
@@ -1557,7 +1609,11 @@ export default function agentViews(pi: ExtensionAPI): void {
             // "fire-and-forget" case (typing `@agent do X` while chatting
             // with main). It also broke symmetry with `route`, which
             // already stays background and just toasts.
-            void spawn(ctx, action.prompt, { attach: false, def: action.def }).then((file) => {
+            void spawn(ctx, action.prompt, {
+              attach: false,
+              def: action.def,
+              contextFrom: action.fromAttached,
+            }).then((file) => {
               if (!file) return;
               // Prefer the agent's real slug (from the manifest, written
               // synchronously by registerAgent) over the def's name in the

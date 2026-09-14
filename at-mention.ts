@@ -36,9 +36,12 @@
  * If interception fails, the whole message goes to main / the attached agent
  * as normal chat. When it succeeds, the full original message is passed
  * verbatim to the target — the mention is not stripped. The `\@` cleanup
- * (removing leading backslashes from `@`-escape sequences) is done by the
- * editor before this module runs, so `parseAtMention` sees the same text
- * both when it decides to intercept and when it lets the message through.
+ * (removing leading backslashes from `@`-escape sequences) is the editor's
+ * job, but it must run *after* this module, not before: `parseAtMention`
+ * needs the backslash still in place to reject `\@pinger …` on the position
+ * check. The editor calls `parseAtMention` on the raw text first, and only
+ * strips `\@` from whichever text actually ends up sent (chat, or the
+ * routed/spawned task).
  *
  * Everything here is pure: no FS, no TUI, no extension context, no mtime.
  */

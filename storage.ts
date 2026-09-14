@@ -178,3 +178,28 @@ export function registerAgent(root: RootCtx, name: string, cwd: string, def?: st
   sm.appendSessionInfo(name);
   return file;
 }
+
+/**
+ * Remove an agent's manifest entry and delete its session file from disk.
+ *
+ * Used for an outright delete (Ctrl+X in `index.ts`), as opposed to merely
+ * stopping it (`terminateAgent` in `agent-runtime.ts`): after this call
+ * `listAgentEntries()` no longer reports the agent at all, so there is
+ * nothing left on the picker to attach to and revive. A missing file (or no
+ * matching manifest entry) is not an error.
+ */
+export function removeAgentEntry(root: RootCtx, file: string): void {
+  const m = loadManifest(root.sessionDir, root.rootId);
+  if (m) {
+    const next = m.agents.filter((a) => a.file !== file);
+    if (next.length !== m.agents.length) {
+      m.agents = next;
+      saveManifest(root.sessionDir, m);
+    }
+  }
+  try {
+    fs.rmSync(file, { force: true });
+  } catch {
+    /* ignore */
+  }
+}

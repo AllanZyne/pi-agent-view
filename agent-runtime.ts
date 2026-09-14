@@ -234,6 +234,47 @@ export function seedTranscript(sm: SessionManager): TranscriptItem[] {
   return out;
 }
 
+const CONTEXT_MAX_TURNS = 6;
+const CONTEXT_MAX_CHARS = 3000;
+const CONTEXT_TURN_MAX_CHARS = 800;
+
+/**
+ * A short, plain-text excerpt of the tail of a transcript, meant to be
+ * prepended to a freshly-spawned sub-agent's task so it isn't dropped into
+ * the middle of someone else's conversation with zero background.
+ *
+ * Only `user`/`assistant` turns are kept (tool calls/results/errors are
+ * noise for this purpose and can be huge); each turn is truncated to
+ * `CONTEXT_TURN_MAX_CHARS`, and the whole excerpt is capped at
+ * `CONTEXT_MAX_TURNS` turns *and* `CONTEXT_MAX_CHARS` — whichever is hit
+ * first, walking backwards from the most recent turn so the freshest
+ * context always wins over older turns. Returns `""` when there is nothing
+ * worth including (empty transcript, or only tool activity).
+ */
+export function summarizeContext(items: readonly TranscriptItem[]): string {
+  const turns: string[] = [];
+  let chars = 0;
+  for (let i = items.length - 1; i >= 0 && turns.length < CONTEXT_MAX_TURNS; i--) {
+    const item = items[i]!;
+    let line: string | undefined;
+    if (item.kind === "user") line = `User: ${truncate(item.text, CONTEXT_TURN_MAX_CHARS)}`;
+    else if (item.kind === "assistant") {
+      const text = assistantText(item.message).trim();
+      if (text) line = `Assistant: ${truncate(text, CONTEXT_TURN_MAX_CHARS)}`;
+    }
+    if (!line) continue;
+    if (chars + line.length > CONTEXT_MAX_CHARS && turns.length > 0) break;
+    turns.push(line);
+    chars += line.length;
+  }
+  return turns.reverse().join("\n\n");
+}
+
+function truncate(text: string, max: number): string {
+  const trimmed = text.trim();
+  return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
+}
+
 /** Transcript of an agent that is not live in this process, read from its jsonl. */
 export function readTranscript(file: string): TranscriptItem[] {
   const live = registry().agents.get(file);
@@ -643,6 +684,24 @@ export async function terminateAgent(file: string): Promise<boolean> {
   const wasLive = reg.agents.has(file);
   reg.stopped.add(file);
   await disposeAgent(file);
+  notify();
+  return wasLive;
+}
+
+/**
+ * Fully remove an agent from the in-process pool: abort/dispose its live
+ * session (if any) and drop any stale `stopped` bookkeeping for it.
+ *
+ * Unlike `terminateAgent`, this is the runtime half of an outright delete —
+ * the caller (Ctrl+X in `index.ts`) also erases the on-disk record via
+ * `removeAgentEntry()` in `storage.ts`, so there is nothing left to revive.
+ * Returns whether the agent was live at the time.
+ */
+export async function forgetAgent(file: string): Promise<boolean> {
+  const reg = registry();
+  const wasLive = reg.agents.has(file);
+  await disposeAgent(file);
+  reg.stopped.delete(file);
   notify();
   return wasLive;
 }

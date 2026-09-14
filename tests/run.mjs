@@ -13,6 +13,7 @@ import "./unit.render.mjs";
 import "./unit.attached-commands.mjs";
 import "./unit.catalog.mjs";
 import "./unit.at-mention.mjs";
+import "./unit.summarize-context.mjs";
 import "./unit.autocomplete.mjs";
 import "./e2e.concurrency.mjs";
 import { run } from "./harness.mjs";

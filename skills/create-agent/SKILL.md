@@ -1,6 +1,6 @@
 ---
-name: create-subagent
-description: Author a new sub-agent definition file for pi-agent-view under .pi/agents/ (project) or ~/.pi/agent/agents/ (user). Use when the user asks to create, add, define, or design a new sub-agent — for example "create a code-reviewer subagent" or "add an agent that writes commit messages". Gathers a name, description, and system-prompt body, optionally a model, writes the .md file, and shows how to summon it with @name.
+name: create-agent
+description: Author a new sub-agent definition file for pi-agent-view under .pi/agents/ (project) or ~/.pi/agent/agents/ (user). Use when the user asks to create, add, define, or design a new (sub-)agent — for example "create a agent", "create an agent", "create a code-reviewer subagent", or "add an agent that writes commit messages". Gathers a name, description, and system-prompt body, optionally a model, writes the .md file, and shows how to summon it with @name.
 ---
 
 # Create a sub-agent definition
