@@ -856,8 +856,31 @@ class AgentViewEditor extends CustomEditor {
           // deciding to call `agent_create` / `agent_send` / `agent_inspect` /
           // `agent_remove` from inside its reply, exactly like main would.
           // See README "LLM-callable tools".
-          const raw = this.getText();
-          const text = raw.trim();
+          let text = this.getText().trim();
+          if (this.isShowingAutocomplete()) {
+            // A popup is up (e.g. "/rel" showing "reload"). pi's own `Editor`
+            // treats Enter here as "accept the highlighted suggestion", and
+            // for a slash command it *also* falls through to submit in the
+            // same keystroke — so classifying `this.getText()` directly would
+            // act on the unfinished prefix ("/rel") instead of what the user
+            // actually picked ("/reload"). Swap `onSubmit` out for the
+            // duration so that fallthrough lands on our own capture instead
+            // of pi's real dispatcher (which always targets main, not the
+            // attached agent), then classify the *completed* text below.
+            const realOnSubmit = this.onSubmit;
+            let completed: string | undefined;
+            this.onSubmit = (submitted) => {
+              completed = submitted;
+            };
+            super.handleInput(data);
+            this.onSubmit = realOnSubmit;
+            // Accepting a non-slash completion (a file path, an `@mention`, an
+            // argument that isn't a whole command by itself) applies it to the
+            // text but never reaches `onSubmit` — nothing to classify yet, let
+            // the user keep typing.
+            if (completed === undefined) return;
+            text = completed;
+          }
           if (text) {
             const model = parseModelCommand(text);
             if (model) {
@@ -868,10 +891,12 @@ class AgentViewEditor extends CustomEditor {
             const cmd = commandName(text);
             // Global commands (`/settings`, `/login`, `/quit`, ...) never touch
             // `this.session`, so pi's real dispatch is correct no matter which
-            // agent is on screen — fall through to it exactly like the
-            // detached case below, leaving the text in place for `onSubmit`.
+            // agent is on screen. Call it directly with the resolved text
+            // rather than replaying `data` through `super.handleInput`: pi's
+            // own handler clears the editor itself, and by this point (an
+            // accepted completion) the editor may already be empty anyway.
             if (cmd && GLOBAL_ATTACHED_COMMANDS.has(cmd)) {
-              super.handleInput(data);
+              this.onSubmit?.(text);
               return;
             }
             // Blacklisted commands are wired to pi's own session/tree — block
