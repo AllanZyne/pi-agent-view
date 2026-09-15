@@ -54,9 +54,9 @@ works as soon as you type.
 
 ## Talking to agents
 
-There's no `/agent` command and no `@<slug>` routing — `@name` is just text.
-Whichever conversation you're talking to (main, or an agent you're attached
-to) decides from context what to do and calls the matching tool itself:
+Just ask in plain language. Whichever conversation you're talking to (main,
+or an agent you're attached to) reads the request and calls the matching
+tool itself:
 
 ```
 @reviewer take a look at this diff        → agent_create
@@ -65,9 +65,8 @@ how's the reviewer doing?                  → agent_inspect
 kill the reviewer, it's stuck              → agent_remove
 ```
 
-No position rule, no escaping, no `:<model>` syntax — just ask in plain
-language. Typing `@` still opens a discovery-only picker (inserts
-`@<name> ` at the cursor); it doesn't route or intercept anything.
+Typing `@` opens a discovery picker that inserts `@<name> ` at the cursor —
+it's just a convenience for referring to an agent by name in your message.
 
 Four tools, one per intent, so the model expresses intent by *which tool it
 calls* rather than arguments a tool would have to guess from. **Every
@@ -138,10 +137,22 @@ an agent does changes pi's global default.
 ## Slash commands while attached
 
 While attached to an agent, typed text is sent to the agent as a chat
-message — pi's own slash commands don't run there, except `/model` (above).
-Commands that only make sense for pi's own session (`/resume`, `/fork`,
-`/new`, `/tree`, ...) have no meaning for an agent, so `/` completion while
-attached only offers what's actually implemented (currently just `/model`).
+message. A few kinds of slash command are handled differently:
+
+- **`/model`** runs against the attached agent's own model (see "Models"
+  above).
+- **Commands that don't touch a session** — auth, folder trust, settings,
+  reload, quitting, and a few static/info screens — run normally, always
+  against pi itself, regardless of which agent is on screen.
+- **Commands that only make sense for pi's own session** (`/resume`,
+  `/fork`, `/new`, `/tree`, `/clone`, `/export`, `/import`, `/share`,
+  `/scoped-models`, `/name`) are blocked with a notice instead of silently
+  running against the wrong session.
+- Anything else is sent to the agent as chat text, same as any other
+  message.
+
+`/` completion while attached hides the blocked commands, since typing one
+would just produce a notice.
 
 ## Agent list details
 
@@ -151,8 +162,7 @@ attached only offers what's actually implemented (currently just `/model`).
   spawned from a `.pi/agents/*.md` def show a `[<def>]` badge next to their
   name.
 - Icons: `✽` Working, `✓` Completed, `✗` Failed, `⊘` Stopped (aborted or
-  died mid-turn — `Ctrl+X` now deletes an agent outright instead of leaving
-  it Stopped), `∙` Idle.
+  died mid-turn), `∙` Idle.
 - The list is a **snapshot**: it's rebuilt when opened, not on a timer.
   Reopen (`←` twice) to refresh.
 - `Ctrl+X` is a hard delete, not a pause: the agent's turn is aborted, its

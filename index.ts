@@ -544,7 +544,9 @@ type Action =
   | { t: "model"; key: string; search?: string }
   | { t: "cycleModel"; key: string; direction: "forward" | "backward" }
   /** Ctrl+X: interrupt the main session's turn, delete an agent outright. */
-  | { t: "terminate"; key: string };
+  | { t: "terminate"; key: string }
+  /** A `BLOCKED_ATTACHED_COMMANDS` command was typed while attached. */
+  | { t: "blockedCommand"; name: string };
 
 /**
  * `/model` typed while an agent is attached.
@@ -560,24 +562,69 @@ function parseModelCommand(text: string): { search?: string } | undefined {
 }
 
 /**
- * Slash commands actually implemented for an attached agent, keyed by the
- * name pi's autocomplete lists them under (no leading slash).
- *
- * Every pi built-in command past this set is meaningless for an agent — it
- * operates on pi's own session/tree (`/resume`, `/fork`, `/new`, `/tree`, …),
- * which is not what an attached view is showing — and `handleInput` below
- * never lets pi's real command dispatch run while attached, so typing one
- * used to just get sent to the agent as a chat message with the autocomplete
- * suggesting it as if it would work. Add a command here (and teach
- * `handleInput` to actually run it) as attached-agent support for it lands.
+ * pi built-in commands (keyed by the name autocomplete lists them under, no
+ * leading slash) that don't touch a session's transcript/state at all:
+ * auth (`/login`, `/logout`), folder trust, provider settings, extension
+ * reload, quitting the app, static info screens, easter eggs. Running pi's
+ * real dispatch for these is correct and safe no matter which agent is on
+ * screen, since they never read or write `this.session` — so `handleInput`
+ * lets them fall through to it unchanged instead of steering them as chat
+ * text to the attached agent.
+ */
+const GLOBAL_ATTACHED_COMMANDS = new Set<string>([
+  "settings",
+  "login",
+  "logout",
+  "trust",
+  "reload",
+  "debug",
+  "hotkeys",
+  "changelog",
+  "quit",
+  "arminsayshi",
+  "dementedelves",
+]);
+
+/**
+ * Slash commands actually implemented against the attached agent's own
+ * session, keyed by the name pi's autocomplete lists them under. `handleInput`
+ * below has a dedicated case for each of these.
  */
 export const SUPPORTED_ATTACHED_COMMANDS = new Set<string>(["model"]);
 
 /**
- * Hide slash commands the attached view does not support from `/` completion,
- * so the suggestion list matches what actually works when you press Enter
- * (see `SUPPORTED_ATTACHED_COMMANDS`). Detached (on `main`), this passes
- * every call straight through: `view.attached` is unset only there.
+ * Blacklist: pi built-ins that operate on *pi's own* session/tree in ways
+ * that don't translate to "the agent you're looking at" — `/tree`, `/fork`,
+ * `/resume`, and `/new` all branch, switch, or clear pi's session file;
+ * `/clone`, `/export`, `/import`, `/share`, `/scoped-models`, `/name` are
+ * similarly wired to `this.session`. Letting pi's real dispatch run one of
+ * these while attached would silently mutate main instead of the agent on
+ * screen, so `handleInput` blocks them with a notice rather than either
+ * running them against the wrong session or steering the raw text as a chat
+ * message pretending to be a command. Extend this set as more turn out to be
+ * similarly unsafe; anything in neither this set nor the two above just gets
+ * sent to the agent as chat text, same as any other unrecognised input.
+ */
+const BLOCKED_ATTACHED_COMMANDS = new Set<string>([
+  "tree",
+  "fork",
+  "clone",
+  "resume",
+  "new",
+  "scoped-models",
+  "export",
+  "import",
+  "share",
+  "name",
+]);
+
+/**
+ * Hide slash commands the attached view would reject outright from `/`
+ * completion — the blacklist above, since typing one gets blocked with a
+ * notice instead of doing anything useful. Global commands and the ones this
+ * view implements itself both stay visible: both actually run. Detached (on
+ * `main`), this passes every call straight through: `view.attached` is unset
+ * only there.
  */
 export function withAttachedCommandFilter(current: AutocompleteProvider, view: ViewState): AutocompleteProvider {
   return {
@@ -586,10 +633,11 @@ export function withAttachedCommandFilter(current: AutocompleteProvider, view: V
       const result = await current.getSuggestions(lines, cursorLine, cursorCol, options);
       if (!result || !view.attached) return result;
       // Only the top-level "/" command list needs filtering: a command that
-      // made it past that list is one we support, so its own argument
-      // completions (prefix has a space in it) are left untouched.
+      // made it past that list either runs directly or is one we implement
+      // ourselves, so its own argument completions (prefix has a space in it)
+      // are left untouched.
       if (!result.prefix.startsWith("/") || result.prefix.includes(" ")) return result;
-      const items = result.items.filter((item: AutocompleteItem) => SUPPORTED_ATTACHED_COMMANDS.has(item.value));
+      const items = result.items.filter((item: AutocompleteItem) => !BLOCKED_ATTACHED_COMMANDS.has(item.value));
       if (items.length === 0) return null;
       return { ...result, items };
     },
@@ -599,6 +647,17 @@ export function withAttachedCommandFilter(current: AutocompleteProvider, view: V
       ? (lines, cursorLine, cursorCol) => current.shouldTriggerFileCompletion!(lines, cursorLine, cursorCol)
       : undefined,
   };
+}
+
+/**
+ * The bare command name of a `/foo` or `/foo args` line, or `undefined` for
+ * anything else (plain chat text, `!bash`, `@mention`, ...).
+ */
+function commandName(text: string): string | undefined {
+  if (!text.startsWith("/")) return undefined;
+  const spaceIndex = text.indexOf(" ");
+  const name = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+  return name || undefined;
 }
 
 /**
@@ -788,11 +847,29 @@ class AgentViewEditor extends CustomEditor {
           const text = raw.trim();
           if (text) {
             const model = parseModelCommand(text);
-            this.setText("");
             if (model) {
+              this.setText("");
               this.act({ t: "model", key: view.attached, search: model.search });
               return;
             }
+            const cmd = commandName(text);
+            // Global commands (`/settings`, `/login`, `/quit`, ...) never touch
+            // `this.session`, so pi's real dispatch is correct no matter which
+            // agent is on screen — fall through to it exactly like the
+            // detached case below, leaving the text in place for `onSubmit`.
+            if (cmd && GLOBAL_ATTACHED_COMMANDS.has(cmd)) {
+              super.handleInput(data);
+              return;
+            }
+            // Blacklisted commands are wired to pi's own session/tree — block
+            // them instead of either running them against the wrong session
+            // or sending the raw command text to the agent as chat.
+            if (cmd && BLOCKED_ATTACHED_COMMANDS.has(cmd)) {
+              this.setText("");
+              this.act({ t: "blockedCommand", name: cmd });
+              return;
+            }
+            this.setText("");
             this.act({ t: "steer", key: view.attached, text });
             return;
           }
@@ -1503,6 +1580,9 @@ export default function agentViews(pi: ExtensionAPI): void {
             break;
           case "terminate":
             void terminate(ctx, action.key);
+            break;
+          case "blockedCommand":
+            ctx.ui.notify(`/${action.name} isn't available while attached to an agent — detach (Esc) first`, "warning");
             break;
         }
       };

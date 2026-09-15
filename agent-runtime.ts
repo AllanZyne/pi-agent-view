@@ -721,8 +721,15 @@ export async function steerAgent(file: string, text: string): Promise<boolean> {
   const agent = registry().agents.get(file);
   if (!agent) return false;
   try {
-    if (agent.session.isStreaming) await agent.session.steer(text);
-    else await agent.session.prompt(text);
+    // Always go through `prompt()`, exactly like pi's own session does for
+    // both the idle and streaming cases (interactive-mode.js calls `prompt()`
+    // with `streamingBehavior: "steer"` while streaming, never `steer()`
+    // directly). `prompt()` is what dispatches extension commands
+    // (`pi.registerCommand`), skill commands, and prompt templates against
+    // *this* agent's own session -- `steer()` skips all of that and throws on
+    // extension commands, which made those work only while the agent was
+    // idle.
+    await agent.session.prompt(text, agent.session.isStreaming ? { streamingBehavior: "steer" } : undefined);
     notify();
     return true;
   } catch {

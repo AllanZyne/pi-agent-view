@@ -1,11 +1,18 @@
 /**
  * Unit tests for `withAttachedCommandFilter` (index.ts).
  *
- * pi's own slash-command dispatch never runs while an agent is attached (see
- * `AgentViewEditor.handleInput`): every command but `/model` is instead sent
- * to the agent as a plain chat message. Without this filter, `/` completion
- * still suggested every pi built-in command as if it would work — this is
- * the mismatch these tests guard against.
+ * Attached-agent command handling is a blacklist, not a whitelist: `/model`
+ * is implemented against the attached agent's own session,
+ * `GLOBAL_ATTACHED_COMMANDS` (not exported \u2014 covered indirectly here through
+ * the filter, which never hides them) fall through to pi's real dispatch
+ * unchanged because they never touch `this.session`, and only
+ * `BLOCKED_ATTACHED_COMMANDS` (pi's own session/tree commands: `/tree`,
+ * `/fork`, `/resume`, `/new`, ...) are hidden from `/` completion \u2014 because
+ * `AgentViewEditor.handleInput` blocks them with a notice instead of running
+ * them against the wrong session. Everything else (including commands this
+ * view has never heard of \u2014 extension commands, skills, prompt templates)
+ * stays visible: it gets sent to the agent's own session via `prompt()`,
+ * exactly like typing it on main would.
  */
 
 import { assert, assertEqual, load, test } from "./harness.mjs";
@@ -30,8 +37,8 @@ function viewWith(attached) {
   return { attached };
 }
 
-test("SUPPORTED_ATTACHED_COMMANDS includes /model, pi's built-ins otherwise", () => {
-  assert(SUPPORTED_ATTACHED_COMMANDS.has("model"), "the one command actually implemented while attached");
+test("SUPPORTED_ATTACHED_COMMANDS includes /model, the one command implemented against the attached agent's session", () => {
+  assert(SUPPORTED_ATTACHED_COMMANDS.has("model"));
 });
 
 test("detached (main): every command passes through untouched", async () => {
@@ -44,21 +51,49 @@ test("detached (main): every command passes through untouched", async () => {
   );
 });
 
-test("attached to an agent: unsupported commands are hidden from completion", async () => {
-  const provider = withAttachedCommandFilter(fakeCommandProvider(["model", "resume", "fork", "new"]), viewWith("/tmp/agent.jsonl"));
-  const result = await provider.getSuggestions(["/"], 0, 1, {});
-  assertEqual(result.items.map((i) => i.value), ["model"], "only the command handleInput actually runs is suggested");
+test("attached to an agent: blacklisted commands (pi's own session/tree) are hidden from completion", () => {
+  return (async () => {
+    const provider = withAttachedCommandFilter(
+      fakeCommandProvider(["model", "resume", "fork", "new", "tree", "clone", "export", "import", "share", "scoped-models", "name"]),
+      viewWith("/tmp/agent.jsonl"),
+    );
+    const result = await provider.getSuggestions(["/"], 0, 1, {});
+    assertEqual(result.items.map((i) => i.value), ["model"], "every blacklisted command is filtered out");
+  })();
 });
 
-test("attached: no matching supported command means no suggestions, not an empty list pi treats as file completion", async () => {
+test("attached: global commands (auth, settings, quit, ...) stay visible \u2014 they run unmodified against pi's own session", async () => {
+  const provider = withAttachedCommandFilter(
+    fakeCommandProvider(["model", "settings", "login", "logout", "trust", "reload", "quit", "hotkeys", "changelog", "debug"]),
+    viewWith("/tmp/agent.jsonl"),
+  );
+  const result = await provider.getSuggestions(["/"], 0, 1, {});
+  assertEqual(
+    result.items.map((i) => i.value),
+    ["model", "settings", "login", "logout", "trust", "reload", "quit", "hotkeys", "changelog", "debug"],
+    "global commands are not blacklisted",
+  );
+});
+
+test("attached: unrecognised commands (extension/skill/prompt-template) stay visible \u2014 they get sent to the agent's own session", async () => {
+  const provider = withAttachedCommandFilter(fakeCommandProvider(["model", "review", "commit-message"]), viewWith("/tmp/agent.jsonl"));
+  const result = await provider.getSuggestions(["/"], 0, 1, {});
+  assertEqual(
+    result.items.map((i) => i.value),
+    ["model", "review", "commit-message"],
+    "only the explicit blacklist is filtered, not an allowlist",
+  );
+});
+
+test("attached: no matching command means no suggestions, not an empty list pi treats as file completion", async () => {
   const provider = withAttachedCommandFilter(fakeCommandProvider(["resume", "fork"]), viewWith("/tmp/agent.jsonl"));
   const result = await provider.getSuggestions(["/"], 0, 1, {});
   assertEqual(result, null, "nothing left to suggest");
 });
 
-test("attached: argument completions for a supported command are left alone", async () => {
+test("attached: argument completions for any command are left alone", async () => {
   // Once past the top-level "/" list, the prefix has a space in it (e.g.
-  // "/model sonnet") — that's a command's own argument completions, already
+  // "/model sonnet") \u2014 that's a command's own argument completions, already
   // scoped to a command this filter would have let through the list for.
   const provider = withAttachedCommandFilter(
     {
