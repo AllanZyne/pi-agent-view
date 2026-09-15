@@ -30,9 +30,19 @@ any other command-line tool:
 # Isolated scratch directory so you don't touch real project state
 mkdir -p /tmp/repro && cd /tmp/repro
 
-# Start the program in a detached session with a fixed size (so output is
-# reproducible and wide enough not to wrap/truncate what you're inspecting)
-tmux new-session -d -s repro -x 220 -y 50 "<your interactive shell/program>"
+# Start the pane running your actual interactive shell first, THEN launch the
+# program with send-keys — don't hand the program to `new-session` as the pane
+# command. `new-session "<cmd>"` runs `<cmd>` under a bare non-login shell,
+# which may not have the PATH/aliases/functions/rc-file setup your normal
+# terminal has (a program installed or wired up via your shell's rc file can
+# be genuinely "not found" in that bare shell even though it works everywhere
+# you actually type). Starting the real shell first, the same one you'd
+# normally use, avoids debugging a PATH problem that has nothing to do with
+# the bug you're actually chasing.
+tmux new-session -d -s repro -x 220 -y 50 <your-actual-shell>   # e.g. fish, zsh, bash -l
+tmux send-keys -t repro "cd /tmp/repro && <your interactive program>" Enter
+sleep <enough time for it to finish starting up>
+tmux capture-pane -t repro -p   # confirm it's actually up before driving it
 
 # Drive it like a user would
 tmux send-keys -t repro "<input>" Enter
@@ -40,7 +50,7 @@ sleep <enough time for the program to react>
 
 # Inspect what's actually on screen
 tmux capture-pane -t repro -p          # visible pane only
-tmux capture-pane -t repro -p -S -100  # include scrollback
+tmux capture-pane -t repro -p -S -100  # include scrollback (bump -100 for long agentic traces)
 
 # Clean up
 tmux kill-session -t repro
@@ -49,7 +59,12 @@ tmux kill-session -t repro
 Notes that matter in practice:
 
 - Give the program real time to react (`sleep`) before capturing; capturing
-  too early just shows you the loading state.
+  too early just shows you the loading state. For a step whose duration is
+  unpredictable (an agentic tool call, a network request), don't guess one
+  long `sleep` — poll: sleep a short interval, `capture-pane`, check whether
+  the program's own "still working" indicator (a spinner, a "Working"/"Busy"
+  label, a progress line) is still present, and only move on once it's gone.
+  A blind sleep is either wastefully long or truncates a still-running step.
 - If the program needs a real backend/service to exercise the code path (e.g.
   it needs to actually do work, not just sit idle), use whatever the project's
   normal setup provides for that — don't invent a fake credential path that
@@ -60,6 +75,36 @@ Notes that matter in practice:
 - Compare the buggy path against a known-good path side by side (e.g. the
   same operation done directly vs. through the feature under test) so you have
   a concrete "should look like this" reference, not just a vague expectation.
+- Most interactive programs have *some* interrupt key (`Escape`, `Ctrl+C`, …)
+  that cuts a running step short. Learn it and use it once you've seen enough
+  to answer your question — don't sit through a long operation to the end
+  just because you started it; that's how a 5-second check turns into a
+  5-minute one.
+
+## Gotcha: live suggestion/autocomplete popups eat the next keystroke
+
+Many interactive editors open a live suggestion popup while you're mid-token
+after a trigger character (an `@`-mention list, a `/`-command list, a path
+completer after typing part of a filename, …). If a popup like that is open
+when you send `Enter`, the program very plausibly reads that `Enter` as
+"accept the highlighted suggestion", not "submit the line" — and now your
+scripted input never actually got submitted, or got silently replaced by
+whatever the popup was suggesting. This is easy to miss because the pane
+doesn't necessarily show an error; it just quietly doesn't do what you sent.
+
+Two ways to stay out of that state before you send `Enter`:
+
+- Make sure the text you sent doesn't end mid-token — trailing whitespace or
+  more words after the trigger closes most popups on its own.
+- When in doubt, `send-keys -t repro Escape` right before the `Enter` that's
+  supposed to submit. An extra `Escape` is a no-op if nothing was open;
+  skipping it when something *was* open silently eats your input.
+
+Also: clearing the input line (e.g. `Ctrl+U`) does not reliably close an
+already-open popup by itself — the popup can keep rendering even once the
+text behind it is gone. `capture-pane` right after clearing to check, and
+send an explicit `Escape` if the popup is still on screen, before typing the
+next input.
 
 ## When a try/catch is hiding the real error
 
