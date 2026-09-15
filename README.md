@@ -54,28 +54,41 @@ works as soon as you type.
 
 ## Talking to agents
 
-There is **no `/agent` command** and **no `@<slug>` routing operator** —
-`@name` is just text. Whichever conversation you're talking to (`main`, or
-an agent you're attached to) decides from the message's content what to do
-and calls the matching tool itself:
+There's no `/agent` command and no `@<slug>` routing — `@name` is just text.
+Whichever conversation you're talking to (main, or an agent you're attached
+to) decides from context what to do and calls the matching tool itself:
 
 ```
-@reviewer take a look at this diff        → the LLM calls agent_create
-tell the reviewer to also check auth.ts    → the LLM calls agent_send
-how's the reviewer doing?                  → the LLM calls agent_inspect
-kill the reviewer, it's stuck              → the LLM calls agent_remove
+@reviewer take a look at this diff        → agent_create
+tell the reviewer to also check auth.ts    → agent_send
+how's the reviewer doing?                  → agent_inspect
+kill the reviewer, it's stuck              → agent_remove
 ```
 
-No position rule, no escaping (`\@name` isn't needed — `@name` was never
-intercepted to begin with), no `:<model>` micro-syntax — just ask for what
-you want in plain language and the model picks the right tool call. See
-"LLM-callable tools" below for exactly what each one does.
+No position rule, no escaping, no `:<model>` syntax — just ask in plain
+language. Typing `@` still opens a discovery-only picker (inserts
+`@<name> ` at the cursor); it doesn't route or intercept anything.
 
-Typing `@` in the editor still opens an agent picker (instead of pi's file
-picker) as a **discovery convenience only** — it lists `agent` plus every
-live agent and discovered def, and selecting one inserts `@<name> ` at the
-cursor. It doesn't route or intercept anything; it's purely there so you
-don't have to remember exact names.
+Four tools, one per intent, so the model expresses intent by *which tool it
+calls* rather than arguments a tool would have to guess from. **Every
+agent gets all four** — including sub-agents themselves, via `customTools`
+(`agent-runtime.ts`) — so delegation nests to any depth. Agents are peers:
+no parent/child tracking, and removing one never cascades to anything it
+spawned.
+
+- **`agent_create`** — spawn one task or several in parallel
+  (`tasks: [...]`, max 8). `model` takes a full id or a unique substring
+  (`opus`, `haiku`). Waits for completion by default; `wait: false` fires
+  and returns immediately.
+- **`agent_send`** — message an existing agent by name (or def name →
+  most recent instance), reviving it if needed. Fire-and-forget by
+  default; `wait: true` waits for the response. Never creates — errors if
+  `name` is unknown.
+- **`agent_inspect`** — read-only: state, model, task, recent activity,
+  latest output (or `full: true` for the whole transcript), even mid-turn.
+  Omit `name` to list every sub-agent.
+- **`agent_remove`** — delete outright, irreversibly. `main` can never be
+  targeted.
 
 ## Sub-agent definitions (`.pi/agents/`)
 
@@ -119,8 +132,8 @@ an agent does changes pi's global default.
   `Ctrl+P`/`Shift+Ctrl+P` to cycle.
 - **Agent list open:** `/model [search]` + `⏎` sets the model of the
   currently **selected** row (including `main`).
-- **Via a tool call:** `agent_create`'s and `agent_send`'s `model` parameter —
-  see "LLM-callable tools" below.
+- **Via a tool call:** `agent_create`/`agent_send`'s `model` parameter (see
+  "Talking to agents" above).
 
 ## Slash commands while attached
 
@@ -129,59 +142,6 @@ message — pi's own slash commands don't run there, except `/model` (above).
 Commands that only make sense for pi's own session (`/resume`, `/fork`,
 `/new`, `/tree`, ...) have no meaning for an agent, so `/` completion while
 attached only offers what's actually implemented (currently just `/model`).
-
-## LLM-callable tools
-
-Four tools let the assistant itself — not just a human at the keyboard —
-create, message, inspect, and delete sub-agents from inside a turn. **Every
-agent has the same four**, including sub-agents themselves, so delegation
-nests to any depth: a sub-agent can spawn, message, check on, or delete its
-own sub-agents, exactly like main can. There is no parent/child tracking —
-every agent is a peer that can address any other agent in the session by
-name, and terminating one never cascades to anything it spawned.
-
-They're deliberately split by intent rather than merged into one
-do-everything tool, so the calling model doesn't have to guess: "create" vs
-"message an existing one" is a decision the model makes by picking the
-tool, not something a tool infers from the arguments.
-
-- **`agent_create`** — *create.* Delegate one task (`{ task, agent?, model? }`)
-  or several in parallel (`{ tasks: [...] }`, max 8) to new sub-agents. `model`
-  forces which model that sub-agent runs on — a full `provider/id`, a bare
-  `id`, or any short substring that uniquely matches one available model
-  (e.g. `opus`, `haiku`) — no need to know the exact string. By default
-  **waits** for every task to finish and returns each sub-agent's final
-  response; pass `wait: false` to fire-and-forget instead — spawn and
-  return immediately without blocking this turn, then check in later with
-  `agent_inspect`/`agent_send`. Every spawned agent shows up live in the
-  picker (press `←`) while the tool call is in flight, so a human can
-  attach and watch it work.
-- **`agent_send`** — *message an existing one.* Send a message to a
-  sub-agent by name (or by def name, picking its most recent instance),
-  reviving it first if it isn't currently live. Optionally switches its
-  model first (`model`, same fuzzy matching as `agent_create`). Defaults to
-  fire-and-forget (returns immediately, background); pass `wait: true` to
-  wait for the turn and get the response back, same as `agent_create`.
-  **Never creates** — if `name` doesn't match a known sub-agent it errors
-  out and points at `agent_create` instead of guessing.
-- **`agent_inspect`** — *read, without waiting or sending anything.* Given a
-  name, reports that agent's current state, model, original task, recent
-  tool activity and latest output (or, with `full: true`, its entire
-  transcript) — even while it's still `working`, mid-turn. Omit `name` to
-  list every sub-agent in the session with a one-line state + preview.
-  Read-only: never spawns, messages, or changes anything.
-- **`agent_remove`** — *delete.* Aborts a sub-agent's turn, disposes its
-  session, and removes it from the picker. Cannot be undone. `main` (this
-  session's own root conversation) can never be targeted this way — the
-  call errors instead of doing anything.
-
-Technically: sub-agents are built with `noExtensions: true` so they never
-recursively load this whole extension, but `createAgentSession`'s
-`customTools` option hands every one of them these same four tool
-definitions directly (see `setManagedTools`/`ensureAgent` in
-`agent-runtime.ts`) — each gets a fully-scoped `ExtensionContext` pointing
-at *its own* session, so `agent_inspect`/`agent_send`/etc. called from
-inside a sub-agent see the same shared pool main does.
 
 ## Agent list details
 
