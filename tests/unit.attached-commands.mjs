@@ -51,10 +51,26 @@ test("detached (main): every command passes through untouched", async () => {
   );
 });
 
-test("attached to an agent: blacklisted commands (pi's own session/tree) are hidden from completion", () => {
+test("attached to an agent: blacklisted commands (pi's own session/tree, and per-session ones not yet implemented against the attached agent) are hidden from completion", () => {
   return (async () => {
     const provider = withAttachedCommandFilter(
-      fakeCommandProvider(["model", "resume", "fork", "new", "tree", "clone", "export", "import", "share", "scoped-models", "name"]),
+      fakeCommandProvider([
+        "model",
+        "resume",
+        "fork",
+        "new",
+        "tree",
+        "clone",
+        "export",
+        "import",
+        "share",
+        "scoped-models",
+        "name",
+        "thinking",
+        "compact",
+        "copy",
+        "session",
+      ]),
       viewWith("/tmp/agent.jsonl"),
     );
     const result = await provider.getSuggestions(["/"], 0, 1, {});

@@ -146,10 +146,15 @@ message. A few kinds of slash command are handled differently:
   against pi itself, regardless of which agent is on screen.
 - **Commands that only make sense for pi's own session** (`/resume`,
   `/fork`, `/new`, `/tree`, `/clone`, `/export`, `/import`, `/share`,
-  `/scoped-models`, `/name`) are blocked with a notice instead of silently
-  running against the wrong session.
-- Anything else is sent to the agent as chat text, same as any other
-  message.
+  `/scoped-models`, `/name`), and **per-session commands not yet implemented
+  against the attached agent** (`/thinking`, `/compact`, `/copy`,
+  `/session` — each has a direct equivalent on `AgentSession`, just not
+  wired up here yet), are blocked with a notice instead of either silently
+  running against the wrong session or being sent to the agent as a literal
+  chat message pretending to be a command.
+- Anything else — extension commands, skills, prompt templates, plain chat
+  text — is sent to the agent's own session via `prompt()`, exactly like
+  typing it on `main` would.
 
 `/` completion while attached hides the blocked commands, since typing one
 would just produce a notice.

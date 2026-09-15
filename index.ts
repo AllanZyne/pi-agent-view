@@ -593,17 +593,26 @@ const GLOBAL_ATTACHED_COMMANDS = new Set<string>([
 export const SUPPORTED_ATTACHED_COMMANDS = new Set<string>(["model"]);
 
 /**
- * Blacklist: pi built-ins that operate on *pi's own* session/tree in ways
- * that don't translate to "the agent you're looking at" — `/tree`, `/fork`,
- * `/resume`, and `/new` all branch, switch, or clear pi's session file;
+ * Blacklist: pi built-ins that either operate on *pi's own* session/tree in
+ * ways that don't translate to "the agent you're looking at" (`/tree`,
+ * `/fork`, `/resume`, `/new` branch, switch, or clear pi's session file;
  * `/clone`, `/export`, `/import`, `/share`, `/scoped-models`, `/name` are
- * similarly wired to `this.session`. Letting pi's real dispatch run one of
- * these while attached would silently mutate main instead of the agent on
- * screen, so `handleInput` blocks them with a notice rather than either
- * running them against the wrong session or steering the raw text as a chat
- * message pretending to be a command. Extend this set as more turn out to be
- * similarly unsafe; anything in neither this set nor the two above just gets
- * sent to the agent as chat text, same as any other unrecognised input.
+ * similarly wired to `this.session`), or are per-session but not yet
+ * implemented against the attached agent's own session the way `/model` is
+ * (`/thinking`, `/compact`, `/copy`, `/session` all have a direct
+ * `AgentSession` equivalent — `setThinkingLevel`/`cycleThinkingLevel`,
+ * `compact`, `getLastAssistantText`, `getSessionStats` — but nothing in this
+ * file calls them yet). Confirmed in a real tmux run (see
+ * `.agents/skills/pi-agent-view-debug`): letting any of these fall through to
+ * pi's real dispatch while attached either silently mutates main instead of
+ * the agent on screen (`/tree` opened pi's *own* session tree), or — for the
+ * unimplemented per-session ones — just gets sent to the agent as chat text
+ * verbatim (`/thinking` produced a literal "/thinking" chat message the LLM
+ * then had to explain away). Both are worse than a clear "not available"
+ * notice, so `handleInput` blocks all of them instead. Move a command out of
+ * this set into `SUPPORTED_ATTACHED_COMMANDS` once it has a real
+ * attached-agent implementation; move a global one to
+ * `GLOBAL_ATTACHED_COMMANDS` if it turns out not to touch a session at all.
  */
 const BLOCKED_ATTACHED_COMMANDS = new Set<string>([
   "tree",
@@ -616,6 +625,10 @@ const BLOCKED_ATTACHED_COMMANDS = new Set<string>([
   "import",
   "share",
   "name",
+  "thinking",
+  "compact",
+  "copy",
+  "session",
 ]);
 
 /**
