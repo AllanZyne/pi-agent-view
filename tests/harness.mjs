@@ -39,7 +39,7 @@ const jiti = createJiti(import.meta.url, {
     "@earendil-works/pi-ai": `${PI_DIR}/node_modules/@earendil-works/pi-ai`,
     "@earendil-works/pi-tui": `${PI_DIR}/node_modules/@earendil-works/pi-tui`,
     // Real pi resolves bare `typebox` imports (used by `pi.registerTool()`
-    // parameter schemas, e.g. subagent-tool.ts) from its own node_modules via
+    // parameter schemas, e.g. agent-create-tool.ts) from its own node_modules via
     // normal upward resolution; the test harness has no such path, so alias
     // it explicitly.
     typebox: `${PI_DIR}/node_modules/typebox/build/index.mjs`,

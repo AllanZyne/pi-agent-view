@@ -70,9 +70,11 @@ export interface Catalog {
 /**
  * Names the loader silently rejects.
  *
- * `agent` is the reserved slug used by `@agent <task>` to mean "spawn a fresh
- * ad-hoc agent inheriting main". If a def could take that name it would
- * shadow the reserved form, so it is skipped and a diagnostic recorded.
+ * `agent` is the conventional name for "spawn a fresh ad-hoc agent
+ * inheriting main's model" (suggested first in the `@` autocomplete list,
+ * and the natural value to omit for a plain `agent_create` call). If a def
+ * could take that name it would shadow that convention, so it is skipped
+ * and a diagnostic recorded.
  */
 export const RESERVED_NAMES = new Set(["agent"]);
 

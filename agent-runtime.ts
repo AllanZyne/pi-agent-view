@@ -22,6 +22,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Model, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { SubAgentDef } from "./agent-catalog.ts";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -86,6 +87,15 @@ interface Registry {
   stopped: Set<string>;
   modelRuntime?: ModelRuntime;
   onChange?: () => void;
+  /**
+   * Tool definitions handed to every sub-agent's `createAgentSession()` as
+   * `customTools`, so it has the same `agent_create`/`agent_inspect`/`agent_send`/
+   * `agent_remove` capability main does — recursive delegation to any
+   * depth. Set once at extension activation (see `setManagedTools`); a
+   * missing value (extension not yet activated, or an older build) just
+   * means "no managed tools", not a crash.
+   */
+  managedTools?: ToolDefinition[];
 }
 
 /** Registry lives on globalThis so it survives extension reload. */
@@ -112,6 +122,11 @@ export function isLoadingSubAgent(): boolean {
 
 export function setOnChange(cb: (() => void) | undefined): void {
   registry().onChange = cb;
+}
+
+/** See `Registry.managedTools`. Call once at extension activation. */
+export function setManagedTools(tools: ToolDefinition[]): void {
+  registry().managedTools = tools;
 }
 
 function notify(): void {
@@ -495,7 +510,7 @@ export async function ensureAgent(
   // missing / unresolvable model falls through to the caller-supplied
   // inheritance default — same rule as when there's no def.
   const defModel = def?.model ? tryResolveModel(modelRuntime, def.model) : undefined;
-  // `forcedModel` is a caller's explicit choice (e.g. the `subagent` tool's
+  // `forcedModel` is a caller's explicit choice (e.g. the `agent_create` tool's
   // `model` parameter) rather than an inheritance default, so it outranks
   // both the def's model and the plain inherited one.
   const inheritModel = forcedModel ?? defModel ?? model;
@@ -528,6 +543,15 @@ export async function ensureAgent(
       modelRuntime,
       sessionManager: sm,
       resourceLoader: loader,
+      // `noExtensions: true` above keeps this sub-agent from recursively
+      // loading the whole agent-view extension, but it should still get the
+      // same management tools main has — `customTools` is the SDK's
+      // extension-independent way to hand a session tools directly, and
+      // `AgentSession` gives them a real per-session `ExtensionContext`
+      // (via `runner.createContext()`) exactly like an extension-registered
+      // tool would. This is what makes delegation recursive: any agent can
+      // spawn/message/inspect/terminate any other, to any depth.
+      customTools: reg.managedTools,
     });
     session = created.session;
   } finally {
@@ -576,12 +600,46 @@ function tryResolveModel(runtime: ModelRuntime, id: string): Model<any> | undefi
 
 /**
  * Public, string-based variant of `tryResolveModel` for callers outside this
- * module (e.g. the `subagent` tool's `model: "provider/id"` parameter) that
+ * module (e.g. the `agent_create` tool's `model: "provider/id"` parameter) that
  * don't otherwise need a `ModelRuntime` handle.
  */
 export async function resolveModelId(id: string): Promise<Model<any> | undefined> {
   const runtime = await getModelRuntime();
   return tryResolveModel(runtime, id);
+}
+
+export type ModelSearchResult =
+  | { ok: true; model: Model<any> }
+  | { ok: false; reason: "unknown" }
+  | { ok: false; reason: "ambiguous"; candidates: string[] };
+
+/**
+ * Resolve a short, human-typed model token — e.g. from `@agent:opus` or a
+ * tool's free-form `model` argument — against every currently available
+ * model.
+ *
+ * Tries an exact `provider/id` or bare `id` match first (case-insensitive),
+ * exactly like `tryResolveModel`. Failing that, falls back to a
+ * case-insensitive substring match against every `id`, so a short alias
+ * like `opus` or `haiku` finds `anthropic/claude-opus-4-...` without the
+ * caller typing the whole thing. A substring that matches more than one
+ * model is reported as ambiguous instead of guessing.
+ */
+export async function resolveModelSearch(token: string): Promise<ModelSearchResult> {
+  const runtime = await getModelRuntime();
+  const available = runtime.getAvailableSnapshot();
+  const wanted = token.trim().toLowerCase();
+  const exact = available.find(
+    (m) => `${m.provider}/${m.id}`.toLowerCase() === wanted || m.id.toLowerCase() === wanted,
+  );
+  if (exact) return { ok: true, model: exact };
+
+  const matches = available.filter((m) => m.id.toLowerCase().includes(wanted));
+  if (matches.length === 1) return { ok: true, model: matches[0]! };
+  if (matches.length > 1) {
+    return { ok: false, reason: "ambiguous", candidates: matches.map((m) => `${m.provider}/${m.id}`) };
+  }
+  return { ok: false, reason: "unknown" };
 }
 
 /** Every `provider/id` currently available (has auth configured), for error messages. */
@@ -622,7 +680,7 @@ export async function runAgent(
  * Start (or continue) an agent with a prompt and wait for the turn to end.
  *
  * Same bookkeeping as `runAgent`, but awaits completion instead of firing and
- * forgetting, so a caller that needs the result (e.g. the `subagent` tool)
+ * forgetting, so a caller that needs the result (e.g. the `agent_create` tool)
  * can read the final transcript as soon as this resolves. Because the agent
  * is registered in the same pool as `runAgent` uses, it is a live entry in
  * the picker for the whole time this promise is pending — a human can attach

@@ -1,6 +1,6 @@
 ---
 name: create-agent
-description: Author a new sub-agent definition file for pi-agent-view under .pi/agents/ (project) or ~/.pi/agent/agents/ (user). Use when the user asks to create, add, define, or design a new (sub-)agent — for example "create a agent", "create an agent", "create a code-reviewer subagent", or "add an agent that writes commit messages". Gathers a name, description, and system-prompt body, optionally a model, writes the .md file, and shows how to summon it with @name.
+description: Author a new sub-agent definition file for pi-agent-view under .pi/agents/ (project) or ~/.pi/agent/agents/ (user). Use when the user asks to create, add, define, or design a new (sub-)agent — for example "create a agent", "create an agent", "create a code-reviewer subagent", or "add an agent that writes commit messages". Gathers a name, description, and system-prompt body, optionally a model, writes the .md file, and shows how to invoke it via the `agent_create` tool.
 ---
 
 # Create a sub-agent definition
@@ -14,8 +14,12 @@ Each file is Markdown with YAML frontmatter. The body is *appended* to pi's
 base system prompt (supplement, not replace), so `AGENTS.md`, skills and
 prompt templates all still load.
 
-Users summon these by putting `@<name>` anywhere in a prompt, e.g.
-`@code-reviewer take a look at storage.ts`.
+Users invoke these just by asking naturally — e.g. "have the code-reviewer
+take a look at storage.ts" — and whichever LLM is listening calls the
+`agent_create` tool with `agent: "code-reviewer"` itself. There is no
+`@name` routing syntax: `@` in the editor is only an autocomplete
+convenience that inserts the exact slug (`@code-reviewer `) into the typed
+text, nothing more — it doesn't address or spawn anything by itself.
 
 ## Your job
 
@@ -33,19 +37,16 @@ When the user asks to create a new sub-agent:
    both.
 3. **Draft a slug.** Lowercase letters, digits, hyphens; starts with a
    letter; 2–3 words max. Examples: `code-reviewer`, `commit-writer`,
-   `security-auditor`. Reject `agent` (reserved by pi-agent-view for the
-   adhoc spawn form `@agent <task>`). Also avoid common English words the
-   user might write conversationally at the start of a message
-   (`help`, `test`, `note`, `todo`) — the slug becomes an `@<slug>`
-   routing address, and a message that starts with such a word would
-   otherwise get hijacked. Prose *containing* the slug is fine because
-   the interception rule is message-start only, but a bare
-   "help me with X" would still route to `@help`.
+   `security-auditor`. Reject `agent` — it's the conventional name for "a
+   fresh plain agent, no def", and a def taking that name would shadow it
+   in the `@` completion list and in `agent_create`'s `agent` parameter.
 4. **Draft a description.** One sentence, present tense, third-person. Say
-   *what it does* and *when to invoke it*. This shows up in `/agents` and in
-   the `@`-completion picker, so keep it short and specific. Bad:
-   "Helps with code." Good: "Reviews Python diffs for correctness, style,
-   and obvious bugs. Invoke after writing or changing code."
+   *what it does* and *when to invoke it*. This shows up in `/agents`, in
+   the `@`-completion picker, and is the main thing an LLM has to go on when
+   deciding whether to call `agent_create` with this def — keep it short
+   and specific. Bad: "Helps with code." Good: "Reviews Python diffs for
+   correctness, style, and obvious bugs. Invoke after writing or changing
+   code."
 5. **Draft the system-prompt body.** This is the interesting part. See
    [Writing a good system prompt](#writing-a-good-system-prompt) below.
 6. **Optional fields.** Only include `model` or `thinkingLevel` when the
@@ -57,10 +58,13 @@ When the user asks to create a new sub-agent:
    $PI_CODING_AGENT_DIR`); if unset, it's `~/.pi/agent/agents/`. Do not
    overwrite an existing file without confirming.
 8. **Verify** by asking the user to run `/agents` — it force-rescans both
-   roots and prints what it found — and show them the invocation form:
-   `@<name> <the task>`. Also worth mentioning once, per session: the
-   same `@<name>` prefix will **route to the running agent** the second
-   time it's used (once one is live), instead of spawning a duplicate.
+   roots and prints what it found — and tell them how to invoke it: just
+   ask naturally (e.g. "have `<name>` look at this"), or explicitly with
+   `@<name> <the task>` if they want the autocomplete's help typing the
+   slug. Also worth mentioning once, per session: to continue talking to an
+   *already-running* instance instead of spawning a duplicate, the calling
+   LLM should use `agent_send` (by name or by this def's name) rather than
+   `agent_create` again.
 
 ## Frontmatter reference
 
@@ -166,8 +170,10 @@ or a small code block. If there are no issues, say so in one sentence.
 ```
 
 Then tell the user: *"Written to `~/.pi/agent/agents/py-reviewer.md`. Run
-`/agents` to confirm pi-agent-view sees it, then summon it with
-`@py-reviewer <diff or file to review>` anywhere in your prompt."*
+`/agents` to confirm pi-agent-view sees it, then just ask for it naturally
+(e.g. `@py-reviewer take a look at this diff`, or plain 'have py-reviewer
+review this') — the LLM will call `agent_create` with `agent:
+"py-reviewer"`."*
 
 ## Guardrails
 
