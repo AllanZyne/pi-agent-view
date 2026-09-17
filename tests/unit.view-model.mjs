@@ -413,3 +413,24 @@ test("rows are grouped Working, Failed, Stopped, Idle, Completed", () => {
     "groups come in attention order",
   );
 });
+
+test("compaction hides everything the agent no longer has in context", () => {
+  // pi clears its transcript on compaction and redraws only what survived. Agent
+  // entries are persisted and cannot be removed, so `visibleFrom` is where the
+  // visible transcript starts and the chat filter skips everything before it.
+  const items = [
+    userItem("do a big refactor"),
+    assistantItem("working on it", false),
+    { kind: "compaction", summary: "s", tokensBefore: 1000, timestamp: 0 },
+    userItem("what did you change?"),
+  ];
+  assertEqual(vm.visibleFrom(items), 2, "the visible transcript starts at the compaction block");
+  assertEqual(vm.visibleFrom(items.slice(0, 2)), 0, "no compaction: everything is visible");
+
+  // A second compaction wins, and the memo notices the array grew.
+  items.push({ kind: "compaction", summary: "s2", tokensBefore: 2000, timestamp: 1 });
+  assertEqual(vm.visibleFrom(items), 4, "the newest compaction is the boundary");
+
+  // The block itself draws (it is the summary of what was dropped).
+  assertEqual(vm.renderable(items[2]), true, "the compaction block itself is drawn");
+});

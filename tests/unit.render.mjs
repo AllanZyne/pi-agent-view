@@ -62,11 +62,19 @@ const textResult = (text, isError = false) => ({
   isPartial: false,
 });
 
+/**
+ * pi hands the entry renderer its live `Theme` instance; the package does not
+ * export the singleton, so stub the methods this renderer uses itself. pi's own
+ * components colour themselves from the theme `initTheme()` set up in the
+ * harness, so their output is still the real thing.
+ */
+const appTheme = { fg: (_color, text) => text, bold: (text) => text, bg: (_color, text) => text };
+
 /** Render one item of a fake agent transcript. */
 function renderItem(items, index, options = {}) {
   const component = new AgentItemComponent(
     { file: "/tmp/agent.jsonl", index },
-    pi.theme ?? {},
+    options.theme ?? appTheme,
     options.settings ?? settings,
     options.expanded ?? false,
     fakeTui,
@@ -211,7 +219,7 @@ test("a tool call built before renderers loaded upgrades once they arrive", asyn
   toolRenderers.resetToolRenderers();
   const component = new AgentItemComponent(
     { file: "/tmp/agent.jsonl", index: 0 },
-    pi.theme ?? {},
+    appTheme,
     settings,
     false,
     fakeTui,
@@ -257,7 +265,7 @@ test("a settled tool box is handed its state once, not rebuilt on every frame", 
   try {
     const component = new AgentItemComponent(
       { file: "/tmp/agent.jsonl", index: 0 },
-      pi.theme ?? {},
+      appTheme,
       settings,
       false,
       fakeTui,
@@ -288,7 +296,7 @@ test("live tool output and the final result both land, like the main session's",
   const items = [call];
   const component = new AgentItemComponent(
     { file: "/tmp/agent.jsonl", index: 0 },
-    pi.theme ?? {},
+    appTheme,
     settings,
     false,
     fakeTui,
@@ -332,7 +340,7 @@ test("a tool box rebuilt when renderers arrive replays the call's whole state", 
   toolRenderers.resetToolRenderers();
   const component = new AgentItemComponent(
     { file: "/tmp/agent.jsonl", index: 0 },
-    pi.theme ?? {},
+    appTheme,
     settings,
     false,
     fakeTui,
@@ -351,7 +359,7 @@ test("nothing is drawn for an agent that is not attached", () => {
   const items = [{ kind: "user", text: "hidden" }];
   const component = new AgentItemComponent(
     { file: "/tmp/agent.jsonl", index: 0 },
-    pi.theme ?? {},
+    appTheme,
     settings,
     false,
     fakeTui,
@@ -398,7 +406,7 @@ test("a click on a tool box reaches pi's expand region, like it does on main", a
   const items = [toolCall("t1", "bash", { command: "seq 60" }, { result: textResult(long) })];
   const component = new AgentItemComponent(
     { file: "/tmp/agent.jsonl", index: 0 },
-    pi.theme ?? {},
+    appTheme,
     settings,
     false,
     fakeTui,
@@ -435,4 +443,41 @@ test("a skill invocation renders pi's [skill] block, not its raw wire format", (
 
   const expanded = renderItem([{ kind: "user", text }], 0, { expanded: true }).join("\n");
   assert(expanded.includes("Do a review."), "ctrl+o expands the block, like main");
+});
+
+test("a compaction the agent's own session did renders pi's [compaction] block", () => {
+  // Sub-agent sessions are created with pi's own SettingsManager, so they
+  // auto-compact on threshold/overflow exactly like main. pi marks that with a
+  // collapsible `[compaction]` block plus a token/cost notice; an agent view
+  // showed nothing at all, so the transcript silently disagreed with the
+  // context the agent was actually working from.
+  const item = {
+    kind: "compaction",
+    summary: "We refactored the parser and fixed two tests.",
+    tokensBefore: 42_000,
+    timestamp: Date.now(),
+    usageTokens: 12_345,
+    usageCost: 0.0234,
+  };
+
+  const collapsed = renderItem([item], 0).join("\n");
+  assert(collapsed.includes("[compaction]"), `pi's compaction label: ${JSON.stringify(collapsed)}`);
+  assert(collapsed.includes("42,000"), "tokens before compaction are shown, like pi");
+  assert(!collapsed.includes("refactored the parser"), "the summary stays collapsed, like main");
+  assert(collapsed.includes("Compaction: 12k tokens billed (~$0.02)"), `pi's cost notice: ${JSON.stringify(collapsed)}`);
+
+  const expanded = renderItem([item], 0, { expanded: true }).join("\n");
+  assert(expanded.includes("refactored the parser"), "ctrl+o expands the summary, like main");
+
+  const quiet = renderItem([item], 0, { settings: { ...settings, showCostNotices: false } }).join("\n");
+  assert(!quiet.includes("tokens billed"), "and the notice honours pi's showCacheMissNotices setting");
+});
+
+test("an error item renders like pi's own error line", () => {
+  // Never covered before, because the harness had no app theme to hand this
+  // renderer — the `error` path throws without one.
+  const out = renderItem([{ kind: "error", text: "Operation aborted" }], 0);
+  assertEqual(out.length, 1, "one line");
+  assert(out[0].includes("Operation aborted"), `the message is drawn: ${JSON.stringify(out)}`);
+  assert(out[0].startsWith(" ".repeat(settings.outputPad)), "padded like pi's own error text");
 });

@@ -101,6 +101,27 @@ export type TranscriptItem =
       content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
       details?: unknown;
     }
+  /**
+   * The agent's own session compacted its context.
+   *
+   * Sub-agent sessions are created with pi's own `SettingsManager`, so they
+   * auto-compact on threshold/overflow exactly like the main session does. pi
+   * marks that in its transcript with a collapsible `[compaction]` block (plus a
+   * token/cost notice) and stops drawing everything before it, because that
+   * history is no longer part of the context. An agent view does the same: this
+   * item renders the block, and items before it are hidden (see `visibleFrom`).
+   *
+   * `usageTokens`/`usageCost` are the summarisation call's own billing, kept
+   * separately so the notice is only drawn when pi would draw it.
+   */
+  | {
+      kind: "compaction";
+      summary: string;
+      tokensBefore: number;
+      timestamp: number;
+      usageTokens?: number;
+      usageCost?: number;
+    }
   | { kind: "error"; text: string };
 
 export interface LiveAgent {
@@ -260,6 +281,12 @@ export function seedTranscript(sm: SessionManager): TranscriptItem[] {
   const out: TranscriptItem[] = [];
   try {
     for (const entry of sm.getBranch()) {
+      // A compaction the agent's session performed earlier: same marker pi
+      // replays, and everything before it stops being drawn (`visibleFrom`).
+      if (entry.type === "compaction") {
+        out.push(compactionItem(entry as unknown as Parameters<typeof compactionItem>[0]));
+        continue;
+      }
       if (entry.type !== "message") continue;
       const m = entry.message as any;
       if (!m) continue;
@@ -368,6 +395,27 @@ export function readTranscript(file: string): TranscriptItem[] {
   } catch {
     return [];
   }
+}
+
+/** A `compaction` transcript item from a persisted or live compaction. */
+function compactionItem(source: {
+  summary?: string;
+  tokensBefore?: number;
+  timestamp?: string | number;
+  usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } };
+}): Extract<TranscriptItem, { kind: "compaction" }> {
+  const usage = source.usage;
+  const tokens = usage
+    ? (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0)
+    : undefined;
+  return {
+    kind: "compaction",
+    summary: source.summary ?? "",
+    tokensBefore: source.tokensBefore ?? 0,
+    timestamp: new Date(source.timestamp ?? Date.now()).getTime(),
+    ...(tokens === undefined ? {} : { usageTokens: tokens }),
+    ...(usage?.cost?.total === undefined ? {} : { usageCost: usage.cost.total }),
+  };
 }
 
 /**
@@ -584,6 +632,27 @@ function attachEvents(agent: LiveAgent): () => void {
 
       case "agent_end": {
         if (agent.state !== "failed" && agent.state !== "stopped") agent.state = "completed";
+        notify(agent.file);
+        break;
+      }
+
+      case "compaction_end": {
+        // The agent's own session compacted (threshold/overflow — sub-agents use
+        // pi's settings, so this happens to them just like to main). Record it
+        // the way pi does: a `[compaction]` block at its chronological position,
+        // after which everything older stops being drawn.
+        const e = event as {
+          aborted?: boolean;
+          result?: { summary?: string; tokensBefore?: number; usage?: Record<string, any> };
+          errorMessage?: string;
+        };
+        if (e.aborted) {
+          agent.transcript.push({ kind: "error", text: "Auto-compaction cancelled" });
+        } else if (e.result) {
+          agent.transcript.push(compactionItem({ ...e.result, timestamp: Date.now() }));
+        } else if (e.errorMessage) {
+          agent.transcript.push({ kind: "error", text: e.errorMessage });
+        }
         notify(agent.file);
         break;
       }

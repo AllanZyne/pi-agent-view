@@ -86,6 +86,7 @@ import * as path from "node:path";
 import {
   AssistantMessageComponent,
   CustomEditor,
+  CompactionSummaryMessageComponent,
   getAgentDir,
   getMarkdownTheme,
   ModelSelectorComponent,
@@ -157,6 +158,7 @@ import {
   noteMirrored,
   reconcileSelection,
   renderable,
+  visibleFrom,
   selectedRow,
   syncMirror,
   type AgentRow,
@@ -271,11 +273,16 @@ export function includeChatChild(
     if (view.attached === undefined) return false;
     const ref = (child as { entry?: { data?: ItemRef } } | null)?.entry?.data;
     if (ref?.file !== view.attached) return false;
+    const items = read(ref.file);
+    // Compacted away: pi clears its transcript on compaction and redraws only
+    // what is still in context, so entries older than the newest compaction
+    // stop being drawn here too.
+    if (ref.index < visibleFrom(items)) return false;
     // An item with nothing to draw *yet* (an assistant message that has not
     // streamed its first token) must be skipped as a whole child: its entry
     // exists so that later items keep their order, and pi's wrapper would
     // otherwise contribute its `Spacer(1)` as a stray blank line.
-    const item = read(ref.file)[ref.index];
+    const item = items[ref.index];
     return item !== undefined && renderable(item);
   }
   const owner = view.piChildOwner?.get(child as object);
@@ -302,6 +309,8 @@ export interface RenderSettings {
   markdownTransformers: unknown[];
   /** `mermaidRenderingMode`, read per render exactly like pi reads it. */
   mermaidMode: () => string;
+  /** `showCacheMissNotices`: gates the compaction token/cost notice, like pi. */
+  showCostNotices: boolean;
 }
 
 export function defaultRenderSettings(): RenderSettings {
@@ -311,6 +320,7 @@ export function defaultRenderSettings(): RenderSettings {
     hideThinkingBlock: false,
     markdownTransformers: [],
     mermaidMode: () => "off",
+    showCostNotices: true,
     tool: { showImages: true, imageWidthCells: 60 },
   };
 }
@@ -334,10 +344,24 @@ function readRenderSettings(cwd: string): RenderSettings {
         }
       },
       tool: { showImages: settings.getShowImages(), imageWidthCells: settings.getImageWidthCells() },
+      showCostNotices: settings.getShowCacheMissNotices(),
     };
   } catch {
     return fallback;
   }
+}
+
+/**
+ * pi's own token formatting (`formatTokens` in its footer component, which the
+ * package does not export), so a compaction notice in an agent view reads
+ * exactly like the main session's.
+ */
+function formatTokens(count: number): string {
+  if (count < 1000) return count.toString();
+  if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+  if (count < 1000000) return `${Math.round(count / 1000)}k`;
+  if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+  return `${Math.round(count / 1000000)}M`;
 }
 
 /** Cheap change detector for a (possibly streaming) assistant message. */
@@ -360,6 +384,8 @@ export class AgentItemComponent implements Component {
   private skill?: SkillInvocationMessageComponent;
   private assistant?: AssistantMessageComponent;
   private tool?: ToolExecutionComponent;
+  /** pi's collapsible `[compaction]` block, for a compaction the agent did. */
+  private compaction?: CompactionSummaryMessageComponent;
   private toolHasRenderers = false;
   /** Lifecycle revision already pushed into the tool box (see render). */
   private toolRevision?: number;
@@ -564,6 +590,37 @@ export class AgentItemComponent implements Component {
       // Results are rendered together with their call.
       case "toolResult":
         return [];
+
+      case "compaction": {
+        // pi's own `[compaction]` block, same component and expand state, plus
+        // the token/cost notice it writes underneath (when notices are on).
+        this.compaction ??= new CompactionSummaryMessageComponent(
+          {
+            role: "compactionSummary",
+            summary: item.summary,
+            tokensBefore: item.tokensBefore,
+            timestamp: item.timestamp,
+          } as never,
+          this.settings.markdownTheme,
+        );
+        if (this.lastExpanded !== this.expanded) {
+          this.lastExpanded = this.expanded;
+          this.compaction.setExpanded(this.expanded);
+        }
+        const out = this.compaction.render(width);
+        if (this.settings.showCostNotices && item.usageTokens !== undefined) {
+          const cost = item.usageCost !== undefined && item.usageCost >= 0.01 ? ` (~$${item.usageCost.toFixed(2)})` : "";
+          out.push("");
+          out.push(
+            truncateToWidth(
+              `${" ".repeat(pad)}${this.theme.fg("warning", `Compaction: ${formatTokens(item.usageTokens)} tokens billed${cost}`)}`,
+              width,
+            ),
+          );
+        }
+        this.droppedLeadingLine = false;
+        return out;
+      }
 
       case "error": {
         const out: string[] = [];

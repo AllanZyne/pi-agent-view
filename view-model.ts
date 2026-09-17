@@ -328,10 +328,39 @@ export function renderable(item: TranscriptItem): boolean {
     case "assistant":
       return assistantHasContent(item.message);
     case "toolCall":
+    case "compaction":
       return true;
     case "toolResult":
       return false;
   }
+}
+
+/**
+ * First transcript index that is still part of the agent's context.
+ *
+ * When a session compacts, pi clears its transcript and redraws only what came
+ * after the compaction, because everything older was summarised away. An agent's
+ * entries are persisted and cannot be removed, so the same effect is achieved by
+ * not drawing them: the index of the newest `compaction` item is where the
+ * visible transcript starts.
+ *
+ * Memoised per array (invalidated by length) because the chat filter asks this
+ * for every child of every frame.
+ */
+const visibleFromCache = new WeakMap<object, { length: number; from: number }>();
+
+export function visibleFrom(items: TranscriptItem[]): number {
+  const cached = visibleFromCache.get(items);
+  if (cached && cached.length === items.length) return cached.from;
+  let from = 0;
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (items[i]!.kind === "compaction") {
+      from = i;
+      break;
+    }
+  }
+  visibleFromCache.set(items, { length: items.length, from });
+  return from;
 }
 
 /**

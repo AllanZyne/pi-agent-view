@@ -203,6 +203,13 @@ would just produce a notice.
   tool-heavy agent view visibly lag while `main` stayed smooth), and a
   background agent's streaming deltas no longer request repaints of a view they
   cannot change.
+- **Compaction.** An agent's session is created with pi's own settings, so it
+  auto-compacts on threshold/overflow just like `main` does. When it happens the
+  agent view shows pi's collapsible `[compaction]` block and its token/cost
+  notice, and stops drawing everything older — the same thing `main` does, since
+  that history is no longer in the agent's context. (Known gap: if pi's *own*
+  session compacts, whatever mirrored agent entries fall before its cut point
+  are pruned from the transcript by pi and are not redrawn.)
 
 ## Tests
 
