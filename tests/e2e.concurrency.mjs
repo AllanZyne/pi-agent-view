@@ -61,6 +61,16 @@ function renderableCount(file) {
   return runtime.readTranscript(file).filter((i) => vm.renderable(i)).length;
 }
 
+/**
+ * Items pi is handed an entry for: everything except tool results, which are
+ * drawn inside their call's box. Items with nothing to draw *yet* get an entry
+ * too (that is what keeps later items in order) and are skipped at render time,
+ * so this is >= `renderableCount`.
+ */
+function mirroredItemCount(file) {
+  return runtime.readTranscript(file).filter((i) => i.kind !== "toolResult").length;
+}
+
 test(
   "three agents keep running while the attached view is switched around",
   async () => {
@@ -147,7 +157,11 @@ test(
         indices.length,
         `agent ${a.n} never had an item appended twice`,
       );
-      assertEqual(indices.length, renderableCount(a.file), `agent ${a.n} appended every renderable item`);
+      assertEqual(indices.length, mirroredItemCount(a.file), `agent ${a.n} appended every item exactly once`);
+      assert(
+        renderableCount(a.file) <= indices.length,
+        `agent ${a.n}: everything that draws has an entry`,
+      );
     }
 
     await runtime.disposeAll();

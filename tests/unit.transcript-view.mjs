@@ -141,3 +141,58 @@ test("another extension's entries always pass through as pi content (never treat
   attached = undefined;
   assertEqual(chat.render(80), ["todo"], "detached: the other extension is there, ours is hidden");
 });
+
+// ── the real include rule (index.ts) ──────────────────────────────
+
+const { includeChatChild } = await load("index.ts");
+
+test("the real filter rule: our entries, main's content, and notices raised inside an agent view", () => {
+  const items = { "/tmp/a.jsonl": [{ kind: "user", text: "hi" }], "/tmp/b.jsonl": [{ kind: "user", text: "yo" }] };
+  const read = (file) => items[file] ?? [];
+  const ourA = ourChild("agent A line", "agent-view-item", "/tmp/a.jsonl");
+  const ourB = ourChild("agent B line", "agent-view-item", "/tmp/b.jsonl");
+  const mainLine = piChild("main line");
+  const noticeInA = piChild("Warning: /copy isn't available…");
+  const view = { attached: undefined, piChildOwner: new WeakMap([[noticeInA, "/tmp/a.jsonl"]]) };
+  const include = (child) => includeChatChild(view, child, read);
+
+  view.attached = undefined;
+  assert(include(mainLine), "detached: main's own content draws");
+  assert(!include(ourA), "detached: no agent entries draw");
+  assert(!include(ourB), "detached: no agent entries draw");
+  assert(
+    !include(noticeInA),
+    "detached: a notice raised inside an agent view does NOT reappear in main's transcript",
+  );
+
+  view.attached = "/tmp/a.jsonl";
+  assert(!include(mainLine), "attached: main's content is hidden");
+  assert(include(ourA), "attached: that agent's entries draw");
+  assert(!include(ourB), "attached: another agent's entries stay hidden");
+  assert(include(noticeInA), "attached: its own notices are visible — this is the whole point");
+
+  view.attached = "/tmp/b.jsonl";
+  assert(!include(noticeInA), "a notice belongs to one view only");
+});
+
+test("an entry whose item has nothing to draw yet is skipped whole, not left as a blank line", () => {
+  // Every item is mirrored as soon as it exists so that order is preserved, so an
+  // assistant reply is in the chat before its first token. pi's CustomEntry
+  // wrapper always prepends a Spacer(1), so such an entry has to be skipped as a
+  // child — otherwise it shows up as an unexplained blank line, and there is one
+  // per empty item.
+  const items = [{ kind: "assistant", message: { role: "assistant", content: [] }, streaming: true }];
+  const read = () => items;
+  const child = ourChild("(nothing yet)", "agent-view-item", "/tmp/a.jsonl");
+  const view = { attached: "/tmp/a.jsonl" };
+
+  assert(!includeChatChild(view, child, read), "empty streaming reply: skipped");
+
+  items[0].message.content = [{ type: "text", text: "here we go" }];
+  assert(includeChatChild(view, child, read), "same entry draws as soon as it has content");
+
+  // A ref that points past the end (its item never made it to disk) draws nothing
+  // instead of throwing.
+  const dangling = { entry: { customType: "agent-view-item", data: { file: "/tmp/a.jsonl", index: 99 } }, render: () => ["x"] };
+  assert(!includeChatChild(view, dangling, read), "a dangling ref is skipped, not rendered");
+});

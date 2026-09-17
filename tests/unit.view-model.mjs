@@ -97,26 +97,50 @@ test("syncMirror hands pi each new renderable item exactly once", () => {
   assertEqual(appended.length, 3, "nothing appended twice");
 });
 
-test("syncMirror waits for the streaming tail to produce text", () => {
+test("syncMirror mirrors an assistant reply before it has any text, and only once", () => {
+  // pi adds its streaming component to the chat immediately and lets it fill in
+  // place; mirroring does the same, because pi's chat is append-only and holding
+  // an item back would either reorder the ones after it or lose it. An item with
+  // nothing to draw yet is skipped at *render* time (see `renderable`).
   const items = [userItem("go"), assistantItem("", true)];
   const state = { attached: "A", mirrored: {} };
   const appended = [];
+  const sync = () => vm.syncMirror(state, (r) => appended.push(r.index), () => items);
 
-  assertEqual(vm.syncMirror(state, (r) => appended.push(r), () => items), 1, "only the user item so far");
-  assertEqual(vm.mirroredCount(state, "A"), 1, "the empty assistant tail is not consumed");
+  assertEqual(sync(), 2, "both items are mirrored right away");
+  assertEqual(vm.renderable(items[1]), false, "but the empty reply draws nothing yet");
 
-  // First delta arrives.
+  // First delta arrives: same entry, now with content.
   setText(items[1], "wor");
-  assertEqual(vm.syncMirror(state, (r) => appended.push(r), () => items), 1, "assistant appears once");
-  assertEqual(
-    appended.map((r) => r.index),
-    [0, 1],
-    "each item appended once, in order",
-  );
+  assertEqual(sync(), 0, "no second entry for the same item");
+  assertEqual(vm.renderable(items[1]), true, "it draws now");
 
   // Further deltas do not append: pi re-renders the same entry.
   setText(items[1], "working");
-  assertEqual(vm.syncMirror(state, (r) => appended.push(r), () => items), 0, "deltas do not append entries");
+  assertEqual(sync(), 0, "deltas do not append entries");
+  assertEqual(appended, [0, 1], "each item appended once, in order");
+});
+
+test("an agent's items keep their transcript order even when one fills in late", () => {
+  // Steering a busy agent pushes a user message onto the transcript while the
+  // assistant reply above it may still be empty. Order is what matters: pi's
+  // chat is append-only, so the reply's entry must already be in place before
+  // the steer's, or the two would appear swapped once the reply streams.
+  const items = [userItem("go"), assistantItem("", true)];
+  const state = { attached: "A", mirrored: {} };
+  const appended = [];
+  const sync = () => vm.syncMirror(state, (r) => appended.push(r.index), () => items);
+
+  assertEqual(sync(), 2, "the user item and the (still empty) reply");
+
+  // The steer lands before the reply has produced a single token.
+  items.push(userItem("also check the tests"));
+  assertEqual(sync(), 1, "the steer is mirrored after the reply, not before");
+
+  // The reply finally streams.
+  setText(items[1], "sure, one sec");
+  assertEqual(sync(), 0, "and needs no new entry to become visible");
+  assertEqual(appended, [0, 1, 2], "nothing lost, nothing duplicated, nothing reordered");
 });
 
 test("attachTo switches the mirrored agent without replaying it", () => {

@@ -46,6 +46,19 @@ export type AgentState = "idle" | "working" | "completed" | "failed" | "stopped"
  * content) for the view layer to render them with pi's own transcript
  * components instead of a bespoke widget renderer.
  */
+/**
+ * A tool result, partial or final, in the shape `ToolExecutionComponent` wants.
+ *
+ * `isPartial` is pi's own distinction: output streamed so far (the box keeps its
+ * "pending" colours) versus the finished result.
+ */
+export interface ToolCallResult {
+  content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+  details?: unknown;
+  isError: boolean;
+  isPartial: boolean;
+}
+
 export type TranscriptItem =
   | { kind: "user"; text: string }
   /**
@@ -54,7 +67,31 @@ export type TranscriptItem =
    * blocks, truncation/abort notices), so the view needs no per-part items.
    */
   | { kind: "assistant"; message: AssistantMessage; streaming: boolean }
-  | { kind: "toolCall"; id: string; name: string; args: Record<string, unknown> }
+  /**
+   * A tool call and its whole lifecycle, tracked the way pi's interactive mode
+   * tracks a `ToolExecutionComponent`: the box exists as soon as the call appears
+   * in the streaming message (args may still be arriving), learns that its args
+   * are complete when the message ends, that execution started when the tool
+   * actually runs, then takes partial output and finally the result.
+   *
+   * The view replays exactly these transitions onto pi's own component, so an
+   * agent's tool box behaves like the main session's — including live output and
+   * the synthetic error result pi writes into every still-pending call when a
+   * turn is aborted (without which the box sits "pending" forever).
+   *
+   * `revision` is bumped on every mutation: it is what lets the view apply state
+   * when something actually changed instead of on every frame.
+   */
+  | {
+      kind: "toolCall";
+      id: string;
+      name: string;
+      args: Record<string, unknown>;
+      argsComplete?: boolean;
+      executionStarted?: boolean;
+      result?: ToolCallResult;
+      revision: number;
+    }
   | {
       kind: "toolResult";
       toolCallId: string;
@@ -86,7 +123,8 @@ interface Registry {
    */
   stopped: Set<string>;
   modelRuntime?: ModelRuntime;
-  onChange?: () => void;
+  /** Called after any live agent changes; the argument is that agent's file. */
+  onChange?: (file?: string) => void;
   /**
    * Tool definitions handed to every sub-agent's `createAgentSession()` as
    * `customTools`, so it has the same `agent_create`/`agent_inspect`/`agent_send`/
@@ -120,7 +158,7 @@ export function isLoadingSubAgent(): boolean {
   return registry().loading;
 }
 
-export function setOnChange(cb: (() => void) | undefined): void {
+export function setOnChange(cb: ((file?: string) => void) | undefined): void {
   registry().onChange = cb;
 }
 
@@ -129,9 +167,17 @@ export function setManagedTools(tools: ToolDefinition[]): void {
   registry().managedTools = tools;
 }
 
-function notify(): void {
+/**
+ * Tell the view layer that `file` changed.
+ *
+ * The file matters: this fires on every streaming delta of every live agent,
+ * and a repaint costs a full document render (fullscreen re-renders everything
+ * on every frame). The view can only skip work it knows is invisible if it is
+ * told *which* agent moved, so always pass the file when it is known.
+ */
+function notify(file?: string): void {
   try {
-    registry().onChange?.();
+    registry().onChange?.(file);
   } catch {
     /* ignore */
   }
@@ -228,7 +274,19 @@ export function seedTranscript(sm: SessionManager): TranscriptItem[] {
         }
         for (const c of m.content ?? []) {
           if (c.type === "toolCall") {
-            out.push({ kind: "toolCall", id: c.id, name: c.name, args: c.arguments ?? {} });
+            out.push({
+              kind: "toolCall",
+              id: c.id,
+              name: c.name,
+              args: c.arguments ?? {},
+              // A persisted call is finished by definition: its args are whole
+              // and it ran. The result is attached below, from the toolResult
+              // message that follows, so a revived transcript drives pi's tool
+              // box through exactly the same state a live one does.
+              argsComplete: true,
+              executionStarted: true,
+              revision: 1,
+            });
           }
         }
       } else if (m.role === "toolResult") {
@@ -241,6 +299,17 @@ export function seedTranscript(sm: SessionManager): TranscriptItem[] {
           content: m.content ?? [],
           details: m.details,
         });
+        for (let i = out.length - 1; i >= 0; i--) {
+          const call = out[i]!;
+          if (call.kind !== "toolCall" || call.id !== m.toolCallId) continue;
+          call.result = {
+            content: m.content ?? [],
+            details: m.details,
+            isError: Boolean(m.isError),
+            isPartial: false,
+          };
+          break;
+        }
       }
     }
   } catch {
@@ -301,6 +370,50 @@ export function readTranscript(file: string): TranscriptItem[] {
   }
 }
 
+/**
+ * The transcript's record of a tool call, searched from the end (a call is
+ * always near the tail when its events arrive).
+ */
+function findCall(agent: LiveAgent, id: string): Extract<TranscriptItem, { kind: "toolCall" }> | undefined {
+  for (let i = agent.transcript.length - 1; i >= 0; i--) {
+    const it = agent.transcript[i]!;
+    if (it.kind === "toolCall" && it.id === id) return it;
+  }
+  return undefined;
+}
+
+/**
+ * Add or update the tool calls of a (possibly still streaming) assistant
+ * message, like pi's `message_update` handler does: a call gets its box as soon
+ * as it appears, and its args are refreshed while they stream.
+ */
+function syncToolCalls(agent: LiveAgent, message: Record<string, any>): boolean {
+  let changed = false;
+  for (const part of (message.content ?? []) as Array<Record<string, any>>) {
+    if (part.type !== "toolCall") continue;
+    const args = (part.arguments ?? {}) as Record<string, unknown>;
+    const existing = findCall(agent, part.id);
+    if (!existing) {
+      agent.transcript.push({ kind: "toolCall", id: part.id, name: part.name, args, revision: 1 });
+      changed = true;
+    } else if (existing.args !== args) {
+      existing.args = args;
+      existing.revision++;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/** Attach a result to a call, if the call is known. */
+function applyResult(agent: LiveAgent, id: string, result: ToolCallResult): boolean {
+  const call = findCall(agent, id);
+  if (!call) return false;
+  call.result = result;
+  call.revision++;
+  return true;
+}
+
 function attachEvents(agent: LiveAgent): () => void {
   const { session } = agent;
 
@@ -316,21 +429,24 @@ function attachEvents(agent: LiveAgent): () => void {
           agent.transcript.push({ kind: "assistant", message: emptyAssistant(m), streaming: true });
         }
         agent.state = "working";
-        notify();
+        notify(agent.file);
         break;
       }
 
       case "message_update": {
         const ev = event.assistantMessageEvent;
+        // Tool calls show up inside the streaming message: pi draws the box
+        // right away (args still arriving) rather than waiting for the turn.
+        if (event.message?.role === "assistant" && syncToolCalls(agent, event.message)) notify(agent.file);
         if (!ev) break;
         const last = agent.transcript[agent.transcript.length - 1];
         if (last?.kind !== "assistant" || !last.streaming) break;
         if (ev.type === "text_delta") {
           appendDelta(last.message, "text", ev.delta ?? "");
-          notify();
+          notify(agent.file);
         } else if (ev.type === "thinking_delta") {
           appendDelta(last.message, "thinking", ev.delta ?? "");
-          notify();
+          notify(agent.file);
         }
         break;
       }
@@ -344,15 +460,37 @@ function attachEvents(agent: LiveAgent): () => void {
           if (it.kind === "assistant" && it.streaming) {
             it.streaming = false;
             if (m?.role === "assistant") it.message = m as AssistantMessage;
-            if (!assistantHasContent(it.message)) agent.transcript.splice(i, 1);
             break;
           }
         }
         if (m?.role === "assistant") {
-          for (const c of m.content ?? []) {
-            if (c.type === "toolCall") {
-              agent.transcript.push({ kind: "toolCall", id: c.id, name: c.name, args: c.arguments ?? {} });
+          // Same wording pi puts on an aborted turn, so the notice on the
+          // message and in every pending tool box reads identically.
+          let errorMessage: string | undefined;
+          if (m.stopReason === "aborted") {
+            const retries = agent.session.retryAttempt ?? 0;
+            errorMessage =
+              retries > 0 ? `Aborted after ${retries} retry attempt${retries > 1 ? "s" : ""}` : "Operation aborted";
+            m.errorMessage = errorMessage;
+          }
+          syncToolCalls(agent, m);
+          const aborted = m.stopReason === "aborted" || m.stopReason === "error";
+          for (const it of agent.transcript) {
+            if (it.kind !== "toolCall" || it.result) continue;
+            if (aborted) {
+              // pi writes a synthetic error result into every still-pending
+              // call; without it the box stays "pending" for good and an
+              // aborted turn looks like a tool that is still running.
+              it.result = {
+                content: [{ type: "text", text: errorMessage || m.errorMessage || "Error" }],
+                isError: true,
+                isPartial: false,
+              };
+            } else {
+              // Args are complete now: this is what makes `edit` compute its diff.
+              it.argsComplete = true;
             }
+            it.revision++;
           }
           if (m.errorMessage) {
             agent.state = "failed";
@@ -368,20 +506,85 @@ function attachEvents(agent: LiveAgent): () => void {
             content: m.content ?? [],
             details: m.details,
           });
+          // Normally `tool_execution_end` already delivered this; attach it
+          // again only if that event never arrived, so a revived or
+          // event-starved transcript still shows the result.
+          const call = findCall(agent, m.toolCallId);
+          if (call && (!call.result || call.result.isPartial)) {
+            call.result = {
+              content: m.content ?? [],
+              details: m.details,
+              isError: Boolean(m.isError),
+              isPartial: false,
+            };
+            call.revision++;
+          }
         }
-        notify();
+        notify(agent.file);
+        break;
+      }
+
+      case "tool_execution_start": {
+        const e = event as { toolCallId: string; toolName?: string; args?: Record<string, unknown> };
+        let call = findCall(agent, e.toolCallId);
+        if (!call) {
+          // The call never showed up in a streaming message (a provider that
+          // does not stream tool args): pi creates the box here too.
+          call = {
+            kind: "toolCall",
+            id: e.toolCallId,
+            name: e.toolName ?? "tool",
+            args: e.args ?? {},
+            argsComplete: true,
+            revision: 1,
+          };
+          agent.transcript.push(call);
+        }
+        call.executionStarted = true;
+        call.revision++;
+        notify(agent.file);
+        break;
+      }
+
+      case "tool_execution_update": {
+        const e = event as { toolCallId: string; partialResult?: { content?: unknown[]; details?: unknown } };
+        const partial = e.partialResult ?? {};
+        if (
+          applyResult(agent, e.toolCallId, {
+            content: (partial.content ?? []) as ToolCallResult["content"],
+            details: partial.details,
+            isError: false,
+            isPartial: true,
+          })
+        ) {
+          notify(agent.file);
+        }
         break;
       }
 
       case "tool_execution_end": {
-        // Covered by toolResult message_end; kept for state freshness.
-        notify();
+        const e = event as {
+          toolCallId: string;
+          result?: { content?: unknown[]; details?: unknown };
+          isError?: boolean;
+        };
+        const result = e.result ?? {};
+        if (
+          applyResult(agent, e.toolCallId, {
+            content: (result.content ?? []) as ToolCallResult["content"],
+            details: result.details,
+            isError: Boolean(e.isError),
+            isPartial: false,
+          })
+        ) {
+          notify(agent.file);
+        }
         break;
       }
 
       case "agent_end": {
         if (agent.state !== "failed" && agent.state !== "stopped") agent.state = "completed";
-        notify();
+        notify(agent.file);
         break;
       }
     }
@@ -419,7 +622,7 @@ export async function setAgentModel(file: string, model: Model<any>): Promise<bo
   const agent = registry().agents.get(file);
   if (!agent) return false;
   await agent.session.setModel(model, { persist: false });
-  notify();
+  notify(file);
   return true;
 }
 
@@ -431,7 +634,7 @@ export async function cycleAgentModel(
   const agent = registry().agents.get(file);
   if (!agent) return undefined;
   const result = await agent.session.cycleModel(direction, { persist: false });
-  notify();
+  notify(file);
   return result?.model;
 }
 
@@ -578,7 +781,7 @@ export async function ensureAgent(
   agent.unsubscribe = attachEvents(agent);
 
   reg.agents.set(file, agent);
-  notify();
+  notify(file);
   return agent;
 }
 
@@ -664,7 +867,7 @@ export async function runAgent(
   const agent = await ensureAgent(file, cwd, model, thinkingLevel, def, forcedModel);
   agent.state = "working";
   agent.error = undefined;
-  notify();
+  notify(file);
 
   // Fire and forget — concurrency is the point.
   agent.session.prompt(prompt).catch((err: unknown) => {
@@ -672,7 +875,7 @@ export async function runAgent(
     agent.state = "stopped";
     agent.error = String(err);
     agent.transcript.push({ kind: "error", text: String(err) });
-    notify();
+    notify(file);
   });
 }
 
@@ -702,7 +905,7 @@ export async function runAgentAndWait(
   const agent = await ensureAgent(file, cwd, model, thinkingLevel, def, forcedModel);
   agent.state = "working";
   agent.error = undefined;
-  notify();
+  notify(file);
 
   try {
     await agent.session.prompt(prompt);
@@ -712,7 +915,7 @@ export async function runAgentAndWait(
     agent.error = String(err);
     agent.transcript.push({ kind: "error", text: String(err) });
   }
-  notify();
+  notify(file);
   return agent;
 }
 
@@ -730,7 +933,7 @@ export async function steerAgent(file: string, text: string): Promise<boolean> {
     // extension commands, which made those work only while the agent was
     // idle.
     await agent.session.prompt(text, agent.session.isStreaming ? { streamingBehavior: "steer" } : undefined);
-    notify();
+    notify(file);
     return true;
   } catch {
     return false;
@@ -749,7 +952,7 @@ export async function terminateAgent(file: string): Promise<boolean> {
   const wasLive = reg.agents.has(file);
   reg.stopped.add(file);
   await disposeAgent(file);
-  notify();
+  notify(file);
   return wasLive;
 }
 
@@ -767,7 +970,7 @@ export async function forgetAgent(file: string): Promise<boolean> {
   const wasLive = reg.agents.has(file);
   await disposeAgent(file);
   reg.stopped.delete(file);
-  notify();
+  notify(file);
   return wasLive;
 }
 
@@ -792,7 +995,7 @@ export async function disposeAgent(file: string): Promise<void> {
     /* ignore */
   }
   reg.agents.delete(file);
-  notify();
+  notify(file);
 }
 
 /** Dispose every agent (call on quit). */

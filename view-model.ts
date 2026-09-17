@@ -125,27 +125,44 @@ const STATE_ORDER: AgentState[] = ["working", "failed", "stopped", "idle", "comp
  * rows swap places under the cursor on every refresh. A join ticket is minted
  * the first time an agent is seen in a state and kept until its state changes,
  * so a group's order is fixed and new members are appended at the bottom.
+ *
+ * Kept on `globalThis`, like the agent pool and the view state: `/reload`
+ * re-evaluates this module, and module-local tickets would be lost — reshuffling
+ * every group, which is exactly what they exist to prevent.
  */
-const groupTickets = new Map<string, { state: AgentState; ticket: number }>();
-let nextTicket = 0;
+interface GroupOrder {
+  tickets: Map<string, { state: AgentState; ticket: number }>;
+  next: number;
+}
+
+const ORDER_KEY = "__piAgentViewsGroupOrder";
+
+function groupOrder(): GroupOrder {
+  const g = globalThis as Record<string, unknown>;
+  if (!g[ORDER_KEY]) g[ORDER_KEY] = { tickets: new Map(), next: 0 } satisfies GroupOrder;
+  return g[ORDER_KEY] as GroupOrder;
+}
 
 function groupTicket(key: string, state: AgentState): number {
-  const previous = groupTickets.get(key);
+  const order = groupOrder();
+  const previous = order.tickets.get(key);
   if (previous && previous.state === state) return previous.ticket;
-  const ticket = ++nextTicket;
-  groupTickets.set(key, { state, ticket });
+  const ticket = ++order.next;
+  order.tickets.set(key, { state, ticket });
   return ticket;
 }
 
 /** Forget agents that vanished, so tickets do not leak across long sessions. */
 function pruneTickets(live: Set<string>): void {
-  for (const key of groupTickets.keys()) if (!live.has(key)) groupTickets.delete(key);
+  const { tickets } = groupOrder();
+  for (const key of tickets.keys()) if (!live.has(key)) tickets.delete(key);
 }
 
 /** Test hook: drop all join tickets. */
 export function resetGroupOrder(): void {
-  groupTickets.clear();
-  nextTicket = 0;
+  const order = groupOrder();
+  order.tickets.clear();
+  order.next = 0;
 }
 
 export function buildRows(input: BuildRowsInput): AgentRow[] {
@@ -298,9 +315,9 @@ export function isVisible(state: MirrorState, file: string): boolean {
 /**
  * True when pi would render something for this item right now.
  *
- * `addCustomEntryToChat()` drops entries whose renderer produces no lines, so
- * an assistant item must not be mirrored before its first delta arrives, and
- * tool results are drawn inside their tool call's box.
+ * Used by the chat filter to skip an entry that has nothing to draw *yet*: an
+ * assistant message before its first delta, or a tool result (drawn inside its
+ * call's box).
  */
 export function renderable(item: TranscriptItem): boolean {
   switch (item.kind) {
@@ -319,6 +336,14 @@ export function renderable(item: TranscriptItem): boolean {
 
 /**
  * Hand pi every transcript item of the attached agent it has not rendered yet.
+ *
+ * Every item is mirrored as soon as it exists, in transcript order — including
+ * an assistant message that has not streamed a token yet. pi's chat is
+ * append-only, so waiting for an item to have content would mean either
+ * appending later items *before* it (wrong order) or skipping it for good; and
+ * pi itself adds its streaming component immediately for the same reason. An
+ * entry with nothing to draw is skipped at render time instead (`isVisible` /
+ * the chat filter), so it costs nothing on screen and fills in place.
  *
  * Pure bookkeeping: the caller supplies `append` (pi.appendEntry in the
  * extension, a collector in tests) and optionally `read` (defaults to the live
@@ -339,20 +364,12 @@ export function syncMirror(
   let appended = 0;
 
   while (cursor < items.length) {
-    const item = items[cursor]!;
-    if (item.kind === "toolResult") {
-      cursor++;
-      continue;
+    // Tool results are drawn inside their call's box, never on their own.
+    if (items[cursor]!.kind !== "toolResult") {
+      append({ file, index: cursor });
+      appended++;
     }
-    if (!renderable(item)) {
-      // The streaming tail has no text yet: wait for the next update.
-      if (cursor === items.length - 1) break;
-      cursor++;
-      continue;
-    }
-    append({ file, index: cursor });
     cursor++;
-    appended++;
   }
   state.mirrored[file] = cursor;
   return appended;

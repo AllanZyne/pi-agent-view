@@ -56,6 +56,7 @@ export interface ToolRenderers {
 }
 
 const RENDERERS_SUBPATH = ["dist", "core", "tools", "renderers", "index.js"];
+const MERMAID_SUBPATH = ["dist", "modes", "interactive", "components", "mermaid.js"];
 const PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 
 /** One guess at the package's install root, paired with why it might be right. */
@@ -138,10 +139,15 @@ let attempted = false;
 let lastResolution: { reason: string; path: string } | undefined;
 
 function renderersFileUrl(): { url: string; reason: string } | undefined {
+  return piModuleUrl(RENDERERS_SUBPATH);
+}
+
+/** Locate one of pi's own modules on disk, by absolute path (see file header). */
+function piModuleUrl(subpath: string[]): { url: string; reason: string } | undefined {
   for (const candidate of CANDIDATES) {
     const root = candidate.packageRoot();
     if (!root) continue;
-    const file = join(root, ...RENDERERS_SUBPATH);
+    const file = join(root, ...subpath);
     if (existsSync(file)) return { url: pathToFileURL(file).href, reason: candidate.reason };
   }
   return undefined;
@@ -196,4 +202,54 @@ export function resetToolRenderers(): void {
   lookup = undefined;
   attempted = false;
   lastResolution = undefined;
+}
+
+// ── Markdown transformers (mermaid) ───────────────────────────────
+
+/**
+ * pi hands its message components a list of markdown transformers, and the one
+ * it always includes turns a ```mermaid block into a terminal diagram
+ * (`createMermaidMarkdownTransformer`). Without it, an agent's reply shows the
+ * raw mermaid source while the same reply on `main` shows the diagram.
+ *
+ * Lives in `dist/modes/interactive/components/mermaid.js`, which the package's
+ * `exports` map does not expose either, so it is loaded exactly like the tool
+ * renderers above: by absolute `file://` URL.
+ */
+export type MermaidTransformerFactory = (options: {
+  getMode: () => string;
+  theme: unknown;
+}) => unknown;
+
+let mermaid: MermaidTransformerFactory | undefined;
+let mermaidAttempted = false;
+
+/** Load pi's mermaid markdown transformer factory once. */
+export async function initMarkdownTransformers(): Promise<boolean> {
+  if (mermaidAttempted) return mermaid !== undefined;
+  mermaidAttempted = true;
+  const found = piModuleUrl(MERMAID_SUBPATH);
+  if (!found) return false;
+  try {
+    const mod = (await import(found.url)) as {
+      createMermaidMarkdownTransformer?: MermaidTransformerFactory;
+    };
+    if (typeof mod.createMermaidMarkdownTransformer === "function") {
+      mermaid = mod.createMermaidMarkdownTransformer;
+    }
+  } catch {
+    mermaid = undefined;
+  }
+  return mermaid !== undefined;
+}
+
+/** pi's mermaid transformer factory, or undefined if it could not be loaded. */
+export function mermaidTransformerFactory(): MermaidTransformerFactory | undefined {
+  return mermaid;
+}
+
+/** Test seam: forget the loaded transformer factory. */
+export function resetMarkdownTransformers(): void {
+  mermaid = undefined;
+  mermaidAttempted = false;
 }

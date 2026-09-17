@@ -10,6 +10,7 @@ import "./unit.view-model.mjs";
 import "./unit.transcript-view.mjs";
 import "./unit.tool-renderers.mjs";
 import "./unit.render.mjs";
+import "./unit.picker.mjs";
 import "./unit.attached-commands.mjs";
 import "./unit.catalog.mjs";
 import "./unit.at-mention.mjs";

@@ -89,8 +89,10 @@ import {
   getAgentDir,
   getMarkdownTheme,
   ModelSelectorComponent,
+  parseSkillBlock,
   SessionManager,
   SettingsManager,
+  SkillInvocationMessageComponent,
   ToolExecutionComponent,
   UserMessageComponent,
   type ExtensionAPI,
@@ -143,7 +145,7 @@ import { loadCatalog, type Catalog, type SubAgentDef } from "./agent-catalog.ts"
 import { type LiveAgentInfo } from "./at-mention.ts";
 import { wrapWithAgentMentions } from "./autocomplete.ts";
 import { findChatContainer, installChatFilter, isOwnedChild, type RenderNode } from "./transcript-view.ts";
-import { initToolRenderers, toolRenderersFor } from "./tool-renderers.ts";
+import { initMarkdownTransformers, initToolRenderers, mermaidTransformerFactory, toolRenderersFor } from "./tool-renderers.ts";
 import { registerAgentCreateTool, agentCreateTool } from "./agent-create-tool.ts";
 import { registerAgentInspectTool, agentInspectTool } from "./agent-inspect-tool.ts";
 import { registerAgentControlTools, agentSendTool, agentRemoveTool } from "./agent-control-tool.ts";
@@ -213,6 +215,17 @@ export interface ViewState extends MirrorState, Selection {
   refresh?: () => void;
   /** Removes the chat-container render filter (see transcript-view.ts). */
   unfilter?: () => void;
+  /** pi's chat container, once located. Kept so notices can be attributed. */
+  chat?: RenderNode;
+  /**
+   * Which view a *pi-owned* chat child belongs to.
+   *
+   * `ui.notify` appends pi's own children; those are hidden while an agent is
+   * attached, so a notice raised from an agent view was invisible and then
+   * surfaced later in main's transcript out of nowhere. Children tagged here
+   * draw in the tagged agent's view and nowhere else.
+   */
+  piChildOwner?: WeakMap<object, string>;
   /** Stops the current editor's agent working spinner. */
   stopStatus?: () => void;
 }
@@ -236,6 +249,41 @@ const ITEM_ENTRY = "agent-view-item";
 const OWNED_ENTRIES: ReadonlySet<string> = new Set([ITEM_ENTRY]);
 
 /**
+ * Which children of pi's chat container draw in the current frame.
+ *
+ * Three kinds of child, three rules:
+ *   - **our custom entries** — drawn only while their own agent is attached.
+ *     Skipping the whole child matters: pi's `CustomEntryComponent` wrapper
+ *     always prepends a `Spacer(1)`, so a merely-empty render would still leave
+ *     one mystery blank line per hidden entry.
+ *   - **notices we raised from inside an agent view** — pi's own children, but
+ *     they belong to that agent's conversation (see `notify`).
+ *   - **everything else pi appends** — main's own transcript: drawn only when
+ *     nothing is attached.
+ */
+export function includeChatChild(
+  view: ViewState,
+  child: unknown,
+  /** Test seam; defaults to the live agent pool. */
+  read: (file: string) => TranscriptItem[] = readTranscript,
+): boolean {
+  if (isOwnedChild(child, OWNED_ENTRIES)) {
+    if (view.attached === undefined) return false;
+    const ref = (child as { entry?: { data?: ItemRef } } | null)?.entry?.data;
+    if (ref?.file !== view.attached) return false;
+    // An item with nothing to draw *yet* (an assistant message that has not
+    // streamed its first token) must be skipped as a whole child: its entry
+    // exists so that later items keep their order, and pi's wrapper would
+    // otherwise contribute its `Spacer(1)` as a stray blank line.
+    const item = read(ref.file)[ref.index];
+    return item !== undefined && renderable(item);
+  }
+  const owner = view.piChildOwner?.get(child as object);
+  if (owner !== undefined) return view.attached === owner;
+  return view.attached === undefined;
+}
+
+/**
  * Everything pi feeds its own message components, read from settings once so an
  * agent transcript is laid out and coloured exactly like the main session's.
  */
@@ -245,6 +293,15 @@ export interface RenderSettings {
   markdownTheme: MarkdownTheme;
   hideThinkingBlock: boolean;
   tool: { showImages: boolean; imageWidthCells: number };
+  /**
+   * pi's markdown transformers, the same list it hands its own message
+   * components (today: the mermaid diagram renderer). Filled in lazily by
+   * `ensureMarkdownTransformers` because building it needs the theme instance,
+   * which only the entry renderer receives.
+   */
+  markdownTransformers: unknown[];
+  /** `mermaidRenderingMode`, read per render exactly like pi reads it. */
+  mermaidMode: () => string;
 }
 
 export function defaultRenderSettings(): RenderSettings {
@@ -252,6 +309,8 @@ export function defaultRenderSettings(): RenderSettings {
     outputPad: 1,
     markdownTheme: getMarkdownTheme(),
     hideThinkingBlock: false,
+    markdownTransformers: [],
+    mermaidMode: () => "off",
     tool: { showImages: true, imageWidthCells: 60 },
   };
 }
@@ -265,6 +324,15 @@ function readRenderSettings(cwd: string): RenderSettings {
       outputPad: settings.getOutputPad(),
       markdownTheme: { ...getMarkdownTheme(), codeBlockIndent: settings.getCodeBlockIndent() },
       hideThinkingBlock: settings.getHideThinkingBlock(),
+      markdownTransformers: [],
+      mermaidMode: () => {
+        try {
+          const get = (settings as { getMermaidRenderingMode?: () => string }).getMermaidRenderingMode;
+          return get ? (get.call(settings) ?? "off") : "off";
+        } catch {
+          return "off";
+        }
+      },
       tool: { showImages: settings.getShowImages(), imageWidthCells: settings.getImageWidthCells() },
     };
   } catch {
@@ -288,11 +356,19 @@ function assistantSignature(item: { message: AssistantMessage; streaming: boolea
  */
 export class AgentItemComponent implements Component {
   private user?: UserMessageComponent;
+  /** pi's collapsible `[skill]` block, when the user text is a skill invocation. */
+  private skill?: SkillInvocationMessageComponent;
   private assistant?: AssistantMessageComponent;
   private tool?: ToolExecutionComponent;
   private toolHasRenderers = false;
+  /** Lifecycle revision already pushed into the tool box (see render). */
+  private toolRevision?: number;
   private lastSignature = "";
   private lastExpanded?: boolean;
+  /** True when the last render stripped a leading line (see `handleMouse`). */
+  private droppedLeadingLine = false;
+  /** Free-text part of a skill invocation, drawn after the `[skill]` block. */
+  private skillUserMessage?: string;
 
   constructor(
     private readonly ref: ItemRef,
@@ -312,6 +388,27 @@ export class AgentItemComponent implements Component {
     this.user?.invalidate?.();
     this.assistant?.invalidate();
     this.tool?.invalidate();
+  }
+
+  /**
+   * Forward clicks to whichever of pi's components drew this item.
+   *
+   * pi's expand affordance for a truncated tool result is a `MouseRegion`
+   * *inside* `ToolExecutionComponent`, so without this a click on an agent's
+   * tool box did nothing (it started a text selection instead) while the same
+   * box on `main` expanded.
+   *
+   * The `y` shift matters: `dropLeadingSpacer` removes one line from the top of
+   * what the inner component produced, so the coordinates the parent hands us
+   * are one line above the component's own.
+   */
+  handleMouse(event: unknown): unknown {
+    const target = this.tool ?? this.assistant ?? this.user;
+    const handler = (target as { handleMouse?: (e: unknown) => unknown } | undefined)?.handleMouse;
+    if (!handler || !target) return undefined;
+    const e = event as { y?: number };
+    const shifted = this.droppedLeadingLine && typeof e?.y === "number" ? { ...e, y: e.y + 1 } : event;
+    return handler.call(target, shifted);
   }
 
   render(width: number): string[] {
@@ -334,24 +431,72 @@ export class AgentItemComponent implements Component {
     // top of its `Spacer(1)`), while leaving Box padding lines (from
     // `applyBg("", w)`, which produce bg-tinted spaces — non-zero width)
     // untouched so a user message keeps its box top-padding.
-    const dropLeadingSpacer = (lines: string[]): string[] =>
-      lines.length > 0 && visibleWidth(lines[0]!) === 0 ? lines.slice(1) : lines;
+    // ... and keeps whatever zero-width prefix that line carried. pi puts an
+    // OSC133 prompt-zone marker there, which fullscreen's `Ctrl+↑`/`Ctrl+↓`
+    // prompt navigation looks for — dropping it silently made prompt jumping in
+    // an agent view skip every assistant turn.
+    const dropLeadingSpacer = (lines: string[]): string[] => {
+      this.droppedLeadingLine = lines.length > 0 && visibleWidth(lines[0]!) === 0;
+      if (!this.droppedLeadingLine) return lines;
+      const rest = lines.slice(1);
+      const marker = lines[0]!;
+      if (marker.length > 0 && rest.length > 0) rest[0] = `${marker}${rest[0]}`;
+      return rest;
+    };
 
     switch (item.kind) {
       case "user": {
-        this.user ??= new UserMessageComponent(item.text, this.settings.markdownTheme, pad);
+        // A steer can be a skill invocation (`/skill:foo`), which pi does not
+        // draw as plain text: it renders a collapsible `[skill]` block plus the
+        // user's own message, if any. Same components, same order, so an agent
+        // view shows what the main session would.
+        const block = this.skill ? undefined : parseSkillBlock(item.text);
+        if (block || this.skill) {
+          if (!this.skill && block) {
+            this.skill = new SkillInvocationMessageComponent(block, this.settings.markdownTheme);
+            this.skillUserMessage = block.userMessage;
+          }
+          if (this.lastExpanded !== this.expanded) {
+            this.lastExpanded = this.expanded;
+            this.skill!.setExpanded(this.expanded);
+          }
+          const out = this.skill!.render(width);
+          if (this.skillUserMessage !== undefined) {
+            this.user ??= new UserMessageComponent(
+              this.skillUserMessage,
+              this.settings.markdownTheme,
+              pad,
+              this.settings.markdownTransformers as never,
+            );
+            // pi separates the two with a blank line.
+            out.push("");
+            out.push(...this.user.render(width));
+          }
+          this.droppedLeadingLine = false;
+          return out;
+        }
+        this.user ??= new UserMessageComponent(
+          item.text,
+          this.settings.markdownTheme,
+          pad,
+          this.settings.markdownTransformers as never,
+        );
+        this.droppedLeadingLine = false;
         return this.user.render(width);
       }
 
       case "assistant": {
         // The component draws text, thinking blocks and stop-reason notices,
-        // and adds its own leading spacer — same call pi makes.
+        // and adds its own leading spacer — same call pi makes, with the same
+        // arguments (including its markdown transformers, so a ```mermaid block
+        // becomes a diagram here too).
         this.assistant ??= new AssistantMessageComponent(
           undefined,
           this.settings.hideThinkingBlock,
           this.settings.markdownTheme,
           undefined,
           pad,
+          this.settings.markdownTransformers as never,
         );
         const signature = assistantSignature(item);
         if (signature !== this.lastSignature) {
@@ -383,21 +528,35 @@ export class AgentItemComponent implements Component {
             this.cwd,
           );
           this.toolHasRenderers = Boolean(renderers);
-          this.tool.setArgsComplete();
-          this.tool.markExecutionStarted();
+          // A fresh box knows nothing: replay the call's whole lifecycle below.
+          this.toolRevision = undefined;
           this.tool.setExpanded(this.expanded);
           this.lastExpanded = this.expanded;
         } else if (this.lastExpanded !== this.expanded) {
           this.lastExpanded = this.expanded;
           this.tool.setExpanded(this.expanded);
         }
-        // Pair the call with its result so pi renders the usual call+result box.
-        const result = items.find((it) => it.kind === "toolResult" && it.toolCallId === item.id);
-        if (result && result.kind === "toolResult") {
-          this.tool.updateResult(
-            { content: result.content, details: result.details, isError: result.isError },
-            false,
-          );
+        // Replay the call's state onto pi's component — the same calls pi's own
+        // interactive mode makes, in the same order (args → execution started →
+        // args complete → result), but only when something actually changed.
+        //
+        // Doing it per frame instead would be ruinous: each of these setters runs
+        // `updateDisplay()`, which clears the box and re-invokes the tool's
+        // renderers, throwing away the line caches pi's `Text`/`Markdown`
+        // components keep. Fullscreen re-renders the whole document on every
+        // frame, so that made typing and scrolling in a tool-heavy agent view
+        // lag while `main` stayed smooth (~6x pi's own per-frame cost).
+        if (this.toolRevision !== item.revision) {
+          this.toolRevision = item.revision;
+          this.tool.updateArgs(item.args);
+          if (item.argsComplete) this.tool.setArgsComplete();
+          if (item.executionStarted) this.tool.markExecutionStarted();
+          if (item.result) {
+            this.tool.updateResult(
+              { content: item.result.content, details: item.result.details, isError: item.result.isError },
+              item.result.isPartial,
+            );
+          }
         }
         return dropLeadingSpacer(this.tool.render(width));
       }
@@ -436,11 +595,45 @@ function clip(s: string, n: number): string {
 /** Border characters kept to the right of the editor's view label. */
 const LABEL_TAIL = 4;
 
-function viewportRows(): number {
-  return Math.max(3, Math.floor((process.stdout.rows || 30) / 2) - 4);
+/**
+ * Lines the dock keeps for itself around the picker widget: one line of
+ * transcript (pi's layout never gives it less), the editor's three, the footer,
+ * the `Spacer(1)` pi puts above widget content, and slack for the pending /
+ * status rows.
+ *
+ * This matters in fullscreen, where a widget is *not* part of the scrolling
+ * document but a fixed pane in the dock (`chat-viewport.js`): pi does not clamp
+ * factory-built widgets at all, the transcript is squeezed to a single line to
+ * make room, and anything that still doesn't fit is cut — from the bottom, with
+ * no indicator, and the shrink can eat into the editor and footer as well.
+ */
+const DOCK_RESERVE = 9;
+
+/** How many lines the picker may draw without pushing pi's own UI around. */
+export function pickerBudget(): number {
+  return Math.max(6, (process.stdout.rows || 24) - DOCK_RESERVE);
 }
 
-function renderPicker(view: ViewState, th: Theme, width: number): string[] {
+/**
+ * How many agent rows fit in that budget.
+ *
+ * Each row costs two lines (name + meta), and the frame around them costs about
+ * five (title, two rules, the key hints, one group header). Used for rendering
+ * *and* for scrolling, so the cursor can never sit outside the drawn window.
+ */
+function viewportRows(): number {
+  return Math.max(1, Math.floor((pickerBudget() - 5) / 2));
+}
+
+/** Never exceed the budget, and never drop the closing rule + key hints. */
+function fitToBudget(out: string[]): string[] {
+  const budget = pickerBudget();
+  if (out.length <= budget) return out;
+  const tail = out.slice(-2);
+  return [...out.slice(0, Math.max(0, budget - tail.length)), ...tail];
+}
+
+export function renderPicker(view: ViewState, th: Theme, width: number): string[] {
   if (!view.open) return [];
   const out: string[] = [];
   const rule = th.fg("dim", "─".repeat(Math.max(4, Math.min(width - 4, 100))));
@@ -463,7 +656,7 @@ function renderPicker(view: ViewState, th: Theme, width: number): string[] {
       out.push(truncateToWidth(`    ${th.fg("accent", k.padEnd(15))}${th.fg("text", d)}`, width));
     }
     out.push(truncateToWidth(`  ${th.fg("dim", "? to close help")}`, width));
-    return out;
+    return fitToBudget(out);
   }
 
   const working = view.rows.filter((r) => r.state === "working").length;
@@ -480,7 +673,10 @@ function renderPicker(view: ViewState, th: Theme, width: number): string[] {
   if (view.scroll > 0) out.push(truncateToWidth(th.fg("dim", `  ↑ ${view.scroll} more`), width));
 
   const end = Math.min(view.scroll + maxRows, view.rows.length);
-  let lastState: AgentState | undefined;
+  // Seed from the row *above* the window: a group whose header scrolled off
+  // must not have a second one drawn at the top of the viewport, which reads as
+  // a group boundary that isn't there.
+  let lastState: AgentState | undefined = view.rows[view.scroll - 1]?.state;
 
   for (let i = view.scroll; i < end; i++) {
     const row = view.rows[i]!;
@@ -528,7 +724,7 @@ function renderPicker(view: ViewState, th: Theme, width: number): string[] {
       width,
     ),
   );
-  return out;
+  return fitToBudget(out);
 }
 
 // ── Editor ─────────────────────────────────────────────────────────
@@ -1028,20 +1224,8 @@ export default function agentViews(pi: ExtensionAPI): void {
     if (view.unfilter) return;
     const chat = findChatContainer(tui as unknown as RenderNode | undefined, OWNED_ENTRIES);
     if (!chat) return;
-    view.unfilter = installChatFilter(chat, (child) => {
-      if (isOwnedChild(child, OWNED_ENTRIES)) {
-        // Our custom entry. Draw only when attached and it belongs to that
-        // agent. Any other case (not-attached, or attached to someone else)
-        // must skip the whole child so pi's `CustomEntryComponent` wrapper
-        // doesn't leak its own `Spacer(1)` padding as a mystery blank line.
-        if (view.attached === undefined) return false;
-        const ref = (child as { entry?: { data?: ItemRef } } | null)?.entry?.data;
-        return ref?.file === view.attached;
-      }
-      // pi's own child (main-session content). Show only when detached; hide
-      // when attached so the agent view is exclusively that agent's stream.
-      return view.attached === undefined;
-    });
+    view.chat = chat;
+    view.unfilter = installChatFilter(chat, (child) => includeChatChild(view, child));
     // The current frame may already have drawn the unfiltered container.
     tui?.requestRender(true);
   }
@@ -1049,26 +1233,54 @@ export default function agentViews(pi: ExtensionAPI): void {
   /** Toggle between the main transcript and an agent transcript. */
   function redrawTranscript(): void {
     ensureChatFilter();
+    // Switching conversations shows the newest message, like opening a session
+    // does — and drops any text selection.
+    //
+    // In fullscreen the transcript is one ScrollView over the whole document,
+    // and its scroll offset (and follow-at-end flag) is *shared* by every view:
+    // swapping which conversation is drawn keeps the old offset, merely clamped
+    // to the new document's very different height. Without this, attaching to a
+    // long agent could land in the middle of its history, detaching could drop
+    // you at an arbitrary row of main, and a selection made in one view would
+    // stay highlighted over unrelated rows of the other (and be what `/copy`
+    // copied).
+    const t = tui as unknown as { scrollToBottom?: () => void; clearTextSelection?: () => void } | undefined;
+    t?.clearTextSelection?.();
+    t?.scrollToBottom?.();
     // Force a full repaint: the visible transcript is replaced wholesale, not
     // appended to, so a differential frame would leave the old view behind.
     tui?.requestRender(true);
   }
 
+  /**
+   * Build pi's markdown transformers once, on first render.
+   *
+   * They are not part of `readRenderSettings` because `createMermaidMarkdownTransformer`
+   * needs the live theme instance, and the only place an extension is handed it
+   * is the entry renderer.
+   */
+  function ensureMarkdownTransformers(theme: Theme): void {
+    if (renderSettings.markdownTransformers.length > 0) return;
+    const create = mermaidTransformerFactory();
+    if (!create) return;
+    renderSettings.markdownTransformers = [create({ getMode: renderSettings.mermaidMode, theme })];
+  }
+
   // Agent output is rendered by pi, through this renderer. `options.expanded`
   // is pi's Ctrl+O state, so agent tool boxes expand with everything else.
-  pi.registerEntryRenderer<ItemRef>(ITEM_ENTRY, (entry, options, theme) =>
-    entry.data
-      ? new AgentItemComponent(
-          entry.data,
-          theme,
-          renderSettings,
-          options.expanded,
-          tui,
-          process.cwd(),
-          visible,
-        )
-      : undefined,
-  );
+  pi.registerEntryRenderer<ItemRef>(ITEM_ENTRY, (entry, options, theme) => {
+    if (!entry.data) return undefined;
+    ensureMarkdownTransformers(theme);
+    return new AgentItemComponent(
+      entry.data,
+      theme,
+      renderSettings,
+      options.expanded,
+      tui,
+      process.cwd(),
+      visible,
+    );
+  });
 
   /**
    * Best-effort display name for an agent (or the main session).
@@ -1089,10 +1301,20 @@ export default function agentViews(pi: ExtensionAPI): void {
    * `resolveRoot(file, "")` recovers the root purely from the file path
    * (agent files live under `__agents__/<rootId>/`), so this stays a pure
    * helper with no `ctx` dependency.
+   *
+   * Called from `viewStatus()`, i.e. once per frame while attached, so the
+   * manifest hit is memoised: an agent's name is assigned at spawn time and
+   * never changes, and without the memo every frame re-read (and re-parsed)
+   * `manifest.json` — or, if the agent was somehow not listed there, parsed
+   * the agent's whole `.jsonl` through `SessionManager.open`.
    */
+  const manifestNames = new Map<string, string>();
+
   function nameOf(file: string): string {
     const row = view.rows.find((r) => r.key === file);
     if (row) return row.name;
+    const memo = manifestNames.get(file);
+    if (memo !== undefined) return memo;
     try {
       const root = resolveRoot(file, "");
       if (root) {
@@ -1103,11 +1325,16 @@ export default function agentViews(pi: ExtensionAPI): void {
         const entry = listAgentEntries(root, (f) => getAgent(f) !== undefined).find(
           (a) => a.file === file,
         );
-        if (entry) return entry.name;
+        if (entry) {
+          manifestNames.set(file, entry.name);
+          return entry.name;
+        }
       }
     } catch {
       /* manifest is best-effort; fall through */
     }
+    // Not memoised: both of these mean "no name yet", and a later call can do
+    // better once the manifest or the session file has caught up.
     try {
       return SessionManager.open(file).getSessionName() ?? path.basename(file);
     } catch {
@@ -1115,10 +1342,62 @@ export default function agentViews(pi: ExtensionAPI): void {
     }
   }
 
-  /** Append any agent transcript items that pi has not rendered yet. */
-  function mirror(): void {
-    syncMirror(view, (ref) => pi.appendEntry<ItemRef>(ITEM_ENTRY, ref));
+  /**
+   * A toast that is visible in the conversation that raised it.
+   *
+   * `ctx.ui.notify` works by appending pi's *own* children to the chat
+   * container (`showStatus`/`showError`/`showWarning`), and the filter hides
+   * pi's children while an agent is attached. Used raw, every notice raised
+   * from an agent view was therefore invisible — typing `/copy` while attached
+   * just swallowed the input with no explanation, a model switch confirmed
+   * nothing — and then the whole backlog appeared in main's transcript on
+   * detach. So tag whatever pi just added with the view it was raised from, and
+   * let the filter draw it there and nowhere else.
+   */
+  function notify(ctx: ExtensionContext, message: string, level?: "info" | "warning" | "error"): void {
+    const chat = view.chat;
+    const owner = view.attached;
+    if (!chat || owner === undefined) {
+      ctx.ui.notify(message, level);
+      return;
+    }
+    const children = (chat.children ?? []) as unknown[];
+    const before = children.length;
+    ctx.ui.notify(message, level);
+    const own = (child: unknown) => {
+      if (child && typeof child === "object") {
+        view.piChildOwner ??= new WeakMap();
+        view.piChildOwner.set(child as object, owner);
+      }
+    };
+    if (children.length > before) {
+      for (let i = before; i < children.length; i++) own(children[i]);
+    } else {
+      // Back-to-back status messages: pi rewrites the previous status line's
+      // text in place instead of appending (`showStatus`). That line now shows
+      // *our* message, so it belongs to this view too.
+      own(children[children.length - 1]);
+      own(children[children.length - 2]);
+    }
     tui?.requestRender();
+  }
+
+  /** Append any agent transcript items that pi has not rendered yet. */
+  function mirror(changed?: string): void {
+    const appended = syncMirror(view, (ref) => pi.appendEntry<ItemRef>(ITEM_ENTRY, ref));
+    // Repaint only when the screen can actually have changed.
+    //
+    // This runs on *every* streaming delta of *every* live agent, and a repaint
+    // is not cheap: fullscreen mode re-renders the whole document (the entire
+    // transcript, not just the viewport) on every frame, at up to 60 fps. A
+    // background agent's deltas change nothing that is on screen — its entries
+    // are filtered out, the picker is a snapshot, and the editor border shows
+    // only the current view's own status — so repainting for them just burned a
+    // full render per delta and made typing lag while any agent was working.
+    // Repaint when: new entries were mirrored, or the agent being *looked at*
+    // moved (its streaming message mutates in place, and its state drives the
+    // border spinner), or the caller didn't say who changed.
+    if (appended > 0 || changed === undefined || changed === view.attached) tui?.requestRender();
   }
 
   /**
@@ -1182,7 +1461,7 @@ export default function agentViews(pi: ExtensionAPI): void {
 
   function openPicker(ctx: ExtensionContext): void {
     if (!rootOf(ctx)) {
-      ctx.ui.notify("Agents need a saved session", "error");
+      notify(ctx, "Agents need a saved session", "error");
       return;
     }
 
@@ -1210,7 +1489,7 @@ export default function agentViews(pi: ExtensionAPI): void {
   async function attach(ctx: ExtensionContext, file: string): Promise<void> {
     // A just-spawned agent is live before pi flushes its session file.
     if (!getAgent(file) && !fs.existsSync(file)) {
-      ctx.ui.notify("That agent's session file is gone", "error");
+      notify(ctx, "That agent's session file is gone", "error");
       return;
     }
     if (view.attached === file) {
@@ -1220,7 +1499,7 @@ export default function agentViews(pi: ExtensionAPI): void {
     try {
       await ensureAgent(file, ctx.cwd, ctx.model, ctx.thinkingLevel, defForFile(ctx, file));
     } catch (err) {
-      ctx.ui.notify(`Could not open agent: ${String(err)}`, "error");
+      notify(ctx, `Could not open agent: ${String(err)}`, "error");
       return;
     }
     if (view.attached) detach();
@@ -1258,6 +1537,7 @@ export default function agentViews(pi: ExtensionAPI): void {
       return;
     }
     const name = nameOf(file);
+    manifestNames.delete(file);
     await forgetAgent(file);
     const root = rootOf(ctx);
     if (root) removeAgentEntry(root, file);
@@ -1265,7 +1545,7 @@ export default function agentViews(pi: ExtensionAPI): void {
       attachTo(view, undefined);
       redrawTranscript();
     }
-    ctx.ui.notify(`Deleted ${name}`, "info");
+    notify(ctx, `Deleted ${name}`, "info");
     refreshRowsIfOpen(ctx);
     tui?.requestRender();
   }
@@ -1306,7 +1586,7 @@ export default function agentViews(pi: ExtensionAPI): void {
   ): Promise<string | undefined> {
     const root = rootOf(ctx);
     if (!root) {
-      ctx.ui.notify("Agents need a saved session", "error");
+      notify(ctx, "Agents need a saved session", "error");
       return undefined;
     }
 
@@ -1320,7 +1600,7 @@ export default function agentViews(pi: ExtensionAPI): void {
     try {
       await runAgent(file, task, ctx.cwd, ctx.model, ctx.thinkingLevel);
     } catch (err) {
-      ctx.ui.notify(`Could not start agent: ${String(err)}`, "error");
+      notify(ctx, `Could not start agent: ${String(err)}`, "error");
       return undefined;
     }
     if (options.attach) await attach(ctx, file);
@@ -1346,17 +1626,17 @@ export default function agentViews(pi: ExtensionAPI): void {
       if (isRoot(ctx, file)) {
         const ok = await pi.setModel(model);
         if (!ok) {
-          ctx.ui.notify(`No auth configured for ${model.provider}`, "error");
+          notify(ctx, `No auth configured for ${model.provider}`, "error");
           return;
         }
       } else if (!(await setAgentModel(file, model))) {
-        ctx.ui.notify("That agent is not live", "warning");
+        notify(ctx, "That agent is not live", "warning");
         return;
       }
-      ctx.ui.notify(`${nameOf(file)} → ${model.id}`, "info");
+      notify(ctx, `${nameOf(file)} → ${model.id}`, "info");
       refreshRowsIfOpen(ctx);
     } catch (err) {
-      ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+      notify(ctx, err instanceof Error ? err.message : String(err), "error");
     }
   }
 
@@ -1370,7 +1650,7 @@ export default function agentViews(pi: ExtensionAPI): void {
       try {
         await ensureAgent(file, ctx.cwd, ctx.model, ctx.thinkingLevel, defForFile(ctx, file));
       } catch (err) {
-        ctx.ui.notify(`Could not open agent: ${String(err)}`, "error");
+        notify(ctx, `Could not open agent: ${String(err)}`, "error");
         return;
       }
     }
@@ -1416,13 +1696,13 @@ export default function agentViews(pi: ExtensionAPI): void {
     try {
       const model = await cycleAgentModel(file, direction);
       if (!model) {
-        ctx.ui.notify("No other model available", "warning");
+        notify(ctx, "No other model available", "warning");
         return;
       }
-      ctx.ui.notify(`${nameOf(file)} → ${model.id}`, "info");
+      notify(ctx, `${nameOf(file)} → ${model.id}`, "info");
       refreshRowsIfOpen(ctx);
     } catch (err) {
-      ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+      notify(ctx, err instanceof Error ? err.message : String(err), "error");
     }
   }
 
@@ -1455,7 +1735,8 @@ export default function agentViews(pi: ExtensionAPI): void {
       // expect the next `/agents` to see the change without a reload flag.
       const catalog = loadCatalog(ctx.cwd);
       if (catalog.agents.size === 0 && catalog.diagnostics.length === 0) {
-        ctx.ui.notify(
+        notify(
+          ctx,
           "No sub-agent definitions found under .pi/agents/ or ~/.pi/agent/agents/",
           "info",
         );
@@ -1469,7 +1750,7 @@ export default function agentViews(pi: ExtensionAPI): void {
       for (const diag of catalog.diagnostics) {
         lines.push(`(skipped) ${diag.path}: ${diag.error}`);
       }
-      ctx.ui.notify(lines.join("\n"), "info");
+      notify(ctx, lines.join("\n"), "info");
     },
   });
 
@@ -1487,6 +1768,12 @@ export default function agentViews(pi: ExtensionAPI): void {
     // built-in tool renderers it hands to every tool box.
     renderSettings = readRenderSettings(ctx.cwd);
     void initToolRenderers().then((ok) => {
+      if (ok) tui?.requestRender();
+    });
+    // Mermaid diagrams: same story, a module pi does not export (see
+    // tool-renderers.ts). Without it an agent's ```mermaid block would render as
+    // raw source while the identical reply on `main` draws a diagram.
+    void initMarkdownTransformers().then((ok) => {
       if (ok) tui?.requestRender();
     });
     ctx.ui.addAutocompleteProvider((current) =>
@@ -1542,7 +1829,7 @@ export default function agentViews(pi: ExtensionAPI): void {
     });
 
     // Live agents push updates; mirror new items into pi's transcript.
-    setOnChange(() => mirror());
+    setOnChange((file) => mirror(file));
 
     /**
      * What the editor frame says about the conversation on screen.
@@ -1598,15 +1885,15 @@ export default function agentViews(pi: ExtensionAPI): void {
               const target = `@${nameOf(file)}`;
               if (action.fromAttached && action.fromAttached !== file) {
                 const current = `@${nameOf(action.fromAttached)}`;
-                ctx.ui.notify(`Started ${target} in the background · ${current} keeps working`, "info");
+                notify(ctx, `Started ${target} in the background · ${current} keeps working`, "info");
               } else {
-                ctx.ui.notify(`Started ${target} in the background`, "info");
+                notify(ctx, `Started ${target} in the background`, "info");
               }
             });
             break;
           case "steer":
             void steerAgent(action.key, action.text).then((ok) => {
-              if (!ok) ctx.ui.notify("That agent is not live", "warning");
+              if (!ok) notify(ctx, "That agent is not live", "warning");
             });
             break;
           case "model":
@@ -1620,7 +1907,7 @@ export default function agentViews(pi: ExtensionAPI): void {
             void terminate(ctx, action.key);
             break;
           case "blockedCommand":
-            ctx.ui.notify(`/${action.name} isn't available while attached to an agent — detach (Esc) first`, "warning");
+            notify(ctx, `/${action.name} isn't available while attached to an agent — detach (Esc) first`, "warning");
             break;
         }
       };

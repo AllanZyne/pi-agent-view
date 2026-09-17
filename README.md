@@ -174,9 +174,35 @@ would just produce a notice.
   died mid-turn), `∙` Idle.
 - The list is a **snapshot**: it's rebuilt when opened, not on a timer.
   Reopen (`←` twice) to refresh.
+- The list sizes itself to what pi's layout can spare (in fullscreen a widget
+  is a fixed pane, and an oversized one squeezes the transcript to a single
+  line and then gets cut off): long lists scroll inside the widget with
+  `↑ N more` / `↓ N more` markers instead of growing past the screen.
 - `Ctrl+X` is a hard delete, not a pause: the agent's turn is aborted, its
   manifest entry removed and its `.jsonl` erased. There is nothing left to
   revive afterward. If you were attached to it, you land back on `main`.
+
+## Notices, scrolling, and what a switch costs
+
+- Notices this extension raises (model switched, agent started, blocked
+  command, errors) are shown **in the conversation they were raised from**.
+  pi's `notify` appends to its own transcript, which is hidden while an agent
+  is attached, so those children are tagged with the view that owns them —
+  otherwise a notice raised in an agent view would be invisible and then
+  reappear in `main`'s transcript on detach.
+- Attaching or detaching **scrolls to the newest message** and clears any text
+  selection. pi has one scroll offset for the whole document, so a switch would
+  otherwise inherit the previous view's offset (clamped to a completely
+  different height) and leave a selection highlighting unrelated rows.
+- Rendering an agent view costs the same per frame as pi's own transcript.
+  That is not automatic: fullscreen re-renders the entire document on every
+  frame (keystroke, scroll tick, spinner), so anything an entry does per render
+  is paid per keystroke. Entries therefore hand pi's components their content
+  **once** (a tool result is applied when it arrives, not on every frame — that
+  rebuild used to discard pi's line caches and made typing and scrolling in a
+  tool-heavy agent view visibly lag while `main` stayed smooth), and a
+  background agent's streaming deltas no longer request repaints of a view they
+  cannot change.
 
 ## Tests
 
