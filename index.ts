@@ -44,7 +44,7 @@
  *   Enter + text   picker open: create and attach to an agent with that prompt
  *                  attached:    steer the attached agent
  *   Esc            detach (agent keeps running)
- *   Ctrl+X         agent: press twice within 2s to delete; main: interrupt
+ *   Ctrl+X         press twice: agent delete; main abort
  *   Ctrl+L         model selector for the conversation on screen
  *   Ctrl+P         cycle the attached agent's model
  *   ?              help
@@ -232,7 +232,7 @@ export interface ViewState extends MirrorState, Selection {
   piChildOwner?: WeakMap<object, string>;
   /** Stops the current editor's agent working spinner. */
   stopStatus?: () => void;
-  /** Agent waiting for a second Ctrl+X before its deletion deadline. */
+  /** Target waiting for a second Ctrl+X before its action deadline. */
   pendingDeleteKey?: string;
   pendingDeleteUntil?: number;
 }
@@ -707,7 +707,7 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
       ["Enter / →", "Attach: stream it into the transcript"],
       ["Enter + text", "Create an agent with exactly that task and attach"],
       ["Esc", "Detach (agent keeps running)"],
-      ["Ctrl+X", "Press twice within 2s to delete (main: interrupt)"],
+      ["Ctrl+X", "Press twice to delete (main: abort)"],
       ["/model [name]", "Set that agent's model (Ctrl+L when attached)"],
       ["←", "Close the picker (reopen to refresh the list)"],
       ["@agent <task>", "Spawn a background agent (inherits main)"],
@@ -769,7 +769,7 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
 
     const deleting = row.key === view.pendingDeleteKey && (view.pendingDeleteUntil ?? 0) > Date.now();
     const meta = deleting
-      ? th.fg("error", "Press Ctrl+X again within 2s to delete")
+      ? th.fg("error", row.isRoot ? "Press Ctrl+X again to abort" : "Press Ctrl+X again to delete")
       : th.fg("muted", `${row.messageCount} msg${row.messageCount === 1 ? "" : "s"}`);
     const model = !deleting && row.model ? th.fg("dim", ` · ${clip(row.model, 28)}`) : "";
     const summary = !deleting && row.summary ? th.fg("dim", `  ${clip(row.summary, Math.max(10, width - 24))}`) : "";
@@ -795,8 +795,9 @@ type Action =
   | { t: "steer"; key: string; text: string }
   | { t: "model"; key: string; search?: string }
   | { t: "cycleModel"; key: string; direction: "forward" | "backward" }
-  /** Ctrl+X: interrupt the main session's turn, delete an agent outright. */
+  /** Ctrl+X: confirm, then abort main or delete an agent outright. */
   | { t: "terminate"; key: string }
+  | { t: "terminateMain" }
   /** A `BLOCKED_ATTACHED_COMMANDS` command was typed while attached. */
   | { t: "blockedCommand"; name: string };
 
@@ -1090,6 +1091,10 @@ class AgentViewEditor extends CustomEditor {
     if (!view.open) {
       if (empty && matchesKey(data, "left")) {
         this.act({ t: "openPicker" });
+        return;
+      }
+      if (empty && matchesKey(data, "ctrl+x") && !view.attached) {
+        this.act({ t: "terminateMain" });
         return;
       }
       if (view.attached) {
@@ -1600,20 +1605,16 @@ export default function agentViews(pi: ExtensionAPI): void {
   }
 
   /**
-   * Ctrl+X is immediate for main's interrupt, but irreversible agent deletion
-   * must be confirmed by a second press on the same agent within a short window.
+   * Ctrl+X always needs confirmation: it aborts main, or irreversibly deletes
+   * an agent, only after a second press on the same target within the window.
    */
-  function requestTerminate(ctx: ExtensionContext, file: string): void {
-    if (file === ctx.sessionManager.getSessionFile()) {
-      clearDeleteConfirmation();
-      void terminate(ctx, file);
-      return;
-    }
-
+  function requestTerminate(ctx: ExtensionContext, file: string, main = false): void {
+    const isMain = main || file === ctx.sessionManager.getSessionFile();
     const now = Date.now();
     if (view.pendingDeleteKey === file && (view.pendingDeleteUntil ?? 0) >= now) {
       clearDeleteConfirmation();
-      void terminate(ctx, file);
+      if (isMain) ctx.abort();
+      else void terminate(ctx, file);
       return;
     }
 
@@ -1621,7 +1622,9 @@ export default function agentViews(pi: ExtensionAPI): void {
     const deadline = now + DELETE_CONFIRM_MS;
     view.pendingDeleteKey = file;
     view.pendingDeleteUntil = deadline;
-    if (!view.open) notify(ctx, `Press Ctrl+X again within 2 seconds to delete ${nameOf(file)}`, "warning");
+    if (!view.open) {
+      notify(ctx, isMain ? "Press Ctrl+X again to abort" : `Press Ctrl+X again to delete ${nameOf(file)}`, "warning");
+    }
     view.refresh?.();
     tui?.requestRender();
     deleteTimer = setTimeout(() => {
@@ -1633,8 +1636,8 @@ export default function agentViews(pi: ExtensionAPI): void {
   }
 
   /**
-   * Ctrl+X. On the main session this is pi's interrupt; on an agent it is a
-   * hard delete: the turn is aborted, the session dropped, its manifest entry
+   * Ctrl+X. On main this is an abort; on an agent it is a hard delete: the
+   * turn is aborted, the session dropped, its manifest entry
    * removed and its `.jsonl` erased from disk. Unlike a stopped agent, there
    * is no record left afterwards — the agent disappears from the list and
    * attaching to it again is not possible; if you were looking at it, you are
@@ -1979,6 +1982,9 @@ export default function agentViews(pi: ExtensionAPI): void {
             break;
           case "terminate":
             requestTerminate(ctx, action.key);
+            break;
+          case "terminateMain":
+            requestTerminate(ctx, ctx.sessionManager.getSessionFile() ?? "", true);
             break;
           case "blockedCommand":
             notify(ctx, `/${action.name} isn't available while attached to an agent — detach (Esc) first`, "warning");

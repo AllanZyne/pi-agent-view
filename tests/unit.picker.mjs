@@ -60,8 +60,19 @@ test("an armed deletion is shown on the target row", () => {
     th,
     100,
   );
-  assert(lines.some((line) => line.includes("Ctrl+X again within 2s")), JSON.stringify(lines));
-  assertEqual(lines.filter((line) => line.includes("Ctrl+X again within 2s")).length, 1, "only target is armed");
+  assert(lines.some((line) => line.includes("Ctrl+X again to delete")), JSON.stringify(lines));
+  assertEqual(lines.filter((line) => line.includes("Ctrl+X again to delete")).length, 1, "only target is armed");
+});
+
+test("an armed main abort is distinguished from agent deletion", () => {
+  const main = { ...row("main", "working"), isRoot: true };
+  const lines = renderPicker(
+    view([main], { pendingDeleteKey: main.key, pendingDeleteUntil: Date.now() + DELETE_CONFIRM_MS }),
+    th,
+    100,
+  );
+  assert(lines.some((line) => line.includes("Ctrl+X again to abort")), JSON.stringify(lines));
+  assert(!lines.some((line) => line.includes("again to delete")), "main is never described as deleted");
 });
 
 test("help fits the budget too", () => {

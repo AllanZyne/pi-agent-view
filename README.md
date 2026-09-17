@@ -42,7 +42,7 @@ pi install git:github.com/AllanZyne/pi-agent-view
 | `Enter` / `→` | attach to the selected agent |
 | `Enter` + text | list open: new agent with exactly that first prompt, then attach immediately · attached: steer the agent |
 | `Esc` | detach — back to `main`, the agent keeps running |
-| `Ctrl+X` | on an agent, press twice within 2 seconds to delete it outright; on `main`, interrupt |
+| `Ctrl+X` | press twice within 2 seconds: delete an agent outright, or abort `main` |
 | `Ctrl+L` | model selector for the agent you are looking at |
 | `Ctrl+P` / `Shift+Ctrl+P` | cycle the attached agent's model |
 | `?` | help |
@@ -188,8 +188,8 @@ would just produce a notice.
   agent within 2 seconds. While confirmation is armed, that row shows the
   second-press instruction. Deletion aborts the turn, removes the manifest entry
   and erases the `.jsonl`; there is nothing left to revive afterward. If you
-  were attached to it, you land back on `main`. `Ctrl+X` on `main` remains an
-  immediate interrupt.
+  were attached to it, you land back on `main`. On `main`, the same two-press
+  confirmation aborts the current turn instead of deleting anything.
 - Typing a prompt while the list is open creates a plain agent, passes exactly
   that text as its task (without conversation context), and immediately opens
   the new agent's view.
