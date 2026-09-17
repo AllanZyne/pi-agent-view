@@ -91,9 +91,13 @@ spawned.
 
 ## Sub-agent definitions (`.pi/agents/`)
 
-Drop Markdown files under `.pi/agents/` (project, higher priority) or
-`~/.pi/agent/agents/` (user) to predefine reusable agents — same idea as
-Claude Code's `.claude/agents/`. Format:
+Drop Markdown files under `.pi/agents/` (project, highest priority),
+`~/.pi/agent/agents/` (user), or this extension's own `agents/` directory
+(bundled with pi-agent-view itself, lowest priority — e.g. `btw`, a
+read-only Q&A agent shipped in the box) to predefine reusable agents — same
+idea as Claude Code's `.claude/agents/`. A name defined in more than one
+scope resolves to the higher-priority one; the others are still visible via
+`/agents`, which lists source paths. Format:
 
 ```markdown
 ---
@@ -113,8 +117,8 @@ still load. `model` (`provider/id` or `inherit`) and `thinkingLevel` are just
 defaults for a freshly spawned agent; once an agent has run, it keeps its
 own model.
 
-`/agents` rescans both scopes and prints what it found; `agent_create` also
-rescans on every call, so newly added files show up without a reload.
+`/agents` rescans all three scopes and prints what it found; `agent_create`
+also rescans on every call, so newly added files show up without a reload.
 
 Don't want to hand-write the frontmatter? Run `/skill:create-agent` and the
 bundled **`create-agent` skill** will walk you through picking a name,

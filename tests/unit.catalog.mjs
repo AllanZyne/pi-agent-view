@@ -171,14 +171,54 @@ test("loadCatalog: bad files become diagnostics, not exceptions", () => {
   assert(c.diagnostics.some((d) => /reserved/.test(d.error)), `diagnostics: ${JSON.stringify(c.diagnostics)}`);
 });
 
-test("loadCatalog: missing directories are simply empty (no crash)", () => {
+test("loadCatalog: missing project/user directories are simply empty (no crash)", () => {
   const cwd = tempDir(); // no .pi/agents inside
   const savedHome = process.env.HOME;
   process.env.HOME = tempDir(); // no ~/.pi/agent/agents inside either
   try {
     const c = catalog.loadCatalog(cwd);
-    assertEqual(c.agents.size, 0, "no agents");
+    // Extension scope is real (this repo's own `agents/`), so it still
+    // contributes whatever ships with pi-agent-view (e.g. `btw`) — only
+    // project and user are empty here.
+    for (const def of c.agents.values()) {
+      assertEqual(def.scope, "extension", `unexpected non-extension def: ${def.name}`);
+    }
     assertEqual(c.diagnostics.length, 0, "no diagnostics");
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+  }
+});
+
+test("loadCatalog: extension scope loads defs shipped inside this extension's own agents/ dir", () => {
+  const cwd = tempDir();
+  const savedHome = process.env.HOME;
+  process.env.HOME = tempDir();
+  try {
+    const c = catalog.loadCatalog(cwd);
+    const def = c.agents.get("btw");
+    assert(def, `expected the bundled 'btw' def to load: ${JSON.stringify([...c.agents.keys()])}`);
+    assertEqual(def.scope, "extension");
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+  }
+});
+
+test("loadCatalog: project scope wins over extension scope on name collision", () => {
+  const cwd = tempDir();
+  const savedHome = process.env.HOME;
+  process.env.HOME = tempDir();
+  try {
+    writeDef(
+      path.join(cwd, ".pi", "agents"),
+      "btw.md",
+      "---\nname: btw\ndescription: project override\n---\nproject body\n",
+    );
+    const c = catalog.loadCatalog(cwd);
+    const def = c.agents.get("btw");
+    assertEqual(def.scope, "project", "project overrides the bundled extension def");
+    assertEqual(def.appendSystemPrompt, "project body");
   } finally {
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;

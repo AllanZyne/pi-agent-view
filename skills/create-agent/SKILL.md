@@ -5,10 +5,12 @@ description: Author a new sub-agent definition file for pi-agent-view under .pi/
 
 # Create a sub-agent definition
 
-pi-agent-view discovers sub-agent definitions under two roots:
+pi-agent-view discovers sub-agent definitions under three roots (highest
+priority first):
 
-- `<cwd>/.pi/agents/**/*.md` — **project scope** (checked into the repo, shared with the team; higher priority)
+- `<cwd>/.pi/agents/**/*.md` — **project scope** (checked into the repo, shared with the team; highest priority)
 - `~/.pi/agent/agents/**/*.md` — **user scope** (personal, available in every project; this is `getAgentDir()/agents/`, so it follows `$PI_CODING_AGENT_DIR` if the user has overridden or rebranded it — do not assume the literal `~/.pi/agent/` path without checking)
+- `<pi-agent-view's own install dir>/agents/**/*.md` — **extension scope**, lowest priority. These ship *inside* the pi-agent-view package itself (e.g. `btw`, a read-only Q&A agent) and are the same for every project/user regardless of `cwd` or `$PI_CODING_AGENT_DIR`. This skill only ever writes to project or user scope — never write here; it's for defs bundled with the extension's own source.
 
 Each file is Markdown with YAML frontmatter. The body is *appended* to pi's
 base system prompt (supplement, not replace), so `AGENTS.md`, skills and

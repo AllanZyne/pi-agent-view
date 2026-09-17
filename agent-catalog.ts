@@ -4,9 +4,13 @@
  * Mirrors Claude Code's `.claude/agents/` convention, and the built-in
  * `examples/extensions/subagent`'s own layout:
  *
- *   <cwd>/.pi/agents/**\/*.md        (project scope, higher priority)
+ *   <cwd>/.pi/agents/**\/*.md        (project scope, highest priority)
  *   getAgentDir()/agents/**\/*.md    (user scope; `~/.pi/agent/agents/` by
  *                                     default, or `$PI_CODING_AGENT_DIR/agents/`)
+ *   <this extension's dir>/agents/**\/*.md  (extension scope, lowest priority —
+ *                                     defs shipped inside pi-agent-view itself,
+ *                                     e.g. `btw`; always available regardless
+ *                                     of cwd or `$PI_CODING_AGENT_DIR`)
  *
  * User scope lives under `getAgentDir()`, not bare `~/.pi/`, because `~/.pi/`
  * is the shared root for every pi-branded tool (the coding agent, the RPC
@@ -15,6 +19,11 @@
  * it. A bare `~/.pi/agents/` would sit as a stray sibling of `~/.pi/agent/`
  * instead of inside it, and would silently stop working for anyone who sets
  * `PI_CODING_AGENT_DIR` to relocate or rebrand the coding agent's state.
+ *
+ * Extension scope resolves relative to *this module's own file*, not `cwd`
+ * or any pi config dir, so it travels with the installed package and works
+ * the same in every project. It's lowest priority so a project or user def
+ * can freely override a bundled name.
  *
  * A definition is a Markdown file with YAML frontmatter. The frontmatter
  * declares who the agent is and how it should be spawned; the body is
@@ -32,8 +41,12 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
+
+/** Directory of this module — i.e. this extension's own installed root. */
+const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -48,7 +61,7 @@ export interface SubAgentDef {
   description: string;
   /** Absolute path to the source `.md` file. */
   source: string;
-  scope: "project" | "user";
+  scope: "project" | "user" | "extension";
   /** Markdown body, only when non-empty. Appended to the base system prompt. */
   appendSystemPrompt?: string;
   /** `provider/id`. Undefined means "inherit main's model" at spawn time. */
@@ -83,21 +96,23 @@ export const NAME_RE = /^[a-z][a-z0-9-]*$/;
 
 // ── Loading ────────────────────────────────────────────────────────
 
-/** The two roots pi-agent-view scans, project first (higher priority). */
-export function agentRoots(cwd: string): Array<{ dir: string; scope: "project" | "user" }> {
+/** The three roots pi-agent-view scans, project first (highest priority). */
+export function agentRoots(cwd: string): Array<{ dir: string; scope: "project" | "user" | "extension" }> {
   return [
     { dir: path.join(cwd, ".pi", "agents"), scope: "project" },
     { dir: path.join(getAgentDir(), "agents"), scope: "user" },
+    { dir: path.join(EXTENSION_DIR, "agents"), scope: "extension" },
   ];
 }
 
 /**
- * Force-rescan both scopes and return the merged catalog.
+ * Force-rescan all three scopes and return the merged catalog.
  *
- * Project scope wins on `name` collisions — the user scope entry is dropped
- * silently (a diagnostic would be noisy in the common "same name intentionally
- * overridden" case). The user's original file is still discoverable through
- * `/agents`, which lists source paths.
+ * Earlier scopes win on `name` collisions — project beats user beats
+ * extension — with the loser dropped silently (a diagnostic would be noisy
+ * in the common "same name intentionally overridden" case). The loser's
+ * original file is still discoverable through `/agents`, which lists source
+ * paths.
  */
 export function loadCatalog(cwd: string): Catalog {
   const agents = new Map<string, SubAgentDef>();
@@ -127,7 +142,7 @@ export function loadCatalog(cwd: string): Catalog {
  */
 export function parseDefFile(
   file: string,
-  scope: "project" | "user",
+  scope: "project" | "user" | "extension",
 ): { def: SubAgentDef } | { error: string } {
   let raw: string;
   try {
@@ -142,7 +157,7 @@ export function parseDefFile(
 export function parseDefContent(
   raw: string,
   file: string,
-  scope: "project" | "user",
+  scope: "project" | "user" | "extension",
 ): { def: SubAgentDef } | { error: string } {
   let parsed: { frontmatter: Record<string, unknown>; body: string };
   try {
