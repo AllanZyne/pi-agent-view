@@ -6,7 +6,7 @@
  * (`agent-inspect-tool.ts`, `agent-control-tool.ts`): own name first (an
  * exact picker slug), then def name (picking the most recently touched
  * instance if several share a def). No fuzzy/partial matching — an LLM can
- * always call `agent_inspect` with no `name` first to see the exact list.
+ * call `agent_list` first to discover the exact picker names.
  *
  * Headless: no TUI, no extension context.
  */

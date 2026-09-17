@@ -26,12 +26,19 @@ import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { assistantText, getAgent, resolveModelSearch, runAgent, runAgentAndWait, type LiveAgent } from "./agent-runtime.ts";
 import { loadCatalog, type SubAgentDef } from "./agent-catalog.ts";
-import { agentName, listAgentEntries, registerAgent, resolveRoot } from "./storage.ts";
+import {
+  agentName,
+  assertAgentCapacity,
+  listAgentEntries,
+  MAX_AGENTS_PER_SESSION,
+  registerAgent,
+  resolveRoot,
+} from "./storage.ts";
 
 const MAX_TASKS = 8;
 
 const MODEL_DESCRIPTION =
-  "Model to run this sub-agent on: a full provider/id, a bare id, or any short case-insensitive substring that uniquely matches one available model's id (e.g. 'opus', 'haiku', 'sonnet') — a small/cheap model for a fast, narrow check versus a large/capable model for a deep pass. Overrides both the def's own model and this session's model. Omit to inherit the def's model (if any) or this session's model.";
+  "Model to run this sub-agent on: a full provider/id, a bare id, or any short case-insensitive substring that uniquely matches one available model's id (e.g. 'opus', 'haiku', 'sonnet'). Overrides both the def's own model and this session's model. Omit to inherit the def's model (if any) or this session's model.";
 
 const TaskItem = Type.Object({
   agent: Type.Optional(
@@ -93,9 +100,10 @@ export const agentCreateTool = defineTool({
   label: "Agent create",
   description: [
     "Delegate one or more tasks to sub-agents that run concurrently in this process, each with its own isolated context window.",
+    `A root session may retain at most ${MAX_AGENTS_PER_SESSION} sub-agents across all delegation depths.`,
     "Single mode: { task } or { agent, task }. Parallel mode: { tasks: [{ agent?, task, model? }, ...] } — all entries run at the same time.",
     "`agent` selects a def from .pi/agents/ or ~/.pi/agent/agents/ (list them with /agents); omit it for a plain agent that inherits this session's model and default tools.",
-    "`model` picks which model runs that sub-agent, e.g. a small/cheap model for a fast, narrow check (eligibility, a quick summary, scoring one issue) versus a large/capable model for a deep review pass — mix cheap and expensive sub-agents in the same `tasks` array to control cost and latency per task. Overrides the def's own model when both are given. Omit to inherit the def's model, or this session's model.",
+    "`model` selects the model and overrides the def's model when both are given; omit it to inherit the def's model, or this session's model.",
     "Use this to *create* a sub-agent. To message, inspect, or delete an *existing* one by name, use `agent_send` / `agent_inspect` / `agent_remove` instead.",
     "Every spawned agent is a live entry in this extension's agent picker (press Left) for as long as it lives, so a human can attach, watch it stream, or steer it while this call is in flight.",
     "By default this call waits for every task to finish and returns each sub-agent's final response. Set `wait: false` to fire-and-forget instead — spawn and return immediately without blocking this turn, then use `agent_inspect`/`agent_send` afterward to check on or continue any of them.",
@@ -173,6 +181,20 @@ export const agentCreateTool = defineTool({
             text: `${modelErrors.join("; ")}. Use provider/id, or a shorter unique substring (see /model).`,
           },
         ],
+        isError: true,
+      };
+    }
+
+    // Re-check immediately before the synchronous registration block. Model
+    // resolution above awaits, so another agent_create call may have consumed
+    // slots since this call began. Checking the whole batch here keeps this
+    // request all-or-none; registerAgent also enforces the limit defensively
+    // for direct picker creation and other callers.
+    try {
+      assertAgentCapacity(root, requested.length);
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
         isError: true,
       };
     }

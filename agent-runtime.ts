@@ -22,6 +22,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Model, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { SubAgentDef } from "./agent-catalog.ts";
+import { AGENT_POLICY } from "./agent-policy.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -148,11 +149,11 @@ interface Registry {
   onChange?: (file?: string) => void;
   /**
    * Tool definitions handed to every sub-agent's `createAgentSession()` as
-   * `customTools`, so it has the same `agent_create`/`agent_inspect`/`agent_send`/
-   * `agent_remove` capability main does — recursive delegation to any
-   * depth. Set once at extension activation (see `setManagedTools`); a
-   * missing value (extension not yet activated, or an older build) just
-   * means "no managed tools", not a crash.
+   * `customTools`, so it has the same `agent_create`/`agent_list`/
+   * `agent_inspect`/`agent_send`/`agent_remove` capability main does — recursive
+   * delegation to any depth. Set once at extension activation (see
+   * `setManagedTools`); a missing value (extension not yet activated, or an
+   * older build) just means "no managed tools", not a crash.
    */
   managedTools?: ToolDefinition[];
 }
@@ -799,11 +800,10 @@ export async function ensureAgent(
       cwd,
       agentDir: getAgentDir(),
       noExtensions: true,
-      // A def's Markdown body is *appended* to pi's base system prompt, so
-      // AGENTS.md, skills, prompt templates etc. still load — the def
-      // supplements, it does not replace. Undefined leaves the loader with
-      // pi's default behaviour, exactly like a plain agent.
-      ...(def?.appendSystemPrompt ? { appendSystemPrompt: [def.appendSystemPrompt] } : {}),
+      // The shared delegation policy applies to every sub-agent. A def's body
+      // follows it as a specialization; both supplement (rather than replace)
+      // pi's base system prompt, AGENTS.md, skills, and other context.
+      appendSystemPrompt: [AGENT_POLICY, ...(def?.appendSystemPrompt ? [def.appendSystemPrompt] : [])],
     });
     await loader.reload();
 

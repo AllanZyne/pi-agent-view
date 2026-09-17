@@ -6,6 +6,7 @@
  */
 
 import "./unit.storage.mjs";
+import "./unit.agent-tools.mjs";
 import "./unit.view-model.mjs";
 import "./unit.transcript-view.mjs";
 import "./unit.tool-renderers.mjs";

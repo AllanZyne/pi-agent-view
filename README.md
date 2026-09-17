@@ -25,8 +25,6 @@ agent keeps working while you look at another one.
   Completed (1)
      ✓ update-the-unit-tests
        9 msgs · claude-sonnet-4-5   Updated 12 test files.
-  ──────────────────────────────────────────────────────────
-  ↑↓ select · ⏎ attach · type+⏎ new agent · ctrl+x delete · ← close · ? help
 ```
 
 ## Install
@@ -42,9 +40,9 @@ pi install git:github.com/AllanZyne/pi-agent-view
 | `←` | open/close the agent list (empty prompt only) |
 | `↑` `↓` | move the selection (empty prompt only) |
 | `Enter` / `→` | attach to the selected agent |
-| `Enter` + text | list open: new agent with that first prompt · attached: steer the agent |
+| `Enter` + text | list open: new agent with exactly that first prompt, then attach immediately · attached: steer the agent |
 | `Esc` | detach — back to `main`, the agent keeps running |
-| `Ctrl+X` | delete that agent outright — abort its turn, drop its session and erase its record (on `main`: pi's interrupt) |
+| `Ctrl+X` | on an agent, press twice within 2 seconds to delete it outright; on `main`, interrupt |
 | `Ctrl+L` | model selector for the agent you are looking at |
 | `Ctrl+P` / `Shift+Ctrl+P` | cycle the attached agent's model |
 | `?` | help |
@@ -60,17 +58,18 @@ tool itself:
 
 ```
 @reviewer take a look at this diff        → agent_create
+what agents are available?                 → agent_list
+search the reviewer's auth findings         → agent_inspect (regex search)
 tell the reviewer to also check auth.ts    → agent_send
-how's the reviewer doing?                  → agent_inspect
 kill the reviewer, it's stuck              → agent_remove
 ```
 
 Typing `@` opens a discovery picker that inserts `@<name> ` at the cursor —
 it's just a convenience for referring to an agent by name in your message.
 
-Four tools, one per intent, so the model expresses intent by *which tool it
+Five tools, one per intent, so the model expresses intent by *which tool it
 calls* rather than arguments a tool would have to guess from. **Every
-agent gets all four** — including sub-agents themselves, via `customTools`
+agent gets all five** — including sub-agents themselves, via `customTools`
 (`agent-runtime.ts`) — so delegation nests to any depth. Agents are peers:
 no parent/child tracking, and removing one never cascades to anything it
 spawned.
@@ -83,11 +82,18 @@ spawned.
   most recent instance), reviving it if needed. Fire-and-forget by
   default; `wait: true` waits for the response. Never creates — errors if
   `name` is unknown.
-- **`agent_inspect`** — read-only: state, model, task, recent activity,
-  latest output (or `full: true` for the whole transcript), even mid-turn.
-  Omit `name` to list every sub-agent.
+- **`agent_list`** — list every sub-agent's name, model, and state, plus the
+  root session's used/available slots. Use it to find an agent to reuse.
+- **`agent_inspect`** — inspect one agent's compact status, page through a
+  bounded window of its user/assistant turns, or search its chat with a regular
+  expression. It never returns an unbounded full transcript.
 - **`agent_remove`** — delete outright, irreversibly. `main` can never be
   targeted.
+- A root session can retain at most **32 sub-agents**, shared across every
+  delegation depth. Completed, failed, stopped, and idle agents still occupy a
+  slot; `agent_remove` frees it. Prefer `agent_list` + `agent_send` to reuse a
+  suitable agent, and remove agents created only for one-off work after their
+  results have been collected.
 
 ## Sub-agent definitions (`.pi/agents/`)
 
@@ -178,9 +184,15 @@ would just produce a notice.
   is a fixed pane, and an oversized one squeezes the transcript to a single
   line and then gets cut off): long lists scroll inside the widget with
   `↑ N more` / `↓ N more` markers instead of growing past the screen.
-- `Ctrl+X` is a hard delete, not a pause: the agent's turn is aborted, its
-  manifest entry removed and its `.jsonl` erased. There is nothing left to
-  revive afterward. If you were attached to it, you land back on `main`.
+- `Ctrl+X` is a confirmed hard delete, not a pause: press it twice on the same
+  agent within 2 seconds. While confirmation is armed, that row shows the
+  second-press instruction. Deletion aborts the turn, removes the manifest entry
+  and erases the `.jsonl`; there is nothing left to revive afterward. If you
+  were attached to it, you land back on `main`. `Ctrl+X` on `main` remains an
+  immediate interrupt.
+- Typing a prompt while the list is open creates a plain agent, passes exactly
+  that text as its task (without conversation context), and immediately opens
+  the new agent's view.
 
 ## Notices, scrolling, and what a switch costs
 

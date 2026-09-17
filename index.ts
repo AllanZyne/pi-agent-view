@@ -34,17 +34,17 @@
  *   ├────────────────────────────┤
  *   │ ◆ Agents (picker widget)   │  ← only while the picker is open
  *   ├──────────────── ◆ main ────┤  ← current view, on the editor frame
- *   │ editor  /  footer          │
+ *   │ editor                     │
  *   └────────────────────────────┘
  *
  * Keys
  *   ←              open/close the agent picker (empty editor only)
  *   ↑ ↓            move selection (empty editor only)
  *   Enter / →      attach: stream that agent into the transcript
- *   Enter + text   picker open: spawn a background agent with that prompt
+ *   Enter + text   picker open: create and attach to an agent with that prompt
  *                  attached:    steer the attached agent
  *   Esc            detach (agent keeps running)
- *   Ctrl+X         delete that agent outright (main session: interrupt its turn)
+ *   Ctrl+X         agent: press twice within 2s to delete; main: interrupt
  *   Ctrl+L         model selector for the conversation on screen
  *   Ctrl+P         cycle the attached agent's model
  *   ?              help
@@ -63,12 +63,14 @@
  *   (main, or an attached agent — every agent gets the same tools) decides
  *   from context what to do and calls the tool that matches:
  *     `agent_create`      — create one or more sub-agents, wait for them
- *     `agent_inspect`     — read a sub-agent's state/output, non-blocking
+ *     `agent_list`        — list available sub-agents and slot usage
+ *     `agent_inspect`     — inspect one sub-agent's status/conversation
  *     `agent_send`        — message an existing sub-agent by name
  *     `agent_remove`      — delete a sub-agent outright (never `main`)
- *   See agent-create-tool.ts / agent-inspect-tool.ts / agent-control-tool.ts and
- *   README "LLM-callable tools". Because every agent has the same four
- *   tools, delegation nests to any depth — a sub-agent can spawn its own.
+ *   See agent-create-tool.ts / agent-list-tool.ts / agent-inspect-tool.ts /
+ *   agent-control-tool.ts and README "LLM-callable tools". Because every
+ *   agent has the same five tools, delegation nests to any depth — a sub-agent
+ *   can spawn its own.
  *
  *   Typing `@` at the start of the message still opens an agent picker
  *   (autocomplete convenience only, purely cosmetic — inserts `@<name> `);
@@ -123,14 +125,12 @@ import {
   modelOf,
   readTranscript,
   runAgent,
-  seedTranscript,
   setAgentModel,
   setManagedTools,
   setOnChange,
   sharedModelRuntime,
   stateOf,
   steerAgent,
-  summarizeContext,
   type TranscriptItem,
 } from "./agent-runtime.ts";
 import {
@@ -143,11 +143,13 @@ import {
   type RootCtx,
 } from "./storage.ts";
 import { loadCatalog, type Catalog, type SubAgentDef } from "./agent-catalog.ts";
+import { AGENT_POLICY } from "./agent-policy.ts";
 import { type LiveAgentInfo } from "./at-mention.ts";
 import { wrapWithAgentMentions } from "./autocomplete.ts";
 import { findChatContainer, installChatFilter, isOwnedChild, type RenderNode } from "./transcript-view.ts";
 import { initMarkdownTransformers, initToolRenderers, mermaidTransformerFactory, toolRenderersFor } from "./tool-renderers.ts";
 import { registerAgentCreateTool, agentCreateTool } from "./agent-create-tool.ts";
+import { registerAgentListTool, agentListTool } from "./agent-list-tool.ts";
 import { registerAgentInspectTool, agentInspectTool } from "./agent-inspect-tool.ts";
 import { registerAgentControlTools, agentSendTool, agentRemoveTool } from "./agent-control-tool.ts";
 import {
@@ -230,6 +232,9 @@ export interface ViewState extends MirrorState, Selection {
   piChildOwner?: WeakMap<object, string>;
   /** Stops the current editor's agent working spinner. */
   stopStatus?: () => void;
+  /** Agent waiting for a second Ctrl+X before its deletion deadline. */
+  pendingDeleteKey?: string;
+  pendingDeleteUntil?: number;
 }
 
 const VIEW_KEY = "__piAgentViewsState";
@@ -651,6 +656,8 @@ function clip(s: string, n: number): string {
 
 /** Border characters kept to the right of the editor's view label. */
 const LABEL_TAIL = 4;
+/** Time allowed between the two Ctrl+X presses for irreversible deletion. */
+export const DELETE_CONFIRM_MS = 2_000;
 
 /**
  * Lines the dock keeps for itself around the picker widget: one line of
@@ -675,19 +682,16 @@ export function pickerBudget(): number {
  * How many agent rows fit in that budget.
  *
  * Each row costs two lines (name + meta), and the frame around them costs about
- * five (title, two rules, the key hints, one group header). Used for rendering
- * *and* for scrolling, so the cursor can never sit outside the drawn window.
+ * three (title, rule, one group header). Used for rendering and for scrolling,
+ * so the cursor can never sit outside the drawn window.
  */
 function viewportRows(): number {
-  return Math.max(1, Math.floor((pickerBudget() - 5) / 2));
+  return Math.max(1, Math.floor((pickerBudget() - 3) / 2));
 }
 
-/** Never exceed the budget, and never drop the closing rule + key hints. */
+/** Never exceed the budget. */
 function fitToBudget(out: string[]): string[] {
-  const budget = pickerBudget();
-  if (out.length <= budget) return out;
-  const tail = out.slice(-2);
-  return [...out.slice(0, Math.max(0, budget - tail.length)), ...tail];
+  return out.slice(0, pickerBudget());
 }
 
 export function renderPicker(view: ViewState, th: Theme, width: number): string[] {
@@ -701,9 +705,9 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
     for (const [k, d] of [
       ["↑ ↓", "Select agent"],
       ["Enter / →", "Attach: stream it into the transcript"],
-      ["Enter + text", "Background spawn (picker) · steer / @-route (attached)"],
+      ["Enter + text", "Create an agent with exactly that task and attach"],
       ["Esc", "Detach (agent keeps running)"],
-      ["Ctrl+X", "Delete that agent outright (main: interrupt the turn)"],
+      ["Ctrl+X", "Press twice within 2s to delete (main: interrupt)"],
       ["/model [name]", "Set that agent's model (Ctrl+L when attached)"],
       ["←", "Close the picker (reopen to refresh the list)"],
       ["@agent <task>", "Spawn a background agent (inherits main)"],
@@ -712,7 +716,6 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
     ] as const) {
       out.push(truncateToWidth(`    ${th.fg("accent", k.padEnd(15))}${th.fg("text", d)}`, width));
     }
-    out.push(truncateToWidth(`  ${th.fg("dim", "? to close help")}`, width));
     return fitToBudget(out);
   }
 
@@ -764,9 +767,12 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
     const tags = row.isAttached ? th.fg("success", " (attached)") : "";
     out.push(truncateToWidth(`${pointer}${icon} ${nameStr}${badge}${tags}`, width));
 
-    const meta = th.fg("muted", `${row.messageCount} msg${row.messageCount === 1 ? "" : "s"}`);
-    const model = row.model ? th.fg("dim", ` · ${clip(row.model, 28)}`) : "";
-    const summary = row.summary ? th.fg("dim", `  ${clip(row.summary, Math.max(10, width - 24))}`) : "";
+    const deleting = row.key === view.pendingDeleteKey && (view.pendingDeleteUntil ?? 0) > Date.now();
+    const meta = deleting
+      ? th.fg("error", "Press Ctrl+X again within 2s to delete")
+      : th.fg("muted", `${row.messageCount} msg${row.messageCount === 1 ? "" : "s"}`);
+    const model = !deleting && row.model ? th.fg("dim", ` · ${clip(row.model, 28)}`) : "";
+    const summary = !deleting && row.summary ? th.fg("dim", `  ${clip(row.summary, Math.max(10, width - 24))}`) : "";
     out.push(truncateToWidth(`     ${meta}${model}${summary}`, width));
   }
 
@@ -774,13 +780,6 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
     out.push(truncateToWidth(th.fg("dim", `  ↓ ${view.rows.length - end} more`), width));
   }
 
-  out.push(truncateToWidth(`  ${rule}`, width));
-  out.push(
-    truncateToWidth(
-      `  ${th.fg("dim", "↑↓ select · ⏎ attach · type+⏎ new agent · /model · ctrl+x abort · ← close · ? help")}`,
-      width,
-    ),
-  );
   return fitToBudget(out);
 }
 
@@ -792,7 +791,7 @@ type Action =
   | { t: "help" }
   | { t: "attach"; key: string }
   | { t: "detach" }
-  | { t: "spawn"; prompt: string; fromAttached?: string }
+  | { t: "spawn"; prompt: string }
   | { t: "steer"; key: string; text: string }
   | { t: "model"; key: string; search?: string }
   | { t: "cycleModel"; key: string; direction: "forward" | "backward" }
@@ -1191,6 +1190,8 @@ class AgentViewEditor extends CustomEditor {
       view.selected = next.selected;
       view.scroll = next.scroll;
       view.key = next.key;
+      view.pendingDeleteKey = undefined;
+      view.pendingDeleteUntil = undefined;
       view.refresh?.();
       return;
     }
@@ -1215,7 +1216,7 @@ class AgentViewEditor extends CustomEditor {
         // if you want to message/query/delete an *existing* agent by name,
         // that now goes through main's `agent_send` / `agent_inspect` /
         // `agent_remove` tools instead (see README "LLM-callable tools").
-        this.act({ t: "spawn", prompt: text, fromAttached: view.attached });
+        this.act({ t: "spawn", prompt: raw });
       } else {
         const row = this.row();
         if (row) this.act(row.isRoot ? { t: "detach" } : { t: "attach", key: row.key });
@@ -1240,23 +1241,32 @@ export default function agentViews(pi: ExtensionAPI): void {
   // factory must never run inside an agent session being constructed.
   if (isLoadingSubAgent()) return;
 
+  // Main loads this extension and receives the shared policy per turn.
+  // Sub-agents run with noExtensions and receive the same file through their
+  // DefaultResourceLoader in agent-runtime.ts.
+  pi.on("before_agent_start", (event) => ({
+    systemPrompt: `${event.systemPrompt}\n\n${AGENT_POLICY}`,
+  }));
+
   // The `@<slug>` picker used to be a human-only affordance; now every
   // agent (main and every sub-agent — see `setManagedTools` below) gets the
-  // same four tools, so delegation/inspection/messaging/deletion are all
-  // just tool calls, decided by whichever LLM is looking at the message.
+  // same five tools, so delegation/discovery/inspection/messaging/deletion
+  // are all just tool calls, decided by whichever LLM is looking at the message.
   registerAgentCreateTool(pi);
+  registerAgentListTool(pi);
   registerAgentInspectTool(pi);
   registerAgentControlTools(pi);
   // Sub-agents are built with `noExtensions: true` (see `ensureAgent` in
   // agent-runtime.ts), so they never load this extension and never call
   // `pi.registerTool` themselves. `customTools` is how they get these same
-  // four anyway — set once here, read by every `ensureAgent()` call from
+  // five anyway — set once here, read by every `ensureAgent()` call from
   // then on, for any agent at any depth.
-  setManagedTools([agentCreateTool, agentInspectTool, agentSendTool, agentRemoveTool]);
+  setManagedTools([agentCreateTool, agentListTool, agentInspectTool, agentSendTool, agentRemoveTool]);
 
   const view = getView();
   /** Captured from the (invisible) tick widget so components can request renders. */
   let tui: TUI | undefined;
+  let deleteTimer: ReturnType<typeof setTimeout> | undefined;
   /** Refreshed on every session start, like pi refreshes its own render settings. */
   let renderSettings = defaultRenderSettings();
 
@@ -1477,7 +1487,15 @@ export default function agentViews(pi: ExtensionAPI): void {
     }
   }
 
+  function clearDeleteConfirmation(): void {
+    if (deleteTimer) clearTimeout(deleteTimer);
+    deleteTimer = undefined;
+    view.pendingDeleteKey = undefined;
+    view.pendingDeleteUntil = undefined;
+  }
+
   function closePicker(ctx: ExtensionContext): void {
+    clearDeleteConfirmation();
     view.open = false;
     view.showHelp = false;
     ctx.ui.setWidget("agent-view", undefined);
@@ -1531,6 +1549,7 @@ export default function agentViews(pi: ExtensionAPI): void {
       reloadRows(ctx);
     }
     view.showHelp = false;
+    clearDeleteConfirmation();
     view.open = true;
 
     ctx.ui.setWidget("agent-view", (_tui, theme) => ({
@@ -1581,6 +1600,39 @@ export default function agentViews(pi: ExtensionAPI): void {
   }
 
   /**
+   * Ctrl+X is immediate for main's interrupt, but irreversible agent deletion
+   * must be confirmed by a second press on the same agent within a short window.
+   */
+  function requestTerminate(ctx: ExtensionContext, file: string): void {
+    if (file === ctx.sessionManager.getSessionFile()) {
+      clearDeleteConfirmation();
+      void terminate(ctx, file);
+      return;
+    }
+
+    const now = Date.now();
+    if (view.pendingDeleteKey === file && (view.pendingDeleteUntil ?? 0) >= now) {
+      clearDeleteConfirmation();
+      void terminate(ctx, file);
+      return;
+    }
+
+    clearDeleteConfirmation();
+    const deadline = now + DELETE_CONFIRM_MS;
+    view.pendingDeleteKey = file;
+    view.pendingDeleteUntil = deadline;
+    if (!view.open) notify(ctx, `Press Ctrl+X again within 2 seconds to delete ${nameOf(file)}`, "warning");
+    view.refresh?.();
+    tui?.requestRender();
+    deleteTimer = setTimeout(() => {
+      if (view.pendingDeleteKey !== file || view.pendingDeleteUntil !== deadline) return;
+      clearDeleteConfirmation();
+      view.refresh?.();
+      tui?.requestRender();
+    }, DELETE_CONFIRM_MS);
+  }
+
+  /**
    * Ctrl+X. On the main session this is pi's interrupt; on an agent it is a
    * hard delete: the turn is aborted, the session dropped, its manifest entry
    * removed and its `.jsonl` erased from disk. Unlike a stopped agent, there
@@ -1608,39 +1660,11 @@ export default function agentViews(pi: ExtensionAPI): void {
   }
 
   /**
-   * The tail of the conversation `@<slug>` was typed into — the attached
-   * agent's transcript, or main's own session when nothing is attached.
-   * Handed to `spawn` so a freshly-created agent isn't dropped into a task
-   * with zero background: it sees a few of the turns that led up to it
-   * being summoned, the same way a human would fill someone in before
-   * handing off work.
+   * Create a new plain agent from the picker and immediately show it.
+   * The user's text is the complete task: this direct UI gesture deliberately
+   * does not prepend context from main or from the previously attached agent.
    */
-  function spawnContext(ctx: ExtensionContext, fromAttached?: string): string {
-    const items = fromAttached ? readTranscript(fromAttached) : seedTranscript(ctx.sessionManager);
-    return summarizeContext(items);
-  }
-
-  /**
-   * Create a new agent and hand it the prompt. Returns as soon as the turn is
-   * queued: the session you are in is never blocked or interrupted.
-   *
-   * Only reachable from the picker's own Enter+text gesture now (a plain
-   * adhoc agent, no def, no forced model) — anything more targeted goes
-   * through the LLM-callable tools instead (`agent_create`, in particular, for
-   * def-backed / model-forced spawns).
-   *
-   * `contextFrom` is the file of the agent whose recent transcript should be
-   * summarized and prepended to `prompt` (see `spawnContext`) — omit it to
-   * pull context from main's own session instead of an attached agent's. The
-   * agent's *name* is still derived from the bare `prompt`, so the picker
-   * slug stays short and readable instead of being built from the context
-   * blob.
-   */
-  async function spawn(
-    ctx: ExtensionContext,
-    prompt: string,
-    options: { attach: boolean; contextFrom?: string },
-  ): Promise<string | undefined> {
+  async function spawn(ctx: ExtensionContext, prompt: string): Promise<string | undefined> {
     const root = rootOf(ctx);
     if (!root) {
       notify(ctx, "Agents need a saved session", "error");
@@ -1649,20 +1673,18 @@ export default function agentViews(pi: ExtensionAPI): void {
 
     const existing = listAgentEntries(root, (f) => getAgent(f) !== undefined);
     const name = agentName(prompt, existing.map((a) => a.name));
-    const file = registerAgent(root, name, ctx.cwd);
-    const context = spawnContext(ctx, options.contextFrom);
-    const task = context
-      ? `Context from the conversation this task was spawned from (for background only — you were not part of it):\n\n${context}\n\n---\n\nYour task:\n${prompt}`
-      : prompt;
+    let file: string | undefined;
     try {
-      await runAgent(file, task, ctx.cwd, ctx.model, ctx.thinkingLevel);
+      file = registerAgent(root, name, ctx.cwd);
+      await runAgent(file, prompt, ctx.cwd, ctx.model, ctx.thinkingLevel);
     } catch (err) {
+      // A registered agent may not have a session file yet. Remove its manifest
+      // entry as well so a failed one-off start does not consume a slot.
+      if (file) removeAgentEntry(root, file);
       notify(ctx, `Could not start agent: ${String(err)}`, "error");
       return undefined;
     }
-    if (options.attach) await attach(ctx, file);
-    // A new agent changes the list; only rebuild it if it is on screen.
-    else refreshRowsIfOpen(ctx);
+    await attach(ctx, file);
     return file;
   }
 
@@ -1815,6 +1837,7 @@ export default function agentViews(pi: ExtensionAPI): void {
 
   pi.on("session_start", (event, ctx) => {
     if (ctx.mode !== "tui") return;
+    clearDeleteConfirmation();
 
     // A reload rebuilds the extension runtime but keeps the session, its chat
     // container and everything already mirrored into it, so the view survives:
@@ -1900,6 +1923,13 @@ export default function agentViews(pi: ExtensionAPI): void {
      */
     const viewStatus = (): ViewStatus => {
       const file = view.attached;
+      if (view.open) {
+        return {
+          label: ` ◆ ${file ? nameOf(file) : ROOT_AGENT_NAME} `,
+          working: false,
+          ownStatus: true,
+        };
+      }
       return {
         label: ` ◆ ${file ? nameOf(file) : ROOT_AGENT_NAME} `,
         working: file ? stateOf(file) === "working" : !ctx.isIdle(),
@@ -1930,23 +1960,10 @@ export default function agentViews(pi: ExtensionAPI): void {
             detach();
             break;
           case "spawn":
-            // Explicit UI gesture from the picker (Enter+text with the list
-            // open): always a plain adhoc agent, background, no auto-attach.
-            // The user's current conversation stays put; the new sibling
-            // appears in the picker on next `←`. A toast confirms where it
-            // went. Anything more targeted (message/query/delete an
-            // *existing* agent by name) is now the calling LLM's job via
-            // `agent_send` / `agent_inspect` / `agent_remove`, not this key.
-            void spawn(ctx, action.prompt, { attach: false, contextFrom: action.fromAttached }).then((file) => {
-              if (!file) return;
-              const target = `@${nameOf(file)}`;
-              if (action.fromAttached && action.fromAttached !== file) {
-                const current = `@${nameOf(action.fromAttached)}`;
-                notify(ctx, `Started ${target} in the background · ${current} keeps working`, "info");
-              } else {
-                notify(ctx, `Started ${target} in the background`, "info");
-              }
-            });
+            // Direct picker creation switches straight into the new agent. The
+            // prompt is passed through verbatim by spawn(), with no inherited
+            // conversation context.
+            void spawn(ctx, action.prompt);
             break;
           case "steer":
             void steerAgent(action.key, action.text).then((ok) => {
@@ -1961,7 +1978,7 @@ export default function agentViews(pi: ExtensionAPI): void {
             void cycleModel(ctx, action.key, action.direction);
             break;
           case "terminate":
-            void terminate(ctx, action.key);
+            requestTerminate(ctx, action.key);
             break;
           case "blockedCommand":
             notify(ctx, `/${action.name} isn't available while attached to an agent — detach (Esc) first`, "warning");
@@ -1998,6 +2015,7 @@ export default function agentViews(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", (event, ctx) => {
+    clearDeleteConfirmation();
     view.open = false;
     view.attached = undefined;
     view.mirrored = {};

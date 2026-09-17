@@ -10,7 +10,7 @@
 
 import { assert, assertEqual, load, test } from "./harness.mjs";
 
-const { renderPicker, pickerBudget } = await load("index.ts");
+const { renderPicker, pickerBudget, DELETE_CONFIRM_MS } = await load("index.ts");
 
 /** Theme stand-in: styling is irrelevant here, layout is not. */
 const th = { fg: (_c, text) => text, bold: (text) => text };
@@ -47,10 +47,21 @@ test("the picker never draws more lines than pi's dock can give it", () => {
   );
 });
 
-test("the key hint line survives even when the list has to be cut", () => {
-  const many = Array.from({ length: 60 }, (_, i) => row(`agent-${i}`, "working"));
-  const lines = renderPicker(view(many), th, 100);
-  assert(lines[lines.length - 1].includes("attach"), `last line is the hint: ${JSON.stringify(lines.at(-1))}`);
+test("the picker has no footer", () => {
+  const lines = renderPicker(view([row("agent", "idle")]), th, 100);
+  assert(!lines.some((line) => line.includes("attach") || line.includes("ctrl+x")), JSON.stringify(lines));
+  assert(!lines.at(-1).includes("────"), `no closing footer rule: ${JSON.stringify(lines.at(-1))}`);
+});
+
+test("an armed deletion is shown on the target row", () => {
+  const rows = [row("doomed", "idle"), row("safe", "idle")];
+  const lines = renderPicker(
+    view(rows, { pendingDeleteKey: "doomed", pendingDeleteUntil: Date.now() + DELETE_CONFIRM_MS }),
+    th,
+    100,
+  );
+  assert(lines.some((line) => line.includes("Ctrl+X again within 2s")), JSON.stringify(lines));
+  assertEqual(lines.filter((line) => line.includes("Ctrl+X again within 2s")).length, 1, "only target is armed");
 });
 
 test("help fits the budget too", () => {

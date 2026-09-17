@@ -45,6 +45,9 @@ export interface RootCtx {
 
 export const AGENTS_DIR = "__agents__";
 
+/** Hard safety limit shared by every descendant of one root session. */
+export const MAX_AGENTS_PER_SESSION = 32;
+
 export const groupDir = (sessionDir: string, rootId: string): string =>
   path.join(sessionDir, AGENTS_DIR, rootId);
 
@@ -147,6 +150,26 @@ function letterSuffix(n: number): string {
   return letter.repeat(1 + Math.floor(n / 26));
 }
 
+/** Number of occupied agent slots for this root, including completed/stopped agents. */
+export function agentCount(root: RootCtx): number {
+  return loadManifest(root.sessionDir, root.rootId)?.agents.length ?? 0;
+}
+
+/**
+ * Reject a create request that would exceed the root session's shared limit.
+ * Check the whole batch before registering any member so creation is all-or-none.
+ */
+export function assertAgentCapacity(root: RootCtx, requested = 1): void {
+  const current = agentCount(root);
+  if (current + requested <= MAX_AGENTS_PER_SESSION) return;
+  const available = Math.max(0, MAX_AGENTS_PER_SESSION - current);
+  throw new Error(
+    `Agent limit reached: this session has ${current}/${MAX_AGENTS_PER_SESSION} agents, ` +
+      `but ${requested} were requested (${available} slot${available === 1 ? "" : "s"} available). ` +
+      "Reuse an existing agent with agent_send, or delete completed one-off agents with agent_remove.",
+  );
+}
+
 /**
  * Create an agent session file and record it in the manifest.
  *
@@ -154,6 +177,9 @@ function letterSuffix(n: number): string {
  * once it holds an assistant message.
  */
 export function registerAgent(root: RootCtx, name: string, cwd: string, def?: string): string {
+  // Every creation path (LLM tool and direct picker gesture) passes here. The
+  // tool also checks its whole batch up front to avoid partial creation.
+  assertAgentCapacity(root);
   const dir = groupDir(root.sessionDir, root.rootId);
   fs.mkdirSync(dir, { recursive: true });
   const sm = SessionManager.create(cwd, dir, { parentSession: root.rootFile });

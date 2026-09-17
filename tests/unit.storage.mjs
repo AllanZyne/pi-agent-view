@@ -122,6 +122,34 @@ test("listAgentEntries hides deleted agents but keeps live ones", () => {
   );
 });
 
+test("the root session agent limit is all-or-none and removal frees a slot", () => {
+  const dir = tempDir();
+  const rootFile = path.join(dir, "root.jsonl");
+  fs.writeFileSync(rootFile, "");
+  const root = { rootId: "root-limit", rootFile, sessionDir: dir };
+  const agents = Array.from({ length: storage.MAX_AGENTS_PER_SESSION }, (_, i) => ({
+    id: `id-${i}`,
+    name: `agent-${i}`,
+    file: path.join(dir, `agent-${i}.jsonl`),
+    createdAt: new Date().toISOString(),
+  }));
+  storage.saveManifest(dir, { rootId: root.rootId, rootFile, agents });
+
+  assertEqual(storage.agentCount(root), storage.MAX_AGENTS_PER_SESSION, "all manifest entries occupy slots");
+  let message = "";
+  try {
+    storage.assertAgentCapacity(root, 1);
+  } catch (err) {
+    message = String(err);
+  }
+  assert(message.includes("Agent limit reached"), "capacity check explains the limit");
+  assertEqual(storage.agentCount(root), storage.MAX_AGENTS_PER_SESSION, "a rejected request creates nothing");
+
+  storage.removeAgentEntry(root, agents[0].file);
+  assertEqual(storage.agentCount(root), storage.MAX_AGENTS_PER_SESSION - 1, "removal frees one slot");
+  storage.assertAgentCapacity(root, 1);
+});
+
 // ── Naming ─────────────────────────────────────────────────────────
 
 test("agentName slugifies the first prompt to letters and hyphens", () => {

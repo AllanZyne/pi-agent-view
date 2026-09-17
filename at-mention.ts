@@ -4,9 +4,9 @@
  * `@name` used to be a client-side routing operator with its own priority
  * order, position rule, and backslash/backtick/quote escaping (see git
  * history / README for the old design). That's gone: every agent now gets
- * the same LLM-callable tools (`agent_create`, `agent_inspect`, `agent_send`,
- * `agent_remove`), so whichever conversation you're talking to decides
- * from the message's *content* what `@name` means and calls the matching
+ * the same LLM-callable tools (`agent_create`, `agent_list`, `agent_inspect`,
+ * `agent_send`, `agent_remove`), so whichever conversation you're talking to
+ * decides from the message's *content* what `@name` means and calls the matching
  * tool itself — no client-side parsing, no escaping needed.
  *
  * All that's left here is `atTokenAtCursor`: purely cosmetic autocomplete
