@@ -38,35 +38,41 @@ import {
 const MAX_TASKS = 8;
 
 const MODEL_DESCRIPTION =
-  "Model to run this sub-agent on: a full provider/id, a bare id, or any short case-insensitive substring that uniquely matches one available model's id (e.g. 'opus', 'haiku', 'sonnet'). Overrides both the def's own model and this session's model. Omit to inherit the def's model (if any) or this session's model.";
+  "Model to run this sub-agent on: a full provider/id, a bare id, or any short case-insensitive substring that uniquely matches one available model's id (e.g. 'opus', 'haiku', 'sonnet'). Overrides both the template's default model and this session's model. Omit to inherit the template's model (if any) or this session's model.";
 
-const TaskItem = Type.Object({
-  agent: Type.Optional(
-    Type.String({
-      description:
-        "Name of a sub-agent def from .pi/agents/ or ~/.pi/agent/agents/ (see /agents). Omit for a plain adhoc agent that inherits this session's model.",
-    }),
-  ),
-  task: Type.String({ description: "The task/prompt to send to this sub-agent." }),
-  model: Type.Optional(Type.String({ description: MODEL_DESCRIPTION })),
-});
+const TaskItem = Type.Object(
+  {
+    template: Type.Optional(
+      Type.String({
+        description:
+          "ID of an agent template from .pi/agents/ or ~/.pi/agent/agents/ (discover them with agent_list or /agents). Omit for an instance without a template that inherits this session's model.",
+      }),
+    ),
+    task: Type.String({ description: "The task/prompt to send to this sub-agent." }),
+    model: Type.Optional(Type.String({ description: MODEL_DESCRIPTION })),
+  },
+  { additionalProperties: false },
+);
 
-const AgentCreateParams = Type.Object({
-  task: Type.Optional(Type.String({ description: "Task for a single sub-agent (single-task shorthand)." })),
-  agent: Type.Optional(Type.String({ description: "Def name to pair with `task` (single-task shorthand)." })),
-  model: Type.Optional(Type.String({ description: `${MODEL_DESCRIPTION} (single-task shorthand.)` })),
-  tasks: Type.Optional(
-    Type.Array(TaskItem, {
-      description: `One entry per sub-agent, run concurrently. Max ${MAX_TASKS}. Each entry may pick its own \`model\`.`,
-    }),
-  ),
-  wait: Type.Optional(
-    Type.Boolean({
-      description:
-        "Wait for every task to finish and return each sub-agent's final response. Default true. Set to false to fire-and-forget: returns immediately after spawning (with each agent's name so you can address it later), without blocking this turn on any of them — use agent_inspect to check progress/output, or agent_send to give a spawned-but-not-yet-finished agent more instructions.",
-    }),
-  ),
-});
+const AgentCreateParams = Type.Object(
+  {
+    task: Type.Optional(Type.String({ description: "Task for a single sub-agent (single-task shorthand)." })),
+    template: Type.Optional(Type.String({ description: "Template ID to pair with `task` (single-task shorthand)." })),
+    model: Type.Optional(Type.String({ description: `${MODEL_DESCRIPTION} (single-task shorthand.)` })),
+    tasks: Type.Optional(
+      Type.Array(TaskItem, {
+        description: `One entry per sub-agent, run concurrently. Max ${MAX_TASKS}. Each entry may pick its own \`model\`.`,
+      }),
+    ),
+    wait: Type.Optional(
+      Type.Boolean({
+        description:
+          "Wait for every task to finish and return each sub-agent's final response. Default true. Set to false to fire-and-forget: returns immediately after spawning (with each agent's name so you can address it later), without blocking this turn on any of them — use agent_inspect to check progress/output, or agent_send to give a spawned-but-not-yet-finished agent more instructions.",
+      }),
+    ),
+  },
+  { additionalProperties: false },
+);
 
 /**
  * The model catalog only knows `provider/id` model ids. Some models
@@ -101,9 +107,9 @@ export const agentCreateTool = defineTool({
   description: [
     "Delegate one or more tasks to sub-agents that run concurrently in this process, each with its own isolated context window.",
     `A root session may retain at most ${MAX_AGENTS_PER_SESSION} sub-agents across all delegation depths.`,
-    "Single mode: { task } or { agent, task }. Parallel mode: { tasks: [{ agent?, task, model? }, ...] } — all entries run at the same time.",
-    "`agent` selects a def from .pi/agents/ or ~/.pi/agent/agents/ (list them with /agents); omit it for a plain agent that inherits this session's model and default tools.",
-    "`model` selects the model and overrides the def's model when both are given; omit it to inherit the def's model, or this session's model.",
+    "Single mode: { task } or { template, task }. Parallel mode: { tasks: [{ template?, task, model? }, ...] } — all entries run at the same time.",
+    "`template` selects an agent template from .pi/agents/ or ~/.pi/agent/agents/ (discover them with `agent_list` or `/agents`); omit it for an instance without a template that inherits this session's model and default tools.",
+    "`model` selects the model and overrides the template's default when both are given; omit it to inherit the template's model, or this session's model.",
     "Use this to *create* a sub-agent. To message, inspect, or delete an *existing* one by name, use `agent_send` / `agent_inspect` / `agent_remove` instead.",
     "Every spawned agent is a live entry in this extension's agent picker (press Left) for as long as it lives, so a human can attach, watch it stream, or steer it while this call is in flight.",
     "By default this call waits for every task to finish and returns each sub-agent's final response. Set `wait: false` to fire-and-forget instead — spawn and return immediately without blocking this turn, then use `agent_inspect`/`agent_send` afterward to check on or continue any of them.",
@@ -129,13 +135,13 @@ export const agentCreateTool = defineTool({
       params.tasks && params.tasks.length > 0
         ? params.tasks
         : params.task
-          ? [{ agent: params.agent, task: params.task, model: params.model }]
+          ? [{ template: params.template, task: params.task, model: params.model }]
           : []
     ).map((t) => ({ ...t, model: normalizeModelParam(t.model) }));
 
     if (requested.length === 0) {
       return {
-        content: [{ type: "text", text: "Provide `task` (optionally with `agent`), or `tasks`." }],
+        content: [{ type: "text", text: "Provide `task` (optionally with `template`), or `tasks`." }],
         isError: true,
       };
     }
@@ -147,13 +153,13 @@ export const agentCreateTool = defineTool({
     }
 
     const catalog = loadCatalog(ctx.cwd);
-    const unknownDefs = [...new Set(requested.map((t) => t.agent).filter((a): a is string => Boolean(a)))].filter(
+    const unknownTemplates = [...new Set(requested.map((t) => t.template).filter((a): a is string => Boolean(a)))].filter(
       (a) => !catalog.agents.has(a),
     );
-    if (unknownDefs.length > 0) {
+    if (unknownTemplates.length > 0) {
       const available = [...catalog.agents.keys()].join(", ") || "none";
       return {
-        content: [{ type: "text", text: `Unknown agent def(s): ${unknownDefs.join(", ")}. Available: ${available}.` }],
+        content: [{ type: "text", text: `Unknown template(s): ${unknownTemplates.join(", ")}. Available: ${available}.` }],
         isError: true,
       };
     }
@@ -203,11 +209,11 @@ export const agentCreateTool = defineTool({
     // this root's manifest — same naming rule the picker uses.
     const existingNames = listAgentEntries(root, (f) => getAgent(f) !== undefined).map((a) => a.name);
     const spawned = requested.map((t) => {
-      const def: SubAgentDef | undefined = t.agent ? catalog.agents.get(t.agent) : undefined;
+      const def: SubAgentDef | undefined = t.template ? catalog.agents.get(t.template) : undefined;
       const forcedModel = t.model ? resolvedModels.get(t.model) : undefined;
       const name = agentName(t.task, existingNames);
       existingNames.push(name);
-      const file = registerAgent(root, name, ctx.cwd, def?.name);
+      const file = registerAgent(root, name, ctx.cwd, t.template);
       return { name, file, task: t.task, def, modelId: t.model, forcedModel };
     });
 
@@ -237,7 +243,7 @@ export const agentCreateTool = defineTool({
           },
         ],
         details: {
-          agents: spawned.map((s) => ({ name: s.name, file: s.file, def: s.def?.name, model: s.modelId ?? s.forcedModel?.id })),
+          agents: spawned.map((s) => ({ name: s.name, file: s.file, template: s.def?.name, model: s.modelId ?? s.forcedModel?.id })),
         },
         isError: failCount === spawned.length,
       };
@@ -268,7 +274,7 @@ export const agentCreateTool = defineTool({
         agents: results.map((r) => ({
           name: r.name,
           file: r.file,
-          def: r.def?.name,
+          template: r.def?.name,
           model: r.modelId ?? r.agent.session.model?.id,
           state: r.agent.state,
         })),
@@ -278,11 +284,11 @@ export const agentCreateTool = defineTool({
   },
 
   renderCall(args, theme) {
-    const tasks: Array<{ agent?: string; task: string; model?: string }> =
+    const tasks: Array<{ template?: string; task: string; model?: string }> =
       args.tasks && args.tasks.length > 0
         ? args.tasks
         : args.task
-          ? [{ agent: args.agent, task: args.task, model: args.model }]
+          ? [{ template: args.template, task: args.task, model: args.model }]
           : [];
     let text =
       theme.fg("toolTitle", theme.bold("agent_create ")) +
@@ -290,7 +296,7 @@ export const agentCreateTool = defineTool({
       (args.wait === false ? theme.fg("accent", " [no-wait]") : "");
     for (const t of tasks.slice(0, 3)) {
       const preview = t.task.length > 50 ? `${t.task.slice(0, 50)}...` : t.task;
-      const tags = [t.agent, t.model].filter(Boolean).join(" · ");
+      const tags = [t.template, t.model].filter(Boolean).join(" · ");
       text += `\n  ${tags ? theme.fg("accent", `[${tags}] `) : ""}${theme.fg("dim", preview)}`;
     }
     if (tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${tasks.length - 3} more`)}`;

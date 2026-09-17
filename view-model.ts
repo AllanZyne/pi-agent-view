@@ -18,6 +18,7 @@ import {
   type TranscriptItem,
 } from "./agent-runtime.ts";
 import type { AgentEntry } from "./storage.ts";
+import { templateId } from "./storage.ts";
 
 export type { AgentState };
 
@@ -34,12 +35,8 @@ export interface AgentRow {
   lastModified: Date;
   summary?: string;
   model?: string;
-  /**
-   * Sub-agent def name (from `.pi/agents/<def>.md`) that spawned this agent, if
-   * any. The picker draws it as a `[def]` badge next to the name so a
-   * catalog-backed agent is immediately recognisable.
-   */
-  def?: string;
+  /** Template ID that created this instance, shown as a picker badge. */
+  template?: string;
 }
 
 export interface AgentFileInfo {
@@ -170,6 +167,7 @@ export function buildRows(input: BuildRowsInput): AgentRow[] {
     const info = readAgentFile(file);
     const live = getAgent(file);
     const liveState = stateOf(file);
+    const template = entry ? templateId(entry) : undefined;
     // A live agent whose file pi has not flushed yet has no mtime: report now,
     // so callers never see a 1970 timestamp for a running agent.
     const lastModified = info.lastModified.getTime() === 0 && live ? new Date() : info.lastModified;
@@ -185,9 +183,7 @@ export function buildRows(input: BuildRowsInput): AgentRow[] {
       // A live agent's session knows its model right away; the file only learns
       // it from the next assistant message, so `/model` would look like a no-op.
       model: (isRoot ? undefined : modelOf(file)?.id) ?? info.model,
-      // Def name comes from the manifest, not the session file: the def is a
-      // spawn-time input, so revived agents keep the same badge.
-      ...(entry?.def ? { def: entry.def } : {}),
+      ...(template ? { template } : {}),
     };
   };
 

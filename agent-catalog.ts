@@ -83,11 +83,8 @@ export interface Catalog {
 /**
  * Names the loader silently rejects.
  *
- * `agent` is the conventional name for "spawn a fresh ad-hoc agent
- * inheriting main's model" (suggested first in the `@` autocomplete list,
- * and the natural value to omit for a plain `agent_create` call). If a def
- * could take that name it would shadow that convention, so it is skipped
- * and a diagnostic recorded.
+ * `agent` is the namespace marker for template mentions (`@agent:<id>`).
+ * Reserving it as a template ID avoids the confusing `@agent:agent` spelling.
  */
 export const RESERVED_NAMES = new Set(["agent"]);
 
@@ -109,10 +106,8 @@ export function agentRoots(cwd: string): Array<{ dir: string; scope: "project" |
  * Force-rescan all three scopes and return the merged catalog.
  *
  * Earlier scopes win on `name` collisions — project beats user beats
- * extension — with the loser dropped silently (a diagnostic would be noisy
- * in the common "same name intentionally overridden" case). The loser's
- * original file is still discoverable through `/agents`, which lists source
- * paths.
+ * extension — with lower-priority templates of the same name omitted from the
+ * merged catalog.
  */
 export function loadCatalog(cwd: string): Catalog {
   const agents = new Map<string, SubAgentDef>();

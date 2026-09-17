@@ -3,8 +3,9 @@
  *
  * Discovery belongs to agent_list. This tool reports one agent's compact
  * status, pages through its chat turns, or searches those turns with a regular
- * expression. It deliberately has no "return everything" option: every result
- * is bounded so a long-running agent cannot flood the caller's context.
+ * expression. It is non-blocking by default; `wait: true` provides a one-shot
+ * join without sending a message. Every result is bounded so a long-running
+ * agent cannot flood the caller's context.
  */
 
 import { Worker } from "node:worker_threads";
@@ -13,9 +14,9 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { assistantText, getAgent, modelOf, readTranscript, stateOf, type TranscriptItem } from "./agent-runtime.ts";
+import { assistantText, getAgent, modelOf, readTranscript, stateOf, waitForAgentSettled, type TranscriptItem } from "./agent-runtime.ts";
 import { resolveEntry } from "./agent-lookup.ts";
-import { listAgentEntries, resolveRoot, type AgentEntry } from "./storage.ts";
+import { listAgentEntries, resolveRoot, templateId, type AgentEntry } from "./storage.ts";
 
 const DEFAULT_LIMIT = 5;
 const MAX_LIMIT = 10;
@@ -28,8 +29,14 @@ const REGEX_TIMEOUT_MS = 200;
 const AgentInspectParams = Type.Object({
   name: Type.String({
     description:
-      "Picker name of one sub-agent instance, or a def name to pick its most recently active instance. Use agent_list to discover names.",
+      "Picker name of one sub-agent instance. Template IDs are not instance aliases; use agent_list to discover instance names.",
   }),
+  wait: Type.Optional(
+    Type.Boolean({
+      description:
+        "Wait until the instance is no longer working before returning. Default false. This sends no message and starts no new turn; cancel the caller to stop waiting.",
+    }),
+  ),
   mode: Type.Optional(
     StringEnum(["summary", "history", "search"] as const, {
       description:
@@ -87,7 +94,7 @@ function recentToolActivity(items: readonly TranscriptItem[], max = 8): string[]
 
 function describeAgent(entry: AgentEntry): string {
   const model = modelOf(entry.file);
-  const tags = [entry.def, model ? `${model.provider}/${model.id}` : undefined].filter(Boolean);
+  const tags = [templateId(entry), model ? `${model.provider}/${model.id}` : undefined].filter(Boolean);
   return tags.length > 0 ? `${entry.name} [${tags.join(" · ")}]` : entry.name;
 }
 
@@ -254,7 +261,8 @@ export const agentInspectTool = defineTool({
   name: "agent_inspect",
   label: "Agent inspect",
   description: [
-    "Inspect one sub-agent without spawning, messaging, or waiting on it.",
+    "Inspect one sub-agent without spawning, messaging, or waiting on it unless `wait: true` is requested.",
+    "With `wait: true`, this blocks until that instance settles, then returns the requested bounded view without sending it a message.",
     "Summary mode (default) returns compact status, task, recent activity, and latest output.",
     "History mode returns a bounded page of user/assistant turns and a cursor for older turns.",
     "Search mode applies a bounded regular-expression query to chat turns. Raw patterns are case-insensitive; /pattern/flags syntax is supported.",
@@ -279,9 +287,26 @@ export const agentInspectTool = defineTool({
     if (!entry) {
       const available = entries.map((candidate) => candidate.name).join(", ") || "none";
       return {
-        content: [{ type: "text", text: `No sub-agent named or def'd "${params.name}" in this session. Known: ${available}.` }],
+        content: [{ type: "text", text: `No sub-agent instance named "${params.name}" in this session. Known instances: ${available}. Template IDs are not aliases.` }],
         isError: true,
       };
+    }
+
+    if (params.wait) {
+      try {
+        await waitForAgentSettled(entry.file, signal);
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
+          isError: true,
+        };
+      }
+      const stillPresent = listAgentEntries(root, (file) => getAgent(file) !== undefined).some(
+        (candidate) => candidate.file === entry.file,
+      );
+      if (!stillPresent) {
+        return { content: [{ type: "text", text: `${entry.name} was removed while waiting.` }] };
+      }
     }
 
     const items = readTranscript(entry.file);
@@ -320,7 +345,7 @@ export const agentInspectTool = defineTool({
 
   renderCall(args, theme) {
     const mode = args.mode ?? "summary";
-    const tags = [mode, args.query ? `/${args.query}/` : undefined].filter(Boolean).join(" · ");
+    const tags = [mode, args.wait ? "wait" : undefined, args.query ? `/${args.query}/` : undefined].filter(Boolean).join(" · ");
     return new Text(
       theme.fg("toolTitle", theme.bold("agent_inspect ")) +
         theme.fg("accent", args.name) +

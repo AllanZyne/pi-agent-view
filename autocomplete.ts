@@ -3,8 +3,8 @@
  *
  * pi's built-in `CombinedAutocompleteProvider` reserves `@` for a file picker.
  * While pi-agent-view is loaded, `@` picks an agent instead: typing `@` opens
- * a list of `agent` (the reserved adhoc slug) plus every discovered def, and
- * selecting one inserts `@<name> ` at the cursor.
+ * a list of reusable templates as `agent:<id>` and live instances by name.
+ * Selecting one inserts the corresponding `@... ` token.
  *
  * The wrapper composes with `withAttachedCommandFilter`: this one must be the
  * *innermost* wrap so its `shouldTriggerFileCompletion` override actually
@@ -15,7 +15,7 @@
  */
 
 import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
-import { ADHOC_SLUG, atTokenAtCursor, type LiveAgentInfo } from "./at-mention.ts";
+import { atTokenAtCursor, type LiveAgentInfo } from "./at-mention.ts";
 import type { Catalog } from "./agent-catalog.ts";
 
 /**
@@ -24,8 +24,7 @@ import type { Catalog } from "./agent-catalog.ts";
  * excluded so you never see "yourself" in the picker).
  *
  * `liveAgents` is ordered most-recently-active first so the top of the list
- * matches what `parseAtMention` rule 3 would pick when a def has several
- * running instances.
+ * instances of the same template surface the freshest one first.
  */
 export interface MentionScan {
   catalog: Catalog;
@@ -87,37 +86,21 @@ function agentSuggestions(
 ): AutocompleteSuggestions {
   const { catalog, liveAgents } = scan;
 
-  // Live-agent names shadow catalog defs of the same name in the list: if a
-  // slug is live, that's what `parseAtMention` will match (rule 2 beats rule
-  // 4), so surfacing the def entry would be misleading.
-  const liveNames = new Set(liveAgents.map((a) => a.name));
-
+  // Live instances are targets for follow-up wording; templates always remain
+  // present so they can create additional instances, even when one made from
+  // that template is live.
   const items: AutocompleteItem[] = [
-    // The adhoc slug always comes first: it's what users type most, and it's
-    // never in the catalog itself (RESERVED_NAMES).
-    {
-      value: ADHOC_SLUG,
-      label: ADHOC_SLUG,
-      description: "new background agent (inherits main's model)",
-    },
-    // Live agents next, most-recent-first (order preserved from caller).
-    // These route to an existing instance rather than spawning a new one.
-    ...liveAgents
-      .filter((a) => a.name !== ADHOC_SLUG)
-      .map((a) => ({
-        value: a.name,
-        label: a.name,
-        description: a.def ? `live · ${a.def}` : "live",
-      })),
-    // Catalog defs last: they spawn a fresh instance. Skip any whose name is
-    // already taken by a live agent (see `liveNames` above).
+    ...liveAgents.map((a) => ({
+      value: a.name,
+      label: a.name,
+      description: a.template ? `live instance · template: ${a.template}` : "live instance · no template",
+    })),
     ...[...catalog.agents.values()]
-      .filter((def) => !liveNames.has(def.name))
       .sort((a, b) => a.name.localeCompare(b.name))
-      .map((def) => ({
-        value: def.name,
-        label: def.name,
-        description: `[${def.scope}] ${def.description}`,
+      .map((template) => ({
+        value: `agent:${template.name}`,
+        label: `agent:${template.name}`,
+        description: `template · ${template.description} [${template.scope}; default: ${template.model ?? "inherit"}]`,
       })),
   ];
 

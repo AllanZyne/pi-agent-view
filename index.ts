@@ -50,7 +50,7 @@
  *   ?              help
  *
  * Commands
- *   /agents         list sub-agent definitions discovered under .pi/agents/
+ *   /agents         list agent templates discovered under .pi/agents/
  *                   (rescans on every call — no explicit reload flag needed).
  *   /model [name]   while attached (or with the picker open): set that agent's
  *                   model. pi's own /model is intercepted by interactive mode
@@ -62,18 +62,19 @@
  *   resolution, no escaping needed. Whichever conversation you're talking to
  *   (main, or an attached agent — every agent gets the same tools) decides
  *   from context what to do and calls the tool that matches:
- *     `agent_create`      — create one or more sub-agents, wait for them
- *     `agent_list`        — list available sub-agents and slot usage
- *     `agent_inspect`     — inspect one sub-agent's status/conversation
- *     `agent_send`        — message an existing sub-agent by name
- *     `agent_remove`      — delete a sub-agent outright (never `main`)
+ *     `agent_create`      — create one or more instances, with or without templates
+ *     `agent_list`        — list existing instances, available templates, and slots
+ *     `agent_inspect`     — inspect one instance's status/conversation
+ *     `agent_send`        — message an existing instance by name
+ *     `agent_remove`      — delete an instance outright (never `main`)
  *   See agent-create-tool.ts / agent-list-tool.ts / agent-inspect-tool.ts /
  *   agent-control-tool.ts and README "LLM-callable tools". Because every
  *   agent has the same five tools, delegation nests to any depth — a sub-agent
  *   can spawn its own.
  *
- *   Typing `@` at the start of the message still opens an agent picker
- *   (autocomplete convenience only, purely cosmetic — inserts `@<name> `);
+ *   Typing `@` at the start of the message still opens an agent picker:
+ *   `@agent:<template>` is a template and `@<instance>` is a live instance;
+ *   it remains purely cosmetic.
  *   mid-message `@` opens pi's file picker (see `autocomplete.ts`).
  *
  * Storage: agent sessions live in
@@ -140,6 +141,7 @@ import {
   removeAgentEntry,
   resolveRoot,
   ROOT_AGENT_NAME,
+  templateId,
   type RootCtx,
 } from "./storage.ts";
 import { loadCatalog, type Catalog, type SubAgentDef } from "./agent-catalog.ts";
@@ -206,7 +208,7 @@ function computeLiveAgents(ctx: ExtensionContext): LiveAgentInfo[] {
   return listAgentEntries(root, (f) => getAgent(f) !== undefined)
     .filter((a) => getAgent(a.file) !== undefined)
     .sort((a, b) => statMtime(b.file) - statMtime(a.file))
-    .map((a) => ({ file: a.file, name: a.name, ...(a.def ? { def: a.def } : {}) }));
+    .map((a) => ({ file: a.file, name: a.name, ...(templateId(a) ? { template: templateId(a) } : {}) }));
 }
 
 // ── View state (survives per-session extension reloads) ────────────
@@ -710,9 +712,9 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
       ["Ctrl+X", "Press twice to delete (main: abort)"],
       ["/model [name]", "Set that agent's model (Ctrl+L when attached)"],
       ["←", "Close the picker (reopen to refresh the list)"],
-      ["@agent <task>", "Spawn a background agent (inherits main)"],
-      ["@<name> <task>", "Route to a live agent, else spawn from .pi/agents/<name>.md"],
-      ["/agents", "List sub-agent definitions (rescans)"],
+      ["@agent:<template> <task>", "Refer to a reusable template when creating an agent"],
+      ["@<instance> <task>", "Refer to a live instance"],
+      ["/agents", "List agent templates (rescans)"],
     ] as const) {
       out.push(truncateToWidth(`    ${th.fg("accent", k.padEnd(15))}${th.fg("text", d)}`, width));
     }
@@ -763,7 +765,7 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
     // The state icon + group header already say everything about the agent's
     // status, so no "(live)" tag and no ticking mtime column.
     // No "[main]" tag: the root session is just the agent called "main".
-    const badge = row.def ? th.fg("muted", ` [${row.def}]`) : "";
+    const badge = row.template ? th.fg("muted", ` [${row.template}]`) : "";
     const tags = row.isAttached ? th.fg("success", " (attached)") : "";
     out.push(truncateToWidth(`${pointer}${icon} ${nameStr}${badge}${tags}`, width));
 
@@ -968,7 +970,7 @@ class AgentWorkingStatus extends Loader {
 /** Shown on the agent's editor border while it streams. */
 const AGENT_WORKING_MESSAGE = "Working";
 
-class AgentViewEditor extends CustomEditor {
+export class AgentViewEditor extends CustomEditor {
   constructor(
     tui: ConstructorParameters<typeof CustomEditor>[0],
     theme: ConstructorParameters<typeof CustomEditor>[1],
@@ -987,6 +989,16 @@ class AgentViewEditor extends CustomEditor {
   /** pi's indicator, remembered so the main session keeps its own status. */
   private piStatus?: unknown;
   private agentStatus?: AgentWorkingStatus;
+  /**
+   * Whether `agentStatus`'s animation timer is currently running.
+   *
+   * `renderTopBorder` calls `borderStatus()` on every render — including every
+   * tick the spinner's own timer causes via `ui.requestRender()` — so calling
+   * `start()` unconditionally there would call `Loader.restartAnimation()`
+   * (stop + setInterval) that often too, clearing the interval before it ever
+   * fires and freezing the icon. Only (re)start on the stopped→working edge.
+   */
+  private agentStatusRunning = false;
 
   /** pi hands over its working indicator whenever its own session streams. */
   override setWorkingStatusIndicator(indicator: Parameters<CustomEditor["setWorkingStatusIndicator"]>[0]): void {
@@ -1006,17 +1018,24 @@ class AgentViewEditor extends CustomEditor {
    * on the main session it is pi's, untouched.
    */
   private borderStatus(working: boolean, ownStatus: boolean): unknown {
-    if (!ownStatus) return this.piStatus;
+    if (!ownStatus) {
+      this.agentStatus?.stop();
+      this.agentStatusRunning = false;
+      return this.piStatus;
+    }
     if (!working) {
       this.agentStatus?.stop();
+      this.agentStatusRunning = false;
       return undefined;
     }
     if (!this.agentStatus) {
       this.agentStatus = new AgentWorkingStatus(this.tuiRef, AGENT_WORKING_MESSAGE, (text) =>
         this.borderColor(text),
       );
-    } else {
+      this.agentStatusRunning = true;
+    } else if (!this.agentStatusRunning) {
       this.agentStatus.start();
+      this.agentStatusRunning = true;
     }
     return this.agentStatus;
   }
@@ -1794,7 +1813,7 @@ export default function agentViews(pi: ExtensionAPI): void {
   // so they never have to interrupt a turn.
 
   /**
-   * Look up the sub-agent def recorded for `file` in the group's manifest.
+   * Look up the agent template recorded for `file` in the group's manifest.
    *
    * Returns undefined for a plain agent (no def field), the root/main session,
    * or a def whose file has since been removed from `.pi/agents/`. The latter
@@ -1806,12 +1825,12 @@ export default function agentViews(pi: ExtensionAPI): void {
     if (!root) return undefined;
     if (file === root.rootFile) return undefined;
     const entry = listAgentEntries(root).find((a) => a.file === file);
-    if (!entry?.def) return undefined;
-    return loadCatalog(ctx.cwd).agents.get(entry.def);
+    const template = entry ? templateId(entry) : undefined;
+    return template ? loadCatalog(ctx.cwd).agents.get(template) : undefined;
   }
 
   pi.registerCommand("agents", {
-    description: "List sub-agent definitions discovered under .pi/agents/",
+    description: "List agent templates discovered under .pi/agents/",
     handler: async (_args, ctx) => {
       // Force a rescan every time: users edit files while pi is running and
       // expect the next `/agents` to see the change without a reload flag.
@@ -1819,14 +1838,14 @@ export default function agentViews(pi: ExtensionAPI): void {
       if (catalog.agents.size === 0 && catalog.diagnostics.length === 0) {
         notify(
           ctx,
-          "No sub-agent definitions found under .pi/agents/ or ~/.pi/agent/agents/",
+          "No agent templates found under .pi/agents/ or ~/.pi/agent/agents/",
           "info",
         );
         return;
       }
       const lines: string[] = [];
       for (const def of [...catalog.agents.values()].sort((a, b) => a.name.localeCompare(b.name))) {
-        lines.push(`@${def.name}  [${def.scope}]  ${def.description}`);
+        lines.push(`@agent:${def.name}  [${def.scope}]  ${def.description}`);
         lines.push(`  ${def.source}`);
       }
       for (const diag of catalog.diagnostics) {

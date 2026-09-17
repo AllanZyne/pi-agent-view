@@ -10,21 +10,17 @@
  * tool itself — no client-side parsing, no escaping needed.
  *
  * All that's left here is `atTokenAtCursor`: purely cosmetic autocomplete
- * support so typing `@` still offers a list of known agent names/defs and
- * inserts `@<name> ` at the cursor (see `autocomplete.ts`). It has no
- * bearing on what happens when the message is actually sent.
+ * support so typing `@` offers templates as `@agent:<id>` and live instances
+ * as `@<instance-name>` (see `autocomplete.ts`).
  *
  * Headless: no FS, no TUI, no extension context.
  */
-
-/** The conventional slug suggested for "spawn a fresh background agent" in the `@` completion list. Not reserved or special to any parsing — just a suggestion. */
-export const ADHOC_SLUG = "agent";
 
 /** Enough about a live agent for the completion list. */
 export interface LiveAgentInfo {
   file: string;
   name: string;
-  def?: string;
+  template?: string;
 }
 
 /**
@@ -49,7 +45,7 @@ export function atTokenAtCursor(
   const line = lines[0] ?? "";
   const before = line.slice(0, cursorCol);
   // Only whitespace allowed between the start of the message and `@`.
-  const match = /^\s*(@([a-z][a-z0-9-]*)?)$/.exec(before);
+  const match = /^\s*(@((?:agent(?::[a-z0-9-]*)?)|(?:[a-z][a-z0-9-]*))?)$/.exec(before);
   if (!match) return null;
   return { prefix: match[1]!, slug: match[2] ?? "" };
 }

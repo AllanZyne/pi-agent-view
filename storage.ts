@@ -19,14 +19,9 @@ export interface AgentEntry {
   name: string;
   file: string;
   createdAt: string;
-  /**
-   * Sub-agent def name that spawned this agent, if any.
-   *
-   * Present when the agent was summoned via `@<def-name>`. Used to badge the
-   * row and to re-apply the def's `appendSystemPrompt`/model on revive. A
-   * missing field means "plain agent" (forward-compatible with manifests
-   * written by earlier builds).
-   */
+  /** Template ID used to create this instance, if any. */
+  template?: string;
+  /** Legacy manifest field. Read-only compatibility; new manifests never write it. */
   def?: string;
 }
 
@@ -34,6 +29,11 @@ export interface AgentManifest {
   rootId: string;
   rootFile: string;
   agents: AgentEntry[];
+}
+
+/** Current template ID, accepting legacy manifests written with `def`. */
+export function templateId(entry: AgentEntry): string | undefined {
+  return entry.template ?? entry.def;
 }
 
 /** Root context: the top-level pi session that owns a group of agents. */
@@ -176,7 +176,7 @@ export function assertAgentCapacity(root: RootCtx, requested = 1): void {
  * The returned path may not exist on disk yet: pi flushes a session file only
  * once it holds an assistant message.
  */
-export function registerAgent(root: RootCtx, name: string, cwd: string, def?: string): string {
+export function registerAgent(root: RootCtx, name: string, cwd: string, template?: string): string {
   // Every creation path (LLM tool and direct picker gesture) passes here. The
   // tool also checks its whole batch up front to avoid partial creation.
   assertAgentCapacity(root);
@@ -196,7 +196,7 @@ export function registerAgent(root: RootCtx, name: string, cwd: string, def?: st
     name,
     file,
     createdAt: new Date().toISOString(),
-    ...(def ? { def } : {}),
+    ...(template ? { template } : {}),
   });
   saveManifest(root.sessionDir, m);
 

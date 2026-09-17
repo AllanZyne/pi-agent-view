@@ -7,10 +7,12 @@
 
 import "./unit.storage.mjs";
 import "./unit.agent-tools.mjs";
+import "./unit.agent-lookup.mjs";
 import "./unit.view-model.mjs";
 import "./unit.transcript-view.mjs";
 import "./unit.tool-renderers.mjs";
 import "./unit.render.mjs";
+import "./unit.working-indicator.mjs";
 import "./unit.picker.mjs";
 import "./unit.attached-commands.mjs";
 import "./unit.catalog.mjs";

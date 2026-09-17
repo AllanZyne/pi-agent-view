@@ -147,6 +147,8 @@ interface Registry {
   modelRuntime?: ModelRuntime;
   /** Called after any live agent changes; the argument is that agent's file. */
   onChange?: (file?: string) => void;
+  /** Additional observers used by one-shot waits without replacing the UI hook. */
+  changeListeners?: Set<(file?: string) => void>;
   /**
    * Tool definitions handed to every sub-agent's `createAgentSession()` as
    * `customTools`, so it has the same `agent_create`/`agent_list`/
@@ -167,8 +169,9 @@ function registry(): Registry {
     g[KEY] = { agents: new Map<string, LiveAgent>(), loading: false, stopped: new Set<string>() } satisfies Registry;
   }
   const reg = g[KEY] as Registry;
-  // Older builds had no stopped set; keep a reload from crashing.
+  // Older builds had no stopped set/listener set; keep a reload from crashing.
   reg.stopped ??= new Set<string>();
+  reg.changeListeners ??= new Set<(file?: string) => void>();
   return reg;
 }
 
@@ -182,6 +185,13 @@ export function isLoadingSubAgent(): boolean {
 
 export function setOnChange(cb: ((file?: string) => void) | undefined): void {
   registry().onChange = cb;
+}
+
+/** Subscribe without replacing the view layer's singleton repaint hook. */
+export function onAgentChange(cb: (file?: string) => void): () => void {
+  const listeners = registry().changeListeners!;
+  listeners.add(cb);
+  return () => listeners.delete(cb);
 }
 
 /** See `Registry.managedTools`. Call once at extension activation. */
@@ -198,10 +208,18 @@ export function setManagedTools(tools: ToolDefinition[]): void {
  * told *which* agent moved, so always pass the file when it is known.
  */
 function notify(file?: string): void {
+  const reg = registry();
   try {
-    registry().onChange?.(file);
+    reg.onChange?.(file);
   } catch {
     /* ignore */
+  }
+  for (const listener of [...reg.changeListeners!]) {
+    try {
+      listener(file);
+    } catch {
+      /* one observer must not break agent bookkeeping */
+    }
   }
 }
 
@@ -727,6 +745,50 @@ export function stateOf(file: string): AgentState | undefined {
 }
 
 /**
+ * Resolve once an agent is no longer working, without sending it a message or
+ * polling through LLM tool calls. Undefined means the instance disappeared.
+ */
+export function waitForAgentSettled(file: string, signal?: AbortSignal): Promise<AgentState | undefined> {
+  const agent = getAgent(file);
+  if (!agent || stateOf(file) !== "working") return Promise.resolve(stateOf(file));
+  if (signal?.aborted) return Promise.reject(new Error("Waiting for the agent was cancelled."));
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let unsubscribe = () => {};
+    const cleanup = () => {
+      unsubscribe();
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = (state: AgentState | undefined) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(state);
+    };
+    const fail = (err: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+    const onAbort = () => fail(new Error("Waiting for the agent was cancelled."));
+    const onChange = (changed?: string) => {
+      if (changed !== undefined && changed !== file) return;
+      // Removal/disposal can intentionally stop waiting even when an
+      // uncooperative in-flight tool prevents AgentSession.waitForIdle().
+      if (!getAgent(file)) finish(stateOf(file));
+    };
+
+    unsubscribe = onAgentChange(onChange);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    agent.session.waitForIdle().then(() => finish(stateOf(file)), fail);
+    // Close the removal race between the first lookup and subscription.
+    onChange(file);
+  });
+}
+
+/**
  * What an agent's own session file already says about its model/thinking level.
  *
  * Each agent owns its model: `createAgentSession()` restores it from the
@@ -886,7 +948,7 @@ export type ModelSearchResult =
   | { ok: false; reason: "ambiguous"; candidates: string[] };
 
 /**
- * Resolve a short, human-typed model token — e.g. from `@agent:opus` or a
+ * Resolve a short, human-typed model token — e.g. `opus` or a
  * tool's free-form `model` argument — against every currently available
  * model.
  *
@@ -1043,13 +1105,39 @@ export async function forgetAgent(file: string): Promise<boolean> {
   return wasLive;
 }
 
-/** Dispose an agent, releasing its session file. */
+/** Maximum time graceful abort may delay disposal of an in-process agent. */
+export const AGENT_ABORT_GRACE_MS = 2_000;
+
+/**
+ * Ask a session to settle after abort, but never let an uncooperative tool or
+ * re-entrant agent-management call block disposal forever.
+ */
+export async function abortSessionWithTimeout(
+  session: { abort(): Promise<void> },
+  timeoutMs = AGENT_ABORT_GRACE_MS,
+): Promise<"settled" | "timed-out"> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timed-out">((resolve) => {
+    timer = setTimeout(() => resolve("timed-out"), timeoutMs);
+  });
+  try {
+    return await Promise.race([session.abort().then(() => "settled" as const), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Dispose an agent, releasing its session file. Graceful abort is bounded:
+ * arbitrary/custom tools may ignore AbortSignal, and disposal must not inherit
+ * their unbounded lifetime.
+ */
 export async function disposeAgent(file: string): Promise<void> {
   const reg = registry();
   const agent = reg.agents.get(file);
   if (!agent) return;
   try {
-    if (agent.session.isStreaming) await agent.session.abort();
+    if (agent.session.isStreaming) await abortSessionWithTimeout(agent.session);
   } catch {
     /* ignore */
   }

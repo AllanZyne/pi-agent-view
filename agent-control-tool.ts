@@ -30,7 +30,7 @@ import {
 } from "./agent-runtime.ts";
 import { loadCatalog } from "./agent-catalog.ts";
 import { resolveEntry } from "./agent-lookup.ts";
-import { listAgentEntries, removeAgentEntry, resolveRoot, ROOT_AGENT_NAME, type AgentEntry } from "./storage.ts";
+import { listAgentEntries, removeAgentEntry, resolveRoot, ROOT_AGENT_NAME, templateId, type AgentEntry } from "./storage.ts";
 
 const MODEL_DESCRIPTION =
   "Switch the agent's model before delivering the message: a full provider/id, a bare id, or any short case-insensitive substring that uniquely matches one available model's id (e.g. 'opus'). Omit to leave its current model alone.";
@@ -42,7 +42,7 @@ function unknownAgentError(name: string, entries: readonly AgentEntry[]) {
     content: [
       {
         type: "text" as const,
-        text: `No sub-agent named or def'd "${name}" in this session${main}. Known: ${available}. If you meant to create a new one, use \`agent_create\` instead.`,
+        text: `No sub-agent instance named "${name}" in this session${main}. Known instances: ${available}. Template IDs are not instance aliases; use \`agent_create\` to create an instance.`,
       },
     ],
     isError: true,
@@ -50,7 +50,7 @@ function unknownAgentError(name: string, entries: readonly AgentEntry[]) {
 }
 
 function describeAgent(entry: AgentEntry, model?: { provider: string; id: string }): string {
-  const tags = [entry.def, model ? `${model.provider}/${model.id}` : undefined].filter(Boolean);
+  const tags = [templateId(entry), model ? `${model.provider}/${model.id}` : undefined].filter(Boolean);
   return tags.length > 0 ? `${entry.name} [${tags.join(" · ")}]` : entry.name;
 }
 
@@ -68,7 +68,7 @@ function lastAssistantText(agent: LiveAgent): string {
 const AgentSendParams = Type.Object({
   name: Type.String({
     description:
-      "Picker name of a specific sub-agent instance, or a def name to pick its most recently active instance. Must already exist (see agent_inspect) — this never creates a new agent.",
+      "Picker name of a specific sub-agent instance. Must already exist (see agent_inspect) — this never creates a new agent; template IDs are not aliases.",
   }),
   text: Type.String({ description: "The message to send." }),
   model: Type.Optional(Type.String({ description: MODEL_DESCRIPTION })),
@@ -84,8 +84,8 @@ export const agentSendTool = defineTool({
   name: "agent_send",
   label: "Agent send",
   description: [
-    "Send a message to an existing sub-agent by name (revives it first if it isn't currently live).",
-    "Errors if `name` doesn't match any known sub-agent — it never creates one; use `agent_create` for that.",
+    "Send a message to an existing sub-agent instance by name (revives it first if it isn't currently live).",
+    "Errors if `name` doesn't match an instance — template IDs never resolve to instances; use `agent_create` for that.",
     "Optionally switches the agent's model first (`model`), and optionally waits for the turn to finish and returns its response (`wait: true`); by default this is fire-and-forget.",
   ].join(" "),
   promptSnippet: "Message an existing sub-agent by name",
@@ -121,7 +121,8 @@ export const agentSendTool = defineTool({
     }
 
     const catalog = loadCatalog(ctx.cwd);
-    const def = entry.def ? catalog.agents.get(entry.def) : undefined;
+    const template = templateId(entry);
+    const def = template ? catalog.agents.get(template) : undefined;
     try {
       await ensureAgent(entry.file, ctx.cwd, ctx.model, ctx.thinkingLevel, def);
     } catch (err) {
@@ -180,7 +181,7 @@ export const agentSendTool = defineTool({
 
 const AgentRemoveParams = Type.Object({
   name: Type.String({
-    description: "Picker name of the sub-agent to delete outright (aborts its turn, disposes its session, removes it from the picker). Cannot be undone.",
+    description: "Picker name of the sub-agent instance to delete outright (aborts its turn, disposes its session, removes it from the picker). Template IDs are not aliases. Cannot be undone.",
   }),
 });
 
@@ -188,11 +189,11 @@ export const agentRemoveTool = defineTool({
   name: "agent_remove",
   label: "Agent remove",
   description: [
-    "Delete a sub-agent outright: aborts anything it's doing, disposes its session, and removes it from the agent picker. Cannot be undone.",
-    "`main` (this session's own root conversation) can never be targeted this way — the call errors instead.",
-    "Errors if `name` doesn't match any known sub-agent.",
+    "Delete a sub-agent instance outright: aborts anything it's doing, disposes its session, and removes it from the agent picker. Cannot be undone.",
+    "`main` (this session's own root conversation) and the currently calling instance can never be targeted this way — ask a peer/root to remove the caller.",
+    "Errors if `name` doesn't match any known instance; template IDs are not aliases.",
   ].join(" "),
-  promptSnippet: "Delete a sub-agent by name",
+  promptSnippet: "Delete a sub-agent instance by name",
   parameters: AgentRemoveParams,
 
   async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -214,6 +215,12 @@ export const agentRemoveTool = defineTool({
     const entries = listAgentEntries(root, (f) => getAgent(f) !== undefined);
     const entry = resolveEntry(entries, params.name);
     if (!entry) return unknownAgentError(params.name, entries);
+    if (entry.file === ctx.sessionManager.getSessionFile()) {
+      return {
+        content: [{ type: "text", text: "An agent cannot remove itself from inside its own tool call. Ask main or another agent to remove this instance." }],
+        isError: true,
+      };
+    }
 
     await forgetAgent(entry.file);
     removeAgentEntry(root, entry.file);

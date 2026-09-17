@@ -2,8 +2,8 @@
  * Unit tests for autocomplete.ts (wrapWithAgentMentions).
  *
  * pi's `@` normally opens a file picker. pi-agent-view repurposes it as an
- * agent picker: typing `@` lists `agent` (adhoc) plus every discovered def,
- * suppresses pi's file listing, and completes with `@<name> ` at the cursor.
+ * agent picker: typing `@` lists templates as `agent:<id>` plus live instances,
+ * suppresses pi's file listing, and completes with `@<value> ` at the cursor.
  */
 
 import { assert, assertEqual, load, test } from "./harness.mjs";
@@ -43,53 +43,60 @@ function slashBase() {
   };
 }
 
-test("wrap: typing '@' returns adhoc first, then catalog defs alphabetically", async () => {
+test("wrap: typing '@' returns templates as agent:<id>", async () => {
   const provider = wrapWithAgentMentions(slashBase(), () => fakeScan(["reviewer", "debugger"]));
   const result = await provider.getSuggestions(["@"], 0, 1, { signal: new AbortController().signal });
   assertEqual(result.prefix, "@", "prefix is the token so far");
   assertEqual(
     result.items.map((i) => i.value),
-    ["agent", "debugger", "reviewer"],
-    "adhoc first, catalog sorted alphabetically",
+    ["agent:debugger", "agent:reviewer"],
+    "templates are sorted alphabetically and there is no ad-hoc @agent item",
   );
 });
 
-test("wrap: live agents appear between adhoc and catalog defs, most-recent order preserved", async () => {
+test("wrap: live agents appear before templates, most-recent order preserved", async () => {
   const live = [
-    { file: "/a/pearl.jsonl", name: "pearl", def: "reviewer" },
+    { file: "/a/pearl.jsonl", name: "pearl", template: "reviewer" },
     { file: "/a/coral.jsonl", name: "coral" },
   ];
   const provider = wrapWithAgentMentions(slashBase(), () => fakeScan(["debugger"], live));
   const result = await provider.getSuggestions(["@"], 0, 1, { signal: new AbortController().signal });
   assertEqual(
     result.items.map((i) => i.value),
-    ["agent", "pearl", "coral", "debugger"],
-    "order: adhoc, then live (caller order kept), then catalog defs",
+    ["pearl", "coral", "agent:debugger"],
+    "order: live instances first (caller order kept), then templates",
   );
   const pearl = result.items.find((i) => i.value === "pearl");
-  assert(pearl.description.includes("reviewer"), "a live agent's description mentions its def");
+  assert(pearl.description.includes("reviewer"), "a live instance description mentions its template");
 });
 
-test("wrap: a live agent shadows a same-named catalog def (rule 2 beats rule 4)", async () => {
-  const live = [{ file: "/a/reviewer.jsonl", name: "reviewer", def: "reviewer" }];
+test("wrap: templates remain available even when a same-template instance is live", async () => {
+  const live = [{ file: "/a/reviewer.jsonl", name: "reviewer", template: "reviewer" }];
   const provider = wrapWithAgentMentions(slashBase(), () => fakeScan(["reviewer", "debugger"], live));
   const result = await provider.getSuggestions(["@"], 0, 1, { signal: new AbortController().signal });
   assertEqual(
     result.items.map((i) => i.value),
-    ["agent", "reviewer", "debugger"],
-    "the live 'reviewer' is listed once (as live), the catalog entry is suppressed",
+    ["reviewer", "agent:debugger", "agent:reviewer"],
+    "the live instance and reusable template are distinct, non-duplicate entries",
   );
-  const reviewer = result.items.find((i) => i.value === "reviewer");
-  assert(reviewer.description.startsWith("live"), "the surviving entry is the live one, not the catalog def");
+  const reviewer = result.items.find((i) => i.value === "agent:reviewer");
+  assert(reviewer.description.startsWith("template"), "the template remains createable");
 });
 
-test("wrap: fragment '@re' fuzzy-filters the list", async () => {
+test("wrap: @agent: template fragments filter and complete", async () => {
   const provider = wrapWithAgentMentions(slashBase(), () => fakeScan(["reviewer", "debugger"]));
+  const result = await provider.getSuggestions(["@agent:re"], 0, 9, { signal: new AbortController().signal });
+  assertEqual(result.items.map((i) => i.value), ["agent:reviewer"], "template fragment selects a template");
+  assertEqual(result.prefix, "@agent:re", "prefix includes the template marker");
+});
+
+test("wrap: fragment '@re' fuzzy-filters live instances", async () => {
+  const provider = wrapWithAgentMentions(slashBase(), () => fakeScan(["reviewer", "debugger"], [{ file: "/a/review.jsonl", name: "review" }]));
   const result = await provider.getSuggestions(["@re"], 0, 3, { signal: new AbortController().signal });
   assertEqual(
     result.items.map((i) => i.value),
-    ["reviewer"],
-    "'re' matches only 'reviewer' (not 'agent' or 'debugger')",
+    ["review", "agent:reviewer"],
+    "plain fragments find live instances while templates remain discoverable; @agent: narrows to templates",
   );
   assertEqual(result.prefix, "@re", "prefix keeps the fragment for replaceAtToken");
 });

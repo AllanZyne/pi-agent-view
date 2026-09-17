@@ -40,7 +40,7 @@ test("registerAgent appends to an existing manifest", () => {
   assertEqual(names, ["a", "b"], "both agents are recorded in order");
 });
 
-test("registerAgent records the sub-agent def name when given one", () => {
+test("registerAgent persists only the template ID when given one", () => {
   const dir = tempDir();
   const rootFile = path.join(dir, "root.jsonl");
   fs.writeFileSync(rootFile, "");
@@ -50,11 +50,12 @@ test("registerAgent records the sub-agent def name when given one", () => {
   storage.registerAgent(root, "backed", dir, "code-reviewer");
 
   const agents = storage.loadManifest(dir, "root-def").agents;
-  assertEqual(agents[0].def, undefined, "plain agent has no def field on disk");
-  assertEqual(agents[1].def, "code-reviewer", "def-backed agent records its def name");
+  assertEqual(agents[0].template, undefined, "plain agent has no template field on disk");
+  assertEqual(agents[1].template, "code-reviewer", "template-backed agent records its template ID");
+  assertEqual(agents[1].def, undefined, "new manifests never write legacy def");
 });
 
-test("listAgentEntries returns def fields through unchanged (forward-compat)", () => {
+test("legacy def entries remain readable as template IDs", () => {
   const dir = tempDir();
   const rootFile = path.join(dir, "root.jsonl");
   fs.writeFileSync(rootFile, "");
@@ -65,7 +66,7 @@ test("listAgentEntries returns def fields through unchanged (forward-compat)", (
 
   const entries = storage.listAgentEntries(root);
   assertEqual(entries.length, 1);
-  assertEqual(entries[0].def, "reviewer", "def is preserved through the read path");
+  assertEqual(storage.templateId(entries[0]), "reviewer", "legacy def resolves as a template ID");
 });
 
 test("resolveRoot treats a normal session file as its own root", () => {

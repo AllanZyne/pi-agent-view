@@ -50,6 +50,8 @@ test("atTokenAtCursor: uppercase after @ is not a slug character", () => {
   assertEqual(mention.atTokenAtCursor(["@A"], 0, 2), null);
 });
 
-test("ADHOC_SLUG is 'agent'", () => {
-  assertEqual(mention.ADHOC_SLUG, "agent");
+test("atTokenAtCursor: @agent: template marker and fragments are tokens", () => {
+  assertEqual(mention.atTokenAtCursor(["@agent:"], 0, 7), { prefix: "@agent:", slug: "agent:" });
+  assertEqual(mention.atTokenAtCursor(["@agent:rev"], 0, 10), { prefix: "@agent:rev", slug: "agent:rev" });
+  assertEqual(mention.atTokenAtCursor(["@reviewer:rev"], 0, 13), null, "only agent: owns the template namespace");
 });

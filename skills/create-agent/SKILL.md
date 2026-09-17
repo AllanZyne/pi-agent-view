@@ -1,11 +1,11 @@
 ---
 name: create-agent
-description: Author a new sub-agent definition file for pi-agent-view under .pi/agents/ (project) or ~/.pi/agent/agents/ (user). Use when the user asks to create, add, define, or design a new (sub-)agent — for example "create a agent", "create an agent", "create a code-reviewer subagent", or "add an agent that writes commit messages". Gathers a name, description, and system-prompt body, optionally a model, writes the .md file, and shows how to invoke it via the `agent_create` tool.
+description: Author a reusable agent template file for pi-agent-view under .pi/agents/ (project) or ~/.pi/agent/agents/ (user). Use when the user asks to create, add, define, or design a new (sub-)agent — for example "create a agent", "create an agent", "create a code-reviewer subagent", or "add an agent that writes commit messages". Gathers a name, description, and system-prompt body, optionally a model, writes the .md file, and shows how to invoke it via the `agent_create` tool.
 ---
 
-# Create a sub-agent definition
+# Create an agent template
 
-pi-agent-view discovers sub-agent definitions under three roots (highest
+pi-agent-view discovers agent templates under three roots (highest
 priority first):
 
 - `<cwd>/.pi/agents/**/*.md` — **project scope** (checked into the repo, shared with the team; highest priority)
@@ -18,10 +18,9 @@ prompt templates all still load.
 
 Users invoke these just by asking naturally — e.g. "have the code-reviewer
 take a look at storage.ts" — and whichever LLM is listening calls the
-`agent_create` tool with `agent: "code-reviewer"` itself. There is no
-`@name` routing syntax: `@` in the editor is only an autocomplete
-convenience that inserts the exact slug (`@code-reviewer `) into the typed
-text, nothing more — it doesn't address or spawn anything by itself.
+`agent_create` tool with `template: "code-reviewer"` itself. There is no
+`@name` routing syntax: `@` is editor autocomplete only: `@agent:<name> `
+selects a template and `@<instance> ` refers to a live instance.
 
 ## Your job
 
@@ -37,15 +36,15 @@ When the user asks to create a new sub-agent:
    (`~/.pi/agent/agents/`, i.e. `getAgentDir()/agents/`) when it's a generic
    role the user would use anywhere. If unclear, ask once. Never write to
    both.
-3. **Draft a slug.** Lowercase letters, digits, hyphens; starts with a
+3. **Draft a template ID.** Lowercase letters, digits, hyphens; starts with a
    letter; 2–3 words max. Examples: `code-reviewer`, `commit-writer`,
-   `security-auditor`. Reject `agent` — it's the conventional name for "a
-   fresh plain agent, no def", and a def taking that name would shadow it
-   in the `@` completion list and in `agent_create`'s `agent` parameter.
+   `security-auditor`. Reject `agent` — it is the namespace marker for
+   template mentions (`@agent:<name>`), and accepting it would produce the
+   confusing `@agent:agent` spelling.
 4. **Draft a description.** One sentence, present tense, third-person. Say
    *what it does* and *when to invoke it*. This shows up in `/agents`, in
    the `@`-completion picker, and is the main thing an LLM has to go on when
-   deciding whether to call `agent_create` with this def — keep it short
+   deciding whether to call `agent_create` with this template — keep it short
    and specific. Bad: "Helps with code." Good: "Reviews Python diffs for
    correctness, style, and obvious bugs. Invoke after writing or changing
    code."
@@ -62,11 +61,10 @@ When the user asks to create a new sub-agent:
 8. **Verify** by asking the user to run `/agents` — it force-rescans both
    roots and prints what it found — and tell them how to invoke it: just
    ask naturally (e.g. "have `<name>` look at this"), or explicitly with
-   `@<name> <the task>` if they want the autocomplete's help typing the
-   slug. Also worth mentioning once, per session: to continue talking to an
+   `@agent:<name> <the task>` if they want the autocomplete's help typing the
+   template ID. Also worth mentioning once, per session: to continue talking to an
    *already-running* instance instead of spawning a duplicate, the calling
-   LLM should use `agent_send` (by name or by this def's name) rather than
-   `agent_create` again.
+   LLM should use `agent_send` by that instance's name, not its template ID.
 
 ## Frontmatter reference
 
@@ -173,8 +171,8 @@ or a small code block. If there are no issues, say so in one sentence.
 
 Then tell the user: *"Written to `~/.pi/agent/agents/py-reviewer.md`. Run
 `/agents` to confirm pi-agent-view sees it, then just ask for it naturally
-(e.g. `@py-reviewer take a look at this diff`, or plain 'have py-reviewer
-review this') — the LLM will call `agent_create` with `agent:
+(e.g. `@agent:py-reviewer take a look at this diff`, or plain 'have py-reviewer
+review this') — the LLM will call `agent_create` with `template:
 "py-reviewer"`."*
 
 ## Guardrails

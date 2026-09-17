@@ -32,4 +32,4 @@ convention only, not an enforced restriction — nothing stops it from calling
 `edit`/`write` if it chooses to ignore this prompt. Real enforcement would
 require the pi SDK's `createAgentSession({ tools: [...] })` /
 `excludeTools` / `createReadOnlyTools()` (see docs/sdk.md, "Tools" section),
-wired up per-def in agent-catalog.ts + agent-runtime.ts. Not implemented yet.
+wired up per-template in agent-catalog.ts + agent-runtime.ts. Not implemented yet.

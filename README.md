@@ -56,16 +56,17 @@ Just ask in plain language. Whichever conversation you're talking to (main,
 or an agent you're attached to) reads the request and calls the matching
 tool itself:
 
-```
-@reviewer take a look at this diff        → agent_create
+```text
+@agent:reviewer take a look at this diff   → agent_create(template: "reviewer")
 what agents are available?                 → agent_list
-search the reviewer's auth findings         → agent_inspect (regex search)
-tell the reviewer to also check auth.ts    → agent_send
-kill the reviewer, it's stuck              → agent_remove
+search review-auth's auth findings         → agent_inspect(name: "review-auth")
+tell review-auth to also check auth.ts     → agent_send(name: "review-auth")
+kill review-auth, it's stuck               → agent_remove(name: "review-auth")
 ```
 
-Typing `@` opens a discovery picker that inserts `@<name> ` at the cursor —
-it's just a convenience for referring to an agent by name in your message.
+Typing `@` opens a discovery picker for `@agent:<template> ` reusable templates
+and `@<instance-name> ` live instances. It is just a convenience for referring
+to one in your message.
 
 Five tools, one per intent, so the model expresses intent by *which tool it
 calls* rather than arguments a tool would have to guess from. **Every
@@ -75,35 +76,41 @@ no parent/child tracking, and removing one never cascades to anything it
 spawned.
 
 - **`agent_create`** — spawn one task or several in parallel
-  (`tasks: [...]`, max 8). `model` takes a full id or a unique substring
+  (`tasks: [...]`, max 8). Pass `template: "id"` to use an agent template;
+  omit it for an instance without a template. `model` takes a full id or a unique substring
   (`opus`, `haiku`). Waits for completion by default; `wait: false` fires
   and returns immediately.
-- **`agent_send`** — message an existing agent by name (or def name →
-  most recent instance), reviving it if needed. Fire-and-forget by
-  default; `wait: true` waits for the response. Never creates — errors if
-  `name` is unknown.
-- **`agent_list`** — list every sub-agent's name, model, and state, plus the
-  root session's used/available slots. Use it to find an agent to reuse.
+- **`agent_send`** — message an existing instance by name. Template IDs never
+  alias instances; use `agent_create` to make another instance. Fire-and-forget
+  by default; `wait: true` waits for the response.
+- **`agent_list`** — list **Existing instances** (name, model, and state) and
+  **Available templates** (description, scope, and default model), plus root
+  slot usage. Templates are listed even with no instances.
 - **`agent_inspect`** — inspect one agent's compact status, page through a
   bounded window of its user/assistant turns, or search its chat with a regular
-  expression. It never returns an unbounded full transcript.
-- **`agent_remove`** — delete outright, irreversibly. `main` can never be
-  targeted.
+  expression. It never returns an unbounded full transcript. Add `wait: true`
+  to join an already-running instance once and return only after it settles,
+  without sending it a message or starting another turn.
+- **`agent_remove`** — delete outright, irreversibly. `main` cannot be
+  targeted, and an instance cannot remove itself from inside its own tool call;
+  main or another peer must remove it.
 - A root session can retain at most **32 sub-agents**, shared across every
   delegation depth. Completed, failed, stopped, and idle agents still occupy a
   slot; `agent_remove` frees it. Prefer `agent_list` + `agent_send` to reuse a
   suitable agent, and remove agents created only for one-off work after their
-  results have been collected.
+  results have been collected. When the next step depends on a result, keep the
+  default `agent_create` `wait: true`; use `wait: false` only while doing real
+  independent work, then join once with `agent_inspect({ name, wait: true })`
+  rather than polling or asking agents to notify each other with `agent_send`.
 
-## Sub-agent definitions (`.pi/agents/`)
+## Agent templates (`.pi/agents/`)
 
 Drop Markdown files under `.pi/agents/` (project, highest priority),
 `~/.pi/agent/agents/` (user), or this extension's own `agents/` directory
 (bundled with pi-agent-view itself, lowest priority — e.g. `btw`, a
-read-only Q&A agent shipped in the box) to predefine reusable agents — same
-idea as Claude Code's `.claude/agents/`. A name defined in more than one
-scope resolves to the higher-priority one; the others are still visible via
-`/agents`, which lists source paths. Format:
+read-only Q&A agent shipped in the box) to predefine reusable **agent
+templates** — the same idea as Claude Code's `.claude/agents/`. A name defined in more than one scope
+resolves to the higher-priority template. Format:
 
 ```markdown
 ---
@@ -123,7 +130,7 @@ still load. `model` (`provider/id` or `inherit`) and `thinkingLevel` are just
 defaults for a freshly spawned agent; once an agent has run, it keeps its
 own model.
 
-`/agents` rescans all three scopes and prints what it found; `agent_create`
+`/agents` rescans all three scopes and prints the available templates; `agent_create`
 also rescans on every call, so newly added files show up without a reload.
 
 Don't want to hand-write the frontmatter? Run `/skill:create-agent` and the
@@ -174,7 +181,7 @@ would just produce a notice.
 - Agents are named after their first prompt, slugified (lowercase, single
   hyphens); collisions get a letter suffix (`run-tests`, `run-tests-b`, …).
   `main` is always pi's own session, whatever the session name is. Agents
-  spawned from a `.pi/agents/*.md` def show a `[<def>]` badge next to their
+  spawned from a `.pi/agents/*.md` template show a `[<template>]` badge next to their
   name.
 - Icons: `✽` Working, `✓` Completed, `✗` Failed, `⊘` Stopped (aborted or
   died mid-turn), `∙` Idle.
