@@ -31,6 +31,10 @@
  * testable with plain objects.
  */
 
+import { readTranscript } from "./agent-runtime.ts";
+import type { TranscriptItem } from "./agent-runtime.ts";
+import { renderable, visibleFrom } from "./view-model.ts";
+
 /** Minimal shape of a pi-tui Container, as far as this module cares. */
 export interface RenderNode {
   render(width: number): string[];
@@ -140,4 +144,96 @@ export function installChatFilter(
   };
   target[PATCH] = uninstall;
   return uninstall;
+}
+
+// ── Who a chat child belongs to ─────────────────────────────────────
+//
+// Two more kinds of "does this child belong to the view on screen" besides
+// the owned-entry rule above: our own custom entries (read side: does *this*
+// entry's ref belong to the attached agent) and pi's own children raised as a
+// notice while an agent was attached (write side: tag them; read side: check
+// the tag). Kept together because they are the two ends of the same seam —
+// `tagRaisedChildren` writes the ownership `includeChatChild` later reads.
+
+/**
+ * True when `child` should draw in the current frame — the actual rule this
+ * extension installs via `installChatFilter`, combining the owned-entry rule
+ * above with notice ownership (see `tagRaisedChildren`).
+ *
+ * Three kinds of child, three rules:
+ *   - **our custom entries** — drawn only while their own agent is attached.
+ *     Skipping the whole child matters: pi's `CustomEntryComponent` wrapper
+ *     always prepends a `Spacer(1)`, so a merely-empty render would still leave
+ *     one mystery blank line per hidden entry.
+ *   - **notices we raised from inside an agent view** — pi's own children, but
+ *     they belong to that agent's conversation (see `tagRaisedChildren`).
+ *   - **everything else pi appends** — main's own transcript: drawn only when
+ *     nothing is attached.
+ */
+export function includeChatChild(
+  view: {
+    attached?: string;
+    piChildOwner?: WeakMap<object, string>;
+  },
+  child: unknown,
+  owned: OwnedTypes,
+  /** Test seam; defaults to the live agent pool. */
+  read: (file: string) => TranscriptItem[] = readTranscript,
+): boolean {
+  if (isOwnedChild(child, owned)) {
+    if (view.attached === undefined) return false;
+    const ref = (child as { entry?: { data?: { file: string; index: number } } } | null)?.entry?.data;
+    if (ref?.file !== view.attached) return false;
+    const items = read(ref.file);
+    // Compacted away: pi clears its transcript on compaction and redraws only
+    // what is still in context, so entries older than the newest compaction
+    // stop being drawn here too.
+    if (ref.index < visibleFrom(items)) return false;
+    // An item with nothing to draw *yet* (an assistant message that has not
+    // streamed its first token) must be skipped as a whole child: its entry
+    // exists so that later items keep their order, and pi's wrapper would
+    // otherwise contribute its `Spacer(1)` as a stray blank line.
+    const item = items[ref.index];
+    return item !== undefined && renderable(item);
+  }
+  const owner = view.piChildOwner?.get(child as object);
+  if (owner !== undefined) return view.attached === owner;
+  return view.attached === undefined;
+}
+
+/**
+ * Tag whichever of `chat`'s children `raise()` just added as belonging to
+ * `owner`, so `includeChatChild` draws them only in that view.
+ *
+ * `ctx.ui.notify` works by appending pi's *own* children to the chat
+ * container (`showStatus`/`showError`/`showWarning`), and the filter installed
+ * by `installChatFilter` hides pi's children while an agent is attached. Used
+ * raw, every notice raised from an agent view would therefore be invisible —
+ * typing `/copy` while attached would just swallow the input with no
+ * explanation, a model switch would confirm nothing — and then the whole
+ * backlog would appear in main's transcript on detach. So this tags whatever
+ * pi just added with the view it was raised from, and the filter draws it
+ * there and nowhere else.
+ */
+export function tagRaisedChildren(
+  chat: RenderNode,
+  owner: string,
+  piChildOwner: WeakMap<object, string>,
+  raise: () => void,
+): void {
+  const children = (chat.children ?? []) as unknown[];
+  const before = children.length;
+  raise();
+  const own = (child: unknown) => {
+    if (child && typeof child === "object") piChildOwner.set(child, owner);
+  };
+  if (children.length > before) {
+    for (let i = before; i < children.length; i++) own(children[i]);
+  } else {
+    // Back-to-back status messages: pi rewrites the previous status line's
+    // text in place instead of appending (`showStatus`). That line now shows
+    // *our* message, so it belongs to this view too.
+    own(children[children.length - 1]);
+    own(children[children.length - 2]);
+  }
 }

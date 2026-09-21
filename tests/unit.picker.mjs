@@ -10,7 +10,8 @@
 
 import { assert, assertEqual, load, test } from "./harness.mjs";
 
-const { renderPicker, pickerBudget, DELETE_CONFIRM_MS } = await load("index.ts");
+const { renderPicker, pickerBudget } = await load("index.ts");
+const { DELETE_CONFIRM_MS } = await load("view-model.ts");
 
 /** Theme stand-in: styling is irrelevant here, layout is not. */
 const th = { fg: (_c, text) => text, bold: (text) => text };

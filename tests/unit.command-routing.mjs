@@ -1,5 +1,6 @@
 /**
- * Unit tests for `withAttachedCommandFilter` (index.ts).
+ * Unit tests for `command-routing.ts` (`withAttachedCommandFilter` and the
+ * command sets it enforces).
  *
  * Attached-agent command handling is a blacklist, not a whitelist: `/model`
  * is implemented against the attached agent's own session,
@@ -8,8 +9,8 @@
  * unchanged because they never touch `this.session`, and only
  * `BLOCKED_ATTACHED_COMMANDS` (pi's own session/tree commands: `/tree`,
  * `/fork`, `/resume`, `/new`, ...) are hidden from `/` completion \u2014 because
- * `AgentViewEditor.handleInput` blocks them with a notice instead of running
- * them against the wrong session. Everything else (including commands this
+ * `AgentViewEditor.handleInput` (index.ts) blocks them with a notice instead
+ * of running them against the wrong session. Everything else (including commands this
  * view has never heard of \u2014 extension commands, skills, prompt templates)
  * stays visible: it gets sent to the agent's own session via `prompt()`,
  * exactly like typing it on main would.
@@ -17,7 +18,7 @@
 
 import { assert, assertEqual, load, test } from "./harness.mjs";
 
-const { withAttachedCommandFilter, SUPPORTED_ATTACHED_COMMANDS } = await load("index.ts");
+const { withAttachedCommandFilter, SUPPORTED_ATTACHED_COMMANDS } = await load("command-routing.ts");
 
 /** A fake `AutocompleteProvider` returning a fixed top-level "/" command list. */
 function fakeCommandProvider(names) {

@@ -110,8 +110,6 @@ import {
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
-  type AutocompleteItem,
-  type AutocompleteProvider,
   type Component,
   type MarkdownTheme,
   type TUI,
@@ -148,25 +146,35 @@ import { loadCatalog, type Catalog, type SubAgentDef } from "./agent-catalog.ts"
 import { AGENT_POLICY } from "./agent-policy.ts";
 import { type LiveAgentInfo } from "./at-mention.ts";
 import { wrapWithAgentMentions } from "./autocomplete.ts";
-import { findChatContainer, installChatFilter, isOwnedChild, type RenderNode } from "./transcript-view.ts";
+import {
+  BLOCKED_ATTACHED_COMMANDS,
+  commandName,
+  GLOBAL_ATTACHED_COMMANDS,
+  parseModelCommand,
+  withAttachedCommandFilter,
+} from "./command-routing.ts";
+import { findChatContainer, includeChatChild, installChatFilter, tagRaisedChildren, type RenderNode } from "./transcript-view.ts";
 import { initMarkdownTransformers, initToolRenderers, mermaidTransformerFactory, toolRenderersFor } from "./tool-renderers.ts";
 import { registerAgentCreateTool, agentCreateTool } from "./agent-create-tool.ts";
 import { registerAgentListTool, agentListTool } from "./agent-list-tool.ts";
 import { registerAgentInspectTool, agentInspectTool } from "./agent-inspect-tool.ts";
 import { registerAgentControlTools, agentSendTool, agentRemoveTool } from "./agent-control-tool.ts";
 import {
+  armDeleteConfirm,
   attachTo,
   buildRows,
+  clearDeleteConfirm,
+  DELETE_CONFIRM_MS,
+  deleteConfirmed,
   isVisible,
   moveSelection,
   noteMirrored,
   reconcileSelection,
-  renderable,
-  visibleFrom,
   selectedRow,
   syncMirror,
   type AgentRow,
   type AgentState,
+  type DeleteConfirm,
   type ItemRef,
   type MirrorState,
   type Selection,
@@ -256,46 +264,6 @@ function getView(): ViewState {
 
 const ITEM_ENTRY = "agent-view-item";
 const OWNED_ENTRIES: ReadonlySet<string> = new Set([ITEM_ENTRY]);
-
-/**
- * Which children of pi's chat container draw in the current frame.
- *
- * Three kinds of child, three rules:
- *   - **our custom entries** — drawn only while their own agent is attached.
- *     Skipping the whole child matters: pi's `CustomEntryComponent` wrapper
- *     always prepends a `Spacer(1)`, so a merely-empty render would still leave
- *     one mystery blank line per hidden entry.
- *   - **notices we raised from inside an agent view** — pi's own children, but
- *     they belong to that agent's conversation (see `notify`).
- *   - **everything else pi appends** — main's own transcript: drawn only when
- *     nothing is attached.
- */
-export function includeChatChild(
-  view: ViewState,
-  child: unknown,
-  /** Test seam; defaults to the live agent pool. */
-  read: (file: string) => TranscriptItem[] = readTranscript,
-): boolean {
-  if (isOwnedChild(child, OWNED_ENTRIES)) {
-    if (view.attached === undefined) return false;
-    const ref = (child as { entry?: { data?: ItemRef } } | null)?.entry?.data;
-    if (ref?.file !== view.attached) return false;
-    const items = read(ref.file);
-    // Compacted away: pi clears its transcript on compaction and redraws only
-    // what is still in context, so entries older than the newest compaction
-    // stop being drawn here too.
-    if (ref.index < visibleFrom(items)) return false;
-    // An item with nothing to draw *yet* (an assistant message that has not
-    // streamed its first token) must be skipped as a whole child: its entry
-    // exists so that later items keep their order, and pi's wrapper would
-    // otherwise contribute its `Spacer(1)` as a stray blank line.
-    const item = items[ref.index];
-    return item !== undefined && renderable(item);
-  }
-  const owner = view.piChildOwner?.get(child as object);
-  if (owner !== undefined) return view.attached === owner;
-  return view.attached === undefined;
-}
 
 /**
  * Everything pi feeds its own message components, read from settings once so an
@@ -658,8 +626,6 @@ function clip(s: string, n: number): string {
 
 /** Border characters kept to the right of the editor's view label. */
 const LABEL_TAIL = 4;
-/** Time allowed between the two Ctrl+X presses for irreversible deletion. */
-export const DELETE_CONFIRM_MS = 2_000;
 
 /**
  * Lines the dock keeps for itself around the picker widget: one line of
@@ -769,7 +735,7 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
     const tags = row.isAttached ? th.fg("success", " (attached)") : "";
     out.push(truncateToWidth(`${pointer}${icon} ${nameStr}${badge}${tags}`, width));
 
-    const deleting = row.key === view.pendingDeleteKey && (view.pendingDeleteUntil ?? 0) > Date.now();
+    const deleting = deleteConfirmed(view, row.key);
     const meta = deleting
       ? th.fg("error", row.isRoot ? "Press Ctrl+X again to abort" : "Press Ctrl+X again to delete")
       : th.fg("muted", `${row.messageCount} msg${row.messageCount === 1 ? "" : "s"}`);
@@ -802,131 +768,6 @@ type Action =
   | { t: "terminateMain" }
   /** A `BLOCKED_ATTACHED_COMMANDS` command was typed while attached. */
   | { t: "blockedCommand"; name: string };
-
-/**
- * `/model` typed while an agent is attached.
- *
- * pi's own `/model` is handled by interactive mode before extensions see it and
- * always targets pi's session, so an attached view has to recognise it itself —
- * otherwise the command text would be sent to the agent as a prompt.
- */
-function parseModelCommand(text: string): { search?: string } | undefined {
-  if (text !== "/model" && !text.startsWith("/model ")) return undefined;
-  const search = text.slice("/model".length).trim();
-  return { search: search || undefined };
-}
-
-/**
- * pi built-in commands (keyed by the name autocomplete lists them under, no
- * leading slash) that don't touch a session's transcript/state at all:
- * auth (`/login`, `/logout`), folder trust, provider settings, extension
- * reload, quitting the app, static info screens, easter eggs. Running pi's
- * real dispatch for these is correct and safe no matter which agent is on
- * screen, since they never read or write `this.session` — so `handleInput`
- * lets them fall through to it unchanged instead of steering them as chat
- * text to the attached agent.
- */
-const GLOBAL_ATTACHED_COMMANDS = new Set<string>([
-  "settings",
-  "login",
-  "logout",
-  "trust",
-  "reload",
-  "debug",
-  "hotkeys",
-  "changelog",
-  "quit",
-  "arminsayshi",
-  "dementedelves",
-]);
-
-/**
- * Slash commands actually implemented against the attached agent's own
- * session, keyed by the name pi's autocomplete lists them under. `handleInput`
- * below has a dedicated case for each of these.
- */
-export const SUPPORTED_ATTACHED_COMMANDS = new Set<string>(["model"]);
-
-/**
- * Blacklist: pi built-ins that either operate on *pi's own* session/tree in
- * ways that don't translate to "the agent you're looking at" (`/tree`,
- * `/fork`, `/resume`, `/new` branch, switch, or clear pi's session file;
- * `/clone`, `/export`, `/import`, `/share`, `/scoped-models`, `/name` are
- * similarly wired to `this.session`), or are per-session but not yet
- * implemented against the attached agent's own session the way `/model` is
- * (`/thinking`, `/compact`, `/copy`, `/session` all have a direct
- * `AgentSession` equivalent — `setThinkingLevel`/`cycleThinkingLevel`,
- * `compact`, `getLastAssistantText`, `getSessionStats` — but nothing in this
- * file calls them yet). Confirmed in a real tmux run (see
- * `.agents/skills/pi-agent-view-debug`): letting any of these fall through to
- * pi's real dispatch while attached either silently mutates main instead of
- * the agent on screen (`/tree` opened pi's *own* session tree), or — for the
- * unimplemented per-session ones — just gets sent to the agent as chat text
- * verbatim (`/thinking` produced a literal "/thinking" chat message the LLM
- * then had to explain away). Both are worse than a clear "not available"
- * notice, so `handleInput` blocks all of them instead. Move a command out of
- * this set into `SUPPORTED_ATTACHED_COMMANDS` once it has a real
- * attached-agent implementation; move a global one to
- * `GLOBAL_ATTACHED_COMMANDS` if it turns out not to touch a session at all.
- */
-const BLOCKED_ATTACHED_COMMANDS = new Set<string>([
-  "tree",
-  "fork",
-  "clone",
-  "resume",
-  "new",
-  "scoped-models",
-  "export",
-  "import",
-  "share",
-  "name",
-  "thinking",
-  "compact",
-  "copy",
-  "session",
-]);
-
-/**
- * Hide slash commands the attached view would reject outright from `/`
- * completion — the blacklist above, since typing one gets blocked with a
- * notice instead of doing anything useful. Global commands and the ones this
- * view implements itself both stay visible: both actually run. Detached (on
- * `main`), this passes every call straight through: `view.attached` is unset
- * only there.
- */
-export function withAttachedCommandFilter(current: AutocompleteProvider, view: ViewState): AutocompleteProvider {
-  return {
-    triggerCharacters: current.triggerCharacters,
-    async getSuggestions(lines, cursorLine, cursorCol, options) {
-      const result = await current.getSuggestions(lines, cursorLine, cursorCol, options);
-      if (!result || !view.attached) return result;
-      // Only the top-level "/" command list needs filtering: a command that
-      // made it past that list either runs directly or is one we implement
-      // ourselves, so its own argument completions (prefix has a space in it)
-      // are left untouched.
-      if (!result.prefix.startsWith("/") || result.prefix.includes(" ")) return result;
-      const items = result.items.filter((item: AutocompleteItem) => !BLOCKED_ATTACHED_COMMANDS.has(item.value));
-      if (items.length === 0) return null;
-      return { ...result, items };
-    },
-    applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
-      current.applyCompletion(lines, cursorLine, cursorCol, item, prefix),
-    shouldTriggerFileCompletion: current.shouldTriggerFileCompletion
-      ? (lines, cursorLine, cursorCol) => current.shouldTriggerFileCompletion!(lines, cursorLine, cursorCol)
-      : undefined,
-  };
-}
-
-/**
- * The bare command name of a `/foo` or `/foo args` line, or `undefined` for
- * anything else (plain chat text, `!bash`, `@mention`, ...).
- */
-function commandName(text: string): string | undefined {
-  if (!text.startsWith("/")) return undefined;
-  const spaceIndex = text.indexOf(" ");
-  const name = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-  return name || undefined;
-}
 
 /**
  * What the editor frame says about the conversation on screen.
@@ -1214,8 +1055,7 @@ export class AgentViewEditor extends CustomEditor {
       view.selected = next.selected;
       view.scroll = next.scroll;
       view.key = next.key;
-      view.pendingDeleteKey = undefined;
-      view.pendingDeleteUntil = undefined;
+      clearDeleteConfirm(view);
       view.refresh?.();
       return;
     }
@@ -1316,7 +1156,7 @@ export default function agentViews(pi: ExtensionAPI): void {
     const chat = findChatContainer(tui as unknown as RenderNode | undefined, OWNED_ENTRIES);
     if (!chat) return;
     view.chat = chat;
-    view.unfilter = installChatFilter(chat, (child) => includeChatChild(view, child));
+    view.unfilter = installChatFilter(chat, (child) => includeChatChild(view, child, OWNED_ENTRIES));
     // The current frame may already have drawn the unfiltered container.
     tui?.requestRender(true);
   }
@@ -1442,8 +1282,8 @@ export default function agentViews(pi: ExtensionAPI): void {
    * from an agent view was therefore invisible — typing `/copy` while attached
    * just swallowed the input with no explanation, a model switch confirmed
    * nothing — and then the whole backlog appeared in main's transcript on
-   * detach. So tag whatever pi just added with the view it was raised from, and
-   * let the filter draw it there and nowhere else.
+   * detach. So tag whatever pi just added with the view it was raised from (see
+   * `tagRaisedChildren`), and let the filter draw it there and nowhere else.
    */
   function notify(ctx: ExtensionContext, message: string, level?: "info" | "warning" | "error"): void {
     const chat = view.chat;
@@ -1452,24 +1292,8 @@ export default function agentViews(pi: ExtensionAPI): void {
       ctx.ui.notify(message, level);
       return;
     }
-    const children = (chat.children ?? []) as unknown[];
-    const before = children.length;
-    ctx.ui.notify(message, level);
-    const own = (child: unknown) => {
-      if (child && typeof child === "object") {
-        view.piChildOwner ??= new WeakMap();
-        view.piChildOwner.set(child as object, owner);
-      }
-    };
-    if (children.length > before) {
-      for (let i = before; i < children.length; i++) own(children[i]);
-    } else {
-      // Back-to-back status messages: pi rewrites the previous status line's
-      // text in place instead of appending (`showStatus`). That line now shows
-      // *our* message, so it belongs to this view too.
-      own(children[children.length - 1]);
-      own(children[children.length - 2]);
-    }
+    view.piChildOwner ??= new WeakMap();
+    tagRaisedChildren(chat, owner, view.piChildOwner, () => ctx.ui.notify(message, level));
     tui?.requestRender();
   }
 
@@ -1514,8 +1338,7 @@ export default function agentViews(pi: ExtensionAPI): void {
   function clearDeleteConfirmation(): void {
     if (deleteTimer) clearTimeout(deleteTimer);
     deleteTimer = undefined;
-    view.pendingDeleteKey = undefined;
-    view.pendingDeleteUntil = undefined;
+    clearDeleteConfirm(view);
   }
 
   function closePicker(ctx: ExtensionContext): void {
@@ -1629,8 +1452,7 @@ export default function agentViews(pi: ExtensionAPI): void {
    */
   function requestTerminate(ctx: ExtensionContext, file: string, main = false): void {
     const isMain = main || file === ctx.sessionManager.getSessionFile();
-    const now = Date.now();
-    if (view.pendingDeleteKey === file && (view.pendingDeleteUntil ?? 0) >= now) {
+    if (deleteConfirmed(view, file)) {
       clearDeleteConfirmation();
       if (isMain) ctx.abort();
       else void terminate(ctx, file);
@@ -1638,9 +1460,7 @@ export default function agentViews(pi: ExtensionAPI): void {
     }
 
     clearDeleteConfirmation();
-    const deadline = now + DELETE_CONFIRM_MS;
-    view.pendingDeleteKey = file;
-    view.pendingDeleteUntil = deadline;
+    const deadline = armDeleteConfirm(view, file);
     if (!view.open) {
       notify(ctx, isMain ? "Press Ctrl+X again to abort" : `Press Ctrl+X again to delete ${nameOf(file)}`, "warning");
     }

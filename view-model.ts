@@ -253,6 +253,43 @@ export function moveSelection(rows: AgentRow[], previous: Selection, delta: numb
   };
 }
 
+// ── Delete confirmation ───────────────────────────────────────────────
+//
+// Ctrl+X is a confirmed hard action, not a one-press one: it always needs a
+// second press on the *same* target within `DELETE_CONFIRM_MS`, whether that
+// target is an agent (delete) or main (abort). What the picker shows for an
+// armed row (`renderPicker`, index.ts) and what a second Ctrl+X checks (index.ts's
+// `requestTerminate`) must agree on the same definition of "armed" — they used
+// to each write their own `pendingDeleteUntil` comparison and drifted apart
+// (`>` vs `>=` against `Date.now()`). One function now, used by both.
+
+/** Time allowed between the two Ctrl+X presses for irreversible deletion. */
+export const DELETE_CONFIRM_MS = 2_000;
+
+export interface DeleteConfirm {
+  /** Target waiting for a second Ctrl+X before its action deadline. */
+  pendingDeleteKey?: string;
+  pendingDeleteUntil?: number;
+}
+
+/** Arm `key` for deletion/abort, replacing whatever was armed before. Returns the deadline. */
+export function armDeleteConfirm(state: DeleteConfirm, key: string, now: number = Date.now()): number {
+  const deadline = now + DELETE_CONFIRM_MS;
+  state.pendingDeleteKey = key;
+  state.pendingDeleteUntil = deadline;
+  return deadline;
+}
+
+/** True when `key` is armed and the second Ctrl+X still lands within the window. */
+export function deleteConfirmed(state: DeleteConfirm, key: string, now: number = Date.now()): boolean {
+  return state.pendingDeleteKey === key && (state.pendingDeleteUntil ?? 0) >= now;
+}
+
+export function clearDeleteConfirm(state: DeleteConfirm): void {
+  state.pendingDeleteKey = undefined;
+  state.pendingDeleteUntil = undefined;
+}
+
 /**
  * The row the user is actually looking at.
  *

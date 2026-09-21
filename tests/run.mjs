@@ -15,7 +15,7 @@ import "./unit.tool-renderers.mjs";
 import "./unit.render.mjs";
 import "./unit.working-indicator.mjs";
 import "./unit.picker.mjs";
-import "./unit.attached-commands.mjs";
+import "./unit.command-routing.mjs";
 import "./unit.catalog.mjs";
 import "./unit.at-mention.mjs";
 import "./unit.summarize-context.mjs";

@@ -434,3 +434,44 @@ test("compaction hides everything the agent no longer has in context", () => {
   // The block itself draws (it is the summary of what was dropped).
   assertEqual(vm.renderable(items[2]), true, "the compaction block itself is drawn");
 });
+
+// ── Delete confirmation ──────────────────────────────────────────
+
+test("armDeleteConfirm arms a target, deleteConfirmed is true until the window elapses", () => {
+  const state = {};
+  const now = 1_000_000;
+  const deadline = vm.armDeleteConfirm(state, "doomed", now);
+  assertEqual(deadline, now + vm.DELETE_CONFIRM_MS, "deadline is now + the window");
+  assert(vm.deleteConfirmed(state, "doomed", now), "confirmed right after arming");
+  assert(vm.deleteConfirmed(state, "doomed", deadline), "confirmed exactly at the deadline");
+  assert(!vm.deleteConfirmed(state, "doomed", deadline + 1), "not confirmed once the window has passed");
+});
+
+test("deleteConfirmed only agrees for the armed key", () => {
+  const state = {};
+  const now = 1_000_000;
+  vm.armDeleteConfirm(state, "doomed", now);
+  assert(!vm.deleteConfirmed(state, "someone-else", now), "a different key was never armed");
+});
+
+test("deleteConfirmed is false before anything is armed", () => {
+  assert(!vm.deleteConfirmed({}, "anything", Date.now()), "nothing armed yet");
+});
+
+test("armDeleteConfirm re-arming replaces whatever was armed before", () => {
+  const state = {};
+  const now = 1_000_000;
+  vm.armDeleteConfirm(state, "first", now);
+  vm.armDeleteConfirm(state, "second", now);
+  assert(!vm.deleteConfirmed(state, "first", now), "the first target is no longer armed");
+  assert(vm.deleteConfirmed(state, "second", now), "the second target is armed instead");
+});
+
+test("clearDeleteConfirm resets both fields", () => {
+  const state = {};
+  vm.armDeleteConfirm(state, "doomed");
+  vm.clearDeleteConfirm(state);
+  assertEqual(state.pendingDeleteKey, undefined, "key cleared");
+  assertEqual(state.pendingDeleteUntil, undefined, "deadline cleared");
+  assert(!vm.deleteConfirmed(state, "doomed"), "no longer confirmed once cleared");
+});

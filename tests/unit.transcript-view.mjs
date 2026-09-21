@@ -142,9 +142,7 @@ test("another extension's entries always pass through as pi content (never treat
   assertEqual(chat.render(80), ["todo"], "detached: the other extension is there, ours is hidden");
 });
 
-// ── the real include rule (index.ts) ──────────────────────────────
-
-const { includeChatChild } = await load("index.ts");
+// ── the real include rule (transcript-view.ts) ──────────────────────
 
 test("the real filter rule: our entries, main's content, and notices raised inside an agent view", () => {
   const items = { "/tmp/a.jsonl": [{ kind: "user", text: "hi" }], "/tmp/b.jsonl": [{ kind: "user", text: "yo" }] };
@@ -154,7 +152,7 @@ test("the real filter rule: our entries, main's content, and notices raised insi
   const mainLine = piChild("main line");
   const noticeInA = piChild("Warning: /copy isn't available…");
   const view = { attached: undefined, piChildOwner: new WeakMap([[noticeInA, "/tmp/a.jsonl"]]) };
-  const include = (child) => includeChatChild(view, child, read);
+  const include = (child) => tv.includeChatChild(view, child, OWNED, read);
 
   view.attached = undefined;
   assert(include(mainLine), "detached: main's own content draws");
@@ -186,13 +184,39 @@ test("an entry whose item has nothing to draw yet is skipped whole, not left as 
   const child = ourChild("(nothing yet)", "agent-view-item", "/tmp/a.jsonl");
   const view = { attached: "/tmp/a.jsonl" };
 
-  assert(!includeChatChild(view, child, read), "empty streaming reply: skipped");
+  assert(!tv.includeChatChild(view, child, OWNED, read), "empty streaming reply: skipped");
 
   items[0].message.content = [{ type: "text", text: "here we go" }];
-  assert(includeChatChild(view, child, read), "same entry draws as soon as it has content");
+  assert(tv.includeChatChild(view, child, OWNED, read), "same entry draws as soon as it has content");
 
   // A ref that points past the end (its item never made it to disk) draws nothing
   // instead of throwing.
   const dangling = { entry: { customType: "agent-view-item", data: { file: "/tmp/a.jsonl", index: 99 } }, render: () => ["x"] };
-  assert(!includeChatChild(view, dangling, read), "a dangling ref is skipped, not rendered");
+  assert(!tv.includeChatChild(view, dangling, OWNED, read), "a dangling ref is skipped, not rendered");
+});
+
+// ── tagRaisedChildren (the write side of notice ownership) ─────────
+
+test("tagRaisedChildren tags every child a single raise() appended", () => {
+  const chat = container([piChild("existing")]);
+  const owner = new WeakMap();
+  tv.tagRaisedChildren(chat, "/tmp/a.jsonl", owner, () => {
+    chat.children.push(piChild("notice one"), piChild("notice two"));
+  });
+  assertEqual(owner.get(chat.children[1]), "/tmp/a.jsonl", "first appended child tagged");
+  assertEqual(owner.get(chat.children[2]), "/tmp/a.jsonl", "second appended child tagged");
+  assert(!owner.has(chat.children[0]), "a pre-existing child is left untouched");
+});
+
+test("tagRaisedChildren falls back to the last two children when raise() rewrote in place instead of appending", () => {
+  // pi's `showStatus` rewrites the previous status line's text instead of
+  // appending a new child for back-to-back status messages — no new child to
+  // tag, so the two most recent existing ones are re-tagged as belonging here.
+  const chat = container([piChild("first status"), piChild("second status")]);
+  const owner = new WeakMap();
+  tv.tagRaisedChildren(chat, "/tmp/a.jsonl", owner, () => {
+    /* rewrites in place: no push */
+  });
+  assertEqual(owner.get(chat.children[0]), "/tmp/a.jsonl", "second-to-last child tagged");
+  assertEqual(owner.get(chat.children[1]), "/tmp/a.jsonl", "last child tagged");
 });
