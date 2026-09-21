@@ -24,7 +24,8 @@ import { Type } from "typebox";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
-import { assistantText, getAgent, resolveModelSearch, runAgent, runAgentAndWait, type LiveAgent } from "./agent-runtime.ts";
+import { getAgent, resolveModelSearch, runAgent, runAgentAndWait } from "./agent-runtime.ts";
+import { isTerminalFailure, lastAssistantText } from "./agent-summary.ts";
 import { loadCatalog, type SubAgentDef } from "./agent-catalog.ts";
 import {
   agentName,
@@ -86,19 +87,6 @@ function normalizeModelParam(model: string | undefined): string | undefined {
   if (!model) return undefined;
   const trimmed = model.trim();
   return trimmed && trimmed.toLowerCase() !== "inherit" ? trimmed : undefined;
-}
-
-/** The most recent assistant message text in a live agent's transcript. */
-function lastAssistantText(agent: LiveAgent): string {
-  for (let i = agent.transcript.length - 1; i >= 0; i--) {
-    const item = agent.transcript[i]!;
-    if (item.kind === "assistant") return assistantText(item.message).trim();
-  }
-  return "";
-}
-
-function isFailed(agent: LiveAgent): boolean {
-  return agent.state === "failed" || agent.state === "stopped";
 }
 
 export const agentCreateTool = defineTool({
@@ -259,13 +247,13 @@ export const agentCreateTool = defineTool({
     const summaries = results.map(({ name, def, modelId, task, agent }) => {
       const tags = [def?.name, modelId ?? agent.session.model?.id].filter(Boolean);
       const label = tags.length > 0 ? `${name} [${tags.join(" · ")}]` : name;
-      const failed = isFailed(agent);
+      const failed = isTerminalFailure(agent.state);
       const status = failed ? `failed${agent.error ? `: ${agent.error}` : ""}` : "completed";
-      const output = lastAssistantText(agent) || "(no output)";
+      const output = lastAssistantText(agent.transcript) || "(no output)";
       return `### ${label} — ${status}\n\nTask: ${task}\n\n${output}`;
     });
 
-    const successCount = results.filter(({ agent }) => !isFailed(agent)).length;
+    const successCount = results.filter(({ agent }) => !isTerminalFailure(agent.state)).length;
     const header = results.length === 1 ? undefined : `${successCount}/${results.length} sub-agent(s) succeeded.\n\n`;
 
     return {

@@ -8,7 +8,8 @@
 import { Type } from "typebox";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { getAgent, modelOf, stateOf } from "./agent-runtime.ts";
+import { getAgent, stateOf } from "./agent-runtime.ts";
+import { describeAgentLabel } from "./agent-summary.ts";
 import { readAgentFile } from "./view-model.ts";
 import { loadCatalog } from "./agent-catalog.ts";
 import {
@@ -16,17 +17,12 @@ import {
   listAgentEntries,
   MAX_AGENTS_PER_SESSION,
   resolveRoot,
-  templateId,
   type AgentEntry,
 } from "./storage.ts";
 
 function agentLine(entry: AgentEntry): string {
-  const liveModel = modelOf(entry.file);
   const persisted = readAgentFile(entry.file);
-  const model = liveModel ? `${liveModel.provider}/${liveModel.id}` : persisted.model;
-  const tags = [templateId(entry), model].filter(Boolean);
-  const label = tags.length > 0 ? `${entry.name} [${tags.join(" · ")}]` : entry.name;
-  return `- ${label} — ${stateOf(entry.file) ?? persisted.fileState}`;
+  return `- ${describeAgentLabel(entry)} — ${stateOf(entry.file) ?? persisted.fileState}`;
 }
 
 function templateLine(template: { name: string; description: string; scope: string; model?: string }): string {

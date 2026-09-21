@@ -16,18 +16,16 @@ import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import {
-  assistantText,
   ensureAgent,
   forgetAgent,
   getAgent,
-  modelOf,
   resolveModelSearch,
   runAgentAndWait,
   setAgentModel,
   stateOf,
   steerAgent,
-  type LiveAgent,
 } from "./agent-runtime.ts";
+import { describeAgentLabel, isTerminalFailure, lastAssistantText } from "./agent-summary.ts";
 import { loadCatalog } from "./agent-catalog.ts";
 import { resolveEntry } from "./agent-lookup.ts";
 import { listAgentEntries, removeAgentEntry, resolveRoot, ROOT_AGENT_NAME, templateId, type AgentEntry } from "./storage.ts";
@@ -47,20 +45,6 @@ function unknownAgentError(name: string, entries: readonly AgentEntry[]) {
     ],
     isError: true,
   };
-}
-
-function describeAgent(entry: AgentEntry, model?: { provider: string; id: string }): string {
-  const tags = [templateId(entry), model ? `${model.provider}/${model.id}` : undefined].filter(Boolean);
-  return tags.length > 0 ? `${entry.name} [${tags.join(" · ")}]` : entry.name;
-}
-
-/** The most recent assistant message text in a live agent's transcript. */
-function lastAssistantText(agent: LiveAgent): string {
-  for (let i = agent.transcript.length - 1; i >= 0; i--) {
-    const item = agent.transcript[i]!;
-    if (item.kind === "assistant") return assistantText(item.message).trim();
-  }
-  return "";
 }
 
 // ── agent_send ───────────────────────────────────────────────────────
@@ -129,7 +113,6 @@ export const agentSendTool = defineTool({
       return { content: [{ type: "text", text: `Could not revive ${entry.name}: ${String(err)}` }], isError: true };
     }
     if (forcedModel) await setAgentModel(entry.file, forcedModel);
-    const model = modelOf(entry.file);
 
     if (!params.wait) {
       const ok = await steerAgent(entry.file, params.text);
@@ -140,18 +123,18 @@ export const agentSendTool = defineTool({
         content: [
           {
             type: "text",
-            text: `Sent to ${describeAgent(entry, model)}. It's running in the background — use agent_inspect to check on it.`,
+            text: `Sent to ${describeAgentLabel(entry)}. It's running in the background — use agent_inspect to check on it.`,
           },
         ],
       };
     }
 
     const agent = await runAgentAndWait(entry.file, params.text, ctx.cwd, ctx.model, ctx.thinkingLevel, def, forcedModel);
-    const failed = agent.state === "failed" || agent.state === "stopped";
+    const failed = isTerminalFailure(agent.state);
     const status = failed ? `failed${agent.error ? `: ${agent.error}` : ""}` : "completed";
-    const output = lastAssistantText(agent) || "(no output)";
+    const output = lastAssistantText(agent.transcript) || "(no output)";
     return {
-      content: [{ type: "text", text: `${describeAgent(entry, model)} — ${status}\n\n${output}` }],
+      content: [{ type: "text", text: `${describeAgentLabel(entry)} — ${status}\n\n${output}` }],
       isError: failed,
     };
   },

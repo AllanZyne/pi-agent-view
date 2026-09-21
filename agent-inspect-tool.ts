@@ -14,9 +14,10 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { assistantText, getAgent, modelOf, readTranscript, stateOf, waitForAgentSettled, type TranscriptItem } from "./agent-runtime.ts";
+import { assistantText, getAgent, readTranscript, stateOf, waitForAgentSettled, type TranscriptItem } from "./agent-runtime.ts";
+import { describeAgentLabel, lastAssistantText } from "./agent-summary.ts";
 import { resolveEntry } from "./agent-lookup.ts";
-import { listAgentEntries, resolveRoot, templateId, type AgentEntry } from "./storage.ts";
+import { listAgentEntries, resolveRoot, type AgentEntry } from "./storage.ts";
 
 const DEFAULT_LIMIT = 5;
 const MAX_LIMIT = 10;
@@ -74,14 +75,6 @@ function firstUserText(items: readonly TranscriptItem[]): string {
   return item?.kind === "user" ? item.text : "";
 }
 
-function lastAssistantTextFromItems(items: readonly TranscriptItem[]): string {
-  for (let i = items.length - 1; i >= 0; i--) {
-    const item = items[i]!;
-    if (item.kind === "assistant") return assistantText(item.message).trim();
-  }
-  return "";
-}
-
 /** `→ toolName` / `← toolName (error)` lines, most recent last. */
 function recentToolActivity(items: readonly TranscriptItem[], max = 8): string[] {
   const lines: string[] = [];
@@ -90,12 +83,6 @@ function recentToolActivity(items: readonly TranscriptItem[], max = 8): string[]
     else if (item.kind === "toolResult") lines.push(`← ${item.name}${item.isError ? " (error)" : ""}`);
   }
   return lines.slice(-max);
-}
-
-function describeAgent(entry: AgentEntry): string {
-  const model = modelOf(entry.file);
-  const tags = [templateId(entry), model ? `${model.provider}/${model.id}` : undefined].filter(Boolean);
-  return tags.length > 0 ? `${entry.name} [${tags.join(" · ")}]` : entry.name;
 }
 
 interface ChatTurn {
@@ -311,7 +298,7 @@ export const agentInspectTool = defineTool({
 
     const items = readTranscript(entry.file);
     const state = stateOf(entry.file) ?? "idle";
-    const header = `${describeAgent(entry)} — ${state}`;
+    const header = `${describeAgentLabel(entry)} — ${state}`;
     const limit = Math.min(params.limit ?? DEFAULT_LIMIT, MAX_LIMIT);
     const mode = params.mode ?? "summary";
 
@@ -326,7 +313,7 @@ export const agentInspectTool = defineTool({
 
       const task = firstUserText(items) || "(none recorded)";
       const progress = recentToolActivity(items);
-      const latest = truncate(lastAssistantTextFromItems(items) || "(no output yet)", TURN_MAX_CHARS);
+      const latest = truncate(lastAssistantText(items) || "(no output yet)", TURN_MAX_CHARS);
       const body = [
         `Task: ${truncate(task, TURN_MAX_CHARS)}`,
         progress.length > 0 ? `Recent activity:\n${progress.join("\n")}` : undefined,

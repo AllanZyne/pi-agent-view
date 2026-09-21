@@ -7,6 +7,7 @@
 
 import "./unit.storage.mjs";
 import "./unit.agent-tools.mjs";
+import "./unit.agent-summary.mjs";
 import "./unit.agent-lookup.mjs";
 import "./unit.view-model.mjs";
 import "./unit.transcript-view.mjs";
