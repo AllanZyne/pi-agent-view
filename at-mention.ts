@@ -77,3 +77,29 @@ export function atTokenAtCursor(
   const prefix = before.slice(start);
   return { prefix, slug: prefix.slice(1) };
 }
+
+/**
+ * True when the cursor sits exactly one delimiter past a mention that just
+ * finished -- e.g. right after the space in "@agent ". atTokenAtCursor
+ * itself correctly stops recognising a token the instant a delimiter
+ * follows it (the token is over); the problem this catches is one level
+ * out. pi's own file completion has a separate, @-independent fallback: an
+ * empty path prefix immediately after any word+delimiter opportunistically
+ * offers to browse the current directory
+ * (CombinedAutocompleteProvider.extractPathPrefix's "return an empty prefix
+ * after whitespace... but not for empty text" branch). That fallback fires
+ * for this exact position too, because our merged popup was still open
+ * right up until the delimiter was typed, and pi's editor re-queries the
+ * *active* provider (not the natural per-keystroke trigger check) on every
+ * keystroke while a popup is open -- so it lands on our wrapper, sees no @
+ * token, and (without this check) forwards straight to that fallback.
+ * autocomplete.ts uses this to recognise "you just finished a mention,
+ * there is nothing left to suggest" and stop there, instead of opening an
+ * unrelated file listing one keystroke after selecting an agent.
+ */
+export function justClosedMentionToken(lines: string[], cursorLine: number, cursorCol: number): boolean {
+  const line = lines[cursorLine] ?? "";
+  const prev = line[cursorCol - 1];
+  if (prev === undefined || !isDelimiter(prev)) return false;
+  return atTokenAtCursor(lines, cursorLine, cursorCol - 1) !== null;
+}

@@ -42,7 +42,7 @@
  */
 
 import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "@earendil-works/pi-tui";
-import { atTokenAtCursor, type LiveAgentInfo } from "./at-mention.ts";
+import { atTokenAtCursor, justClosedMentionToken, type LiveAgentInfo } from "./at-mention.ts";
 import type { Catalog } from "./agent-catalog.ts";
 
 /**
@@ -92,7 +92,17 @@ export function wrapWithAgentMentions(
 
     async getSuggestions(lines, cursorLine, cursorCol, options) {
       const token = atTokenAtCursor(lines, cursorLine, cursorCol);
-      if (!token) return current.getSuggestions(lines, cursorLine, cursorCol, options);
+      if (!token) {
+        // The cursor just stepped past a mention that finished (e.g. the
+        // space right after "@agent "). Without this, pi's editor re-queries
+        // us (not the base directly) because our popup was still open one
+        // keystroke ago, and forwarding blindly would hit pi's own
+        // unrelated "browse the current directory" fallback for an empty
+        // path prefix after any word (see justClosedMentionToken's doc) --
+        // an unrelated file listing right after picking an agent.
+        if (justClosedMentionToken(lines, cursorLine, cursorCol)) return null;
+        return current.getSuggestions(lines, cursorLine, cursorCol, options);
+      }
 
       const agentItems = agentMentionItems(token, rescan());
       // Ask pi's own file completion too, using the *same* token — its own

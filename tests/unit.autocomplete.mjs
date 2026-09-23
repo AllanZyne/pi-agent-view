@@ -171,6 +171,32 @@ test("wrap: '@' inside a word (e.g. email) is not a token — delegates entirely
   assertEqual(result, null, "not in an @-token → delegated whole → base returned null for this non-slash, non-@ text");
 });
 
+test("wrap: typing a space right after a finished mention closes the popup instead of opening an unrelated file listing", async () => {
+  // The actual bug: pi's editor re-queries the *active* provider (ours, since
+  // our merged popup was still open for "@agent") on the very next keystroke,
+  // even though that keystroke (a space) isn't one of pi's own trigger
+  // characters. Without justClosedMentionToken, falling through to the base
+  // here would hit its own unrelated "browse the current directory" fallback
+  // for an empty path prefix right after a word+delimiter.
+  const provider = wrapWithAgentMentions(slashAndFileBase(), () => fakeScan(["reviewer"]));
+  const result = await provider.getSuggestions(["@agent "], 0, "@agent ".length, {
+    signal: new AbortController().signal,
+  });
+  assertEqual(result, null, "nothing to suggest right after a mention closes — not the base's directory listing");
+});
+
+test("wrap: prose with no @ anywhere still delegates to the base normally (not over-suppressed)", async () => {
+  // A trailing space after ordinary prose (no @ before it at all) must not
+  // be mistaken for "just closed a mention" -- justClosedMentionToken is
+  // false here, so this still reaches the base, which for this input (no
+  // leading "/", no "@") legitimately has nothing to offer either.
+  const provider = wrapWithAgentMentions(slashAndFileBase(), () => fakeScan(["reviewer"]));
+  const result = await provider.getSuggestions(["just some words "], 0, "just some words ".length, {
+    signal: new AbortController().signal,
+  });
+  assertEqual(result, null);
+});
+
 test("wrap: an @ token with no agent matches and no base matches still returns an (empty) merged list", async () => {
   const provider = wrapWithAgentMentions(slashAndFileBase(), () => fakeScan([]));
   const result = await provider.getSuggestions(["@zzz-no-match"], 0, "@zzz-no-match".length, {

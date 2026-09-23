@@ -84,3 +84,24 @@ test("atTokenAtCursor: @agent: template marker and fragments are tokens", () => 
   assertEqual(mention.atTokenAtCursor(["@agent:"], 0, 7), { prefix: "@agent:", slug: "agent:" });
   assertEqual(mention.atTokenAtCursor(["@agent:rev"], 0, 10), { prefix: "@agent:rev", slug: "agent:rev" });
 });
+
+// ── justClosedMentionToken ───────────────────────────────────────────
+
+test("justClosedMentionToken: true right after the space that closes a mention", () => {
+  assertEqual(mention.justClosedMentionToken(["@agent "], 0, 7), true);
+  assertEqual(mention.justClosedMentionToken(["hey @rev "], 0, 9), true, "position-independent, like atTokenAtCursor");
+});
+
+test("justClosedMentionToken: false while still inside the mention (no delimiter yet)", () => {
+  assertEqual(mention.justClosedMentionToken(["@agent"], 0, 6), false);
+});
+
+test("justClosedMentionToken: false after a delimiter that did NOT close an @ token", () => {
+  assertEqual(mention.justClosedMentionToken(["hello "], 0, 6), false, "prose, no @ at all");
+  assertEqual(mention.justClosedMentionToken(["foo@bar "], 0, 8), false, "the word before the space was never a token (email-like)");
+});
+
+test("justClosedMentionToken: false at the very start, or when the cursor isn't right after a delimiter", () => {
+  assertEqual(mention.justClosedMentionToken(["@agent"], 0, 0), false, "cursor at column 0: nothing before it");
+  assertEqual(mention.justClosedMentionToken(["@agent x"], 0, 8), false, "the char right before the cursor ('x') isn't a delimiter");
+});
