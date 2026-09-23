@@ -1032,20 +1032,46 @@ export async function runAgentAndWait(
   thinkingLevel?: ThinkingLevel,
   def?: SubAgentDef,
   forcedModel?: Model<any>,
+  signal?: AbortSignal,
 ): Promise<LiveAgent> {
   const agent = await ensureAgent(file, cwd, model, thinkingLevel, def, forcedModel);
   agent.state = "working";
   agent.error = undefined;
   notify(file);
 
-  try {
-    await agent.session.prompt(prompt);
-  } catch (err) {
+  // Keep this promise's own error handling independent of `signal`: whether
+  // or not the caller keeps waiting, a turn that blows up must still record
+  // the failure on the (still-live) agent for later inspection.
+  const promptPromise = agent.session.prompt(prompt).catch((err: unknown) => {
     // The turn never reached a verdict: the session itself blew up.
     agent.state = "stopped";
     agent.error = String(err);
     agent.transcript.push({ kind: "error", text: String(err) });
+  });
+
+  // `signal` firing (e.g. the human pressed Esc on the tool call that's
+  // awaiting this) must stop *this* wait immediately — it must not require
+  // the sub-agent's own turn to finish first. The sub-agent keeps running in
+  // the background exactly like `wait: false`; it's still a live entry in
+  // the pool and can be inspected/steered afterward.
+  if (signal) {
+    if (signal.aborted) {
+      throw new Error("Waiting for the agent was cancelled; it keeps running in the background.");
+    }
+    let onAbort!: () => void;
+    const abortPromise = new Promise<never>((_, reject) => {
+      onAbort = () => reject(new Error("Waiting for the agent was cancelled; it keeps running in the background."));
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      await Promise.race([promptPromise, abortPromise]);
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
+  } else {
+    await promptPromise;
   }
+
   notify(file);
   return agent;
 }

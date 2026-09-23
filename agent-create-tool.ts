@@ -105,7 +105,7 @@ export const agentCreateTool = defineTool({
   promptSnippet: "Delegate one or more tasks to concurrent sub-agents, optionally waiting for their results",
   parameters: AgentCreateParams,
 
-  async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+  async execute(_toolCallId, params, signal, _onUpdate, ctx) {
     const root = resolveRoot(ctx.sessionManager.getSessionFile(), ctx.sessionManager.getSessionId());
     if (!root) {
       return {
@@ -237,23 +237,65 @@ export const agentCreateTool = defineTool({
       };
     }
 
-    const results = await Promise.all(
+    // `Promise.allSettled`, not `Promise.all`: one task's wait being cut
+    // short by `signal` (the human pressed Esc) must not swallow the others'
+    // real results — each sub-agent still keeps running in the background
+    // regardless of how this settles.
+    const settled = await Promise.allSettled(
       spawned.map(async (s) => {
-        const agent = await runAgentAndWait(s.file, s.task, ctx.cwd, ctx.model, ctx.thinkingLevel, s.def, s.forcedModel);
+        const agent = await runAgentAndWait(
+          s.file,
+          s.task,
+          ctx.cwd,
+          ctx.model,
+          ctx.thinkingLevel,
+          s.def,
+          s.forcedModel,
+          signal,
+        );
         return { ...s, agent };
       }),
     );
 
-    const summaries = results.map(({ name, def, modelId, task, agent }) => {
-      const tags = [def?.name, modelId ?? agent.session.model?.id].filter(Boolean);
+    if (signal?.aborted) {
+      const lines = spawned.map((s) => {
+        const tags = [s.def?.name, s.modelId ?? s.forcedModel?.id].filter(Boolean);
+        const label = tags.length > 0 ? `${s.name} [${tags.join(" · ")}]` : s.name;
+        return `- ${label} — still running in the background`;
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Cancelled waiting. These sub-agent(s) keep running:\n${lines.join("\n")}\n\nUse agent_inspect to check on them, or agent_send to give one more instructions.`,
+          },
+        ],
+        details: { agents: spawned.map((s) => ({ name: s.name, file: s.file, template: s.def?.name })) },
+        isError: true,
+      };
+    }
+
+    // With `signal` not aborted, a rejection here means `ensureAgent` itself
+    // failed (bad model/def) before a live agent even existed — the turn's
+    // own errors are already caught inside `runAgentAndWait`. Report those
+    // inline instead of throwing away every other task's real result.
+    const results = settled.flatMap((r, i) => {
+      if (r.status === "fulfilled") return [r.value];
+      const s = spawned[i]!;
+      return [{ ...s, agent: undefined, startupError: String(r.reason) }];
+    });
+
+    const summaries = results.map(({ name, def, modelId, task, agent, startupError }) => {
+      const tags = [def?.name, modelId ?? agent?.session.model?.id].filter(Boolean);
       const label = tags.length > 0 ? `${name} [${tags.join(" · ")}]` : name;
+      if (!agent) return `### ${label} — failed to start${startupError ? `: ${startupError}` : ""}\n\nTask: ${task}`;
       const failed = isTerminalFailure(agent.state);
       const status = failed ? `failed${agent.error ? `: ${agent.error}` : ""}` : "completed";
       const output = lastAssistantText(agent.transcript) || "(no output)";
       return `### ${label} — ${status}\n\nTask: ${task}\n\n${output}`;
     });
 
-    const successCount = results.filter(({ agent }) => !isTerminalFailure(agent.state)).length;
+    const successCount = results.filter(({ agent }) => agent && !isTerminalFailure(agent.state)).length;
     const header = results.length === 1 ? undefined : `${successCount}/${results.length} sub-agent(s) succeeded.\n\n`;
 
     return {
@@ -263,8 +305,8 @@ export const agentCreateTool = defineTool({
           name: r.name,
           file: r.file,
           template: r.def?.name,
-          model: r.modelId ?? r.agent.session.model?.id,
-          state: r.agent.state,
+          model: r.modelId ?? r.agent?.session.model?.id,
+          state: r.agent?.state ?? "stopped",
         })),
       },
       isError: successCount === 0,

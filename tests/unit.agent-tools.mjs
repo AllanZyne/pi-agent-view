@@ -8,7 +8,7 @@ const { agentCreateTool } = await load("agent-create-tool.ts");
 const { agentListTool } = await load("agent-list-tool.ts");
 const { agentInspectTool, parseRegexQuery } = await load("agent-inspect-tool.ts");
 const { agentRemoveTool } = await load("agent-control-tool.ts");
-const { abortSessionWithTimeout, waitForAgentSettled } = await load("agent-runtime.ts");
+const { abortSessionWithTimeout, waitForAgentSettled, runAgentAndWait } = await load("agent-runtime.ts");
 const storage = await load("storage.ts");
 const { AGENT_POLICY } = await load("agent-policy.ts");
 
@@ -114,6 +114,63 @@ test("waiting for an agent is cancellable without stopping that agent", async ()
     }
     assert(String(error).includes("cancelled"), "caller cancellation ends only the wait");
     assert(globalThis[key].agents.has(live.file), "the agent remains live");
+  } finally {
+    if (saved === undefined) delete globalThis[key];
+    else globalThis[key] = saved;
+  }
+});
+
+test("agent_create's wait:true path is cancellable without stopping the sub-agent (the bug this fixes)", async () => {
+  const key = "__piAgentViewsRuntime";
+  const saved = globalThis[key];
+  let promptStarted;
+  const started = new Promise((resolve) => {
+    promptStarted = resolve;
+  });
+  const live = {
+    file: "/tmp/create-cancellable-agent.jsonl",
+    state: "idle",
+    transcript: [],
+    session: {
+      isStreaming: false,
+      prompt: (text) => {
+        promptStarted(text);
+        // Never resolves on its own — like a real long-running turn. This
+        // stands in for the sub-agent's own in-flight LLM call, which must
+        // keep running in the background even after the wait is cancelled.
+        return new Promise(() => {});
+      },
+    },
+  };
+  globalThis[key] = {
+    agents: new Map([[live.file, live]]),
+    loading: false,
+    stopped: new Set(),
+    changeListeners: new Set(),
+  };
+  try {
+    const controller = new AbortController();
+    const waiting = runAgentAndWait(
+      live.file,
+      "do the task",
+      "/tmp",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      controller.signal,
+    );
+    await started;
+    controller.abort();
+    let error;
+    try {
+      await waiting;
+    } catch (err) {
+      error = err;
+    }
+    assert(error !== undefined, "the wait itself rejects instead of hanging until the turn finishes");
+    assert(String(error).includes("cancelled"), "the rejection explains this is a cancelled wait, not a failed turn");
+    assert(globalThis[key].agents.has(live.file), "the sub-agent stays registered and kept running in the background");
   } finally {
     if (saved === undefined) delete globalThis[key];
     else globalThis[key] = saved;
