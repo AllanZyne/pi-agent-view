@@ -58,6 +58,16 @@ test("the header carries a subtle, unobtrusive hint to press ? for help", () => 
   assert(renderPicker(view(many), th, 100).length <= pickerBudget(), "the hint does not cost extra lines");
 });
 
+test("the ? hint is right-aligned in parentheses, and drops cleanly instead of mangling when the terminal is too narrow", () => {
+  const wide = renderPicker(view([row("agent", "idle")]), th, 100)[0];
+  assert(wide.includes("(? help)"), `parenthesized: ${JSON.stringify(wide)}`);
+  assert(wide.trimEnd().endsWith("(? help)"), `pushed to the right edge: ${JSON.stringify(wide)}`);
+
+  const narrow = renderPicker(view([row("agent", "idle")]), th, 20)[0];
+  assert(!narrow.includes("help"), `dropped whole, not truncated into noise: ${JSON.stringify(narrow)}`);
+  assert(narrow.includes("Agents"), `left side is untouched: ${JSON.stringify(narrow)}`);
+});
+
 test("the picker has no footer", () => {
   const lines = renderPicker(view([row("agent", "idle")]), th, 100);
   assert(!lines.some((line) => line.includes("attach") || line.includes("ctrl+x")), JSON.stringify(lines));

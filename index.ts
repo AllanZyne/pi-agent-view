@@ -636,6 +636,21 @@ function clip(s: string, n: number): string {
   return s.length <= n ? s : `${s.slice(0, Math.max(1, n - 1))}…`;
 }
 
+/**
+ * `left` unchanged, `right` pushed to the far edge of `width` with at least
+ * two spaces between them — the same layout pi's own footer uses to put the
+ * model name on the right of the stats line. `right` is informational, not
+ * load-bearing, so when there is no room for it (a narrow terminal) it is
+ * dropped whole rather than truncated into something unreadable.
+ */
+function rightAlign(left: string, right: string, width: number): string {
+  const minGap = 2;
+  const leftWidth = visibleWidth(left);
+  const rightWidth = visibleWidth(right);
+  if (leftWidth + minGap + rightWidth > width) return left;
+  return left + " ".repeat(width - leftWidth - rightWidth) + right;
+}
+
 /** Border characters kept to the right of the editor's view label. */
 const LABEL_TAIL = 4;
 
@@ -703,8 +718,9 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
   const title = th.fg("accent", th.bold("◆ Agents"));
   const count = th.fg("muted", `${view.rows.length} agent${view.rows.length === 1 ? "" : "s"}`);
   const busy = working > 0 ? th.fg("warning", ` · ${working} working`) : "";
-  const hint = th.fg("dim", " · ? help");
-  out.push(truncateToWidth(`  ${title}  ${count}${busy}${hint}`, width));
+  const left = `  ${title}  ${count}${busy}`;
+  const hint = th.fg("dim", "(? help)");
+  out.push(truncateToWidth(rightAlign(left, hint, width), width));
   out.push(truncateToWidth(`  ${rule}`, width));
 
   // The cursor is the *agent* it is on, so it cannot drift onto a neighbour
