@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { assert, assertEqual, load, pi, tempDir, test } from "./harness.mjs";
 
-const { agentCreateTool } = await load("agent-create-tool.ts");
+const { agentCreateTool, watchForInterrupt } = await load("agent-create-tool.ts");
 const { agentListTool } = await load("agent-list-tool.ts");
 const { agentInspectTool, parseRegexQuery } = await load("agent-inspect-tool.ts");
 const { agentRemoveTool } = await load("agent-control-tool.ts");
@@ -175,6 +175,58 @@ test("agent_create's wait:true path is cancellable without stopping the sub-agen
     if (saved === undefined) delete globalThis[key];
     else globalThis[key] = saved;
   }
+});
+
+test("watchForInterrupt trips on the caller's own abort signal", async () => {
+  const controller = new AbortController();
+  const ctx = { hasPendingMessages: () => false };
+  const interrupt = watchForInterrupt(ctx, controller.signal);
+  try {
+    assert(!interrupt.signal.aborted, "not tripped yet");
+    controller.abort();
+    assert(interrupt.signal.aborted, "the outer abort (Esc) trips the merged signal");
+    assertEqual(interrupt.reason(), "aborted", "the reason is distinguishable from steering");
+  } finally {
+    interrupt.dispose();
+  }
+});
+
+test("watchForInterrupt trips as soon as the caller queues a new message (steering), without waiting for sub-agents", async () => {
+  let pending = false;
+  const ctx = { hasPendingMessages: () => pending };
+  const interrupt = watchForInterrupt(ctx, undefined);
+  try {
+    assert(!interrupt.signal.aborted, "nothing queued yet");
+    pending = true;
+    // Polled, not event-driven (no extension-visible "a message was queued"
+    // event exists) — give it one poll interval to notice.
+    await new Promise((r) => setTimeout(r, 250));
+    assert(interrupt.signal.aborted, "a queued message trips the wait early");
+    assertEqual(interrupt.reason(), "steered", "distinguishable from an Esc abort, for the human-facing message");
+  } finally {
+    interrupt.dispose();
+  }
+});
+
+test("watchForInterrupt trips immediately when a message is already queued at creation", async () => {
+  const ctx = { hasPendingMessages: () => true };
+  const interrupt = watchForInterrupt(ctx, undefined);
+  try {
+    assert(interrupt.signal.aborted, "no need to wait a poll interval for a condition already true");
+    assertEqual(interrupt.reason(), "steered");
+  } finally {
+    interrupt.dispose();
+  }
+});
+
+test("watchForInterrupt.dispose() stops polling — no trip, no leaked timer, after the caller moves on", async () => {
+  let pending = false;
+  const ctx = { hasPendingMessages: () => pending };
+  const interrupt = watchForInterrupt(ctx, undefined);
+  interrupt.dispose();
+  pending = true;
+  await new Promise((r) => setTimeout(r, 250));
+  assert(!interrupt.signal.aborted, "disposed: a later queued message must not retroactively trip it");
 });
 
 test("agent_inspect search accepts raw and slash-delimited regular expressions", () => {

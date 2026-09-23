@@ -21,7 +21,7 @@
  */
 
 import { Type } from "typebox";
-import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { getAgent, resolveModelSearch, runAgent, runAgentAndWait } from "./agent-runtime.ts";
@@ -37,6 +37,55 @@ import {
 } from "./storage.ts";
 
 const MAX_TASKS = 8;
+
+/** How often to poll `ctx.hasPendingMessages()` while waiting on sub-agents. */
+const STEER_POLL_MS = 150;
+
+/**
+ * A caller who steers or follows-up mid-wait (types a new message while this
+ * tool call is still awaiting sub-agents, exactly like typing during any
+ * other in-flight turn) wants this turn to get out of the way *now*, not once
+ * every sub-agent happens to finish — that new message is why they interrupted.
+ * There is no extension-visible event for "a message was just queued"
+ * (`queue_update` is internal to `AgentSession`), so this polls the one thing
+ * that *is* exposed, `ExtensionContext.hasPendingMessages()`, and folds it
+ * into the same abort-signal mechanism `runAgentAndWait` already understands
+ * for Esc — a caller of `runAgentAndWait` cannot tell `aborted` from
+ * `steered` apart, so `reason()` is exposed for the human-facing message.
+ *
+ * The sub-agents themselves are never touched by either kind of interrupt;
+ * they keep running in the background exactly like `wait: false`.
+ */
+export function watchForInterrupt(
+  ctx: ExtensionContext,
+  outerSignal: AbortSignal | undefined,
+): { signal: AbortSignal; reason: () => "aborted" | "steered" | undefined; dispose: () => void } {
+  const controller = new AbortController();
+  let reason: "aborted" | "steered" | undefined;
+
+  const trip = (r: "aborted" | "steered") => {
+    if (controller.signal.aborted) return;
+    reason = r;
+    controller.abort();
+  };
+
+  const onOuterAbort = () => trip("aborted");
+  outerSignal?.addEventListener("abort", onOuterAbort, { once: true });
+
+  const interval = setInterval(() => {
+    if (ctx.hasPendingMessages()) trip("steered");
+  }, STEER_POLL_MS);
+
+  if (outerSignal?.aborted) trip("aborted");
+  else if (ctx.hasPendingMessages()) trip("steered");
+
+  const dispose = () => {
+    clearInterval(interval);
+    outerSignal?.removeEventListener("abort", onOuterAbort);
+  };
+
+  return { signal: controller.signal, reason: () => reason, dispose };
+}
 
 const MODEL_DESCRIPTION =
   "Model to run this sub-agent on: a full provider/id, a bare id, or any short case-insensitive substring that uniquely matches one available model's id (e.g. 'opus', 'haiku', 'sonnet'). Overrides both the template's default model and this session's model. Omit to inherit the template's model (if any) or this session's model.";
@@ -238,9 +287,10 @@ export const agentCreateTool = defineTool({
     }
 
     // `Promise.allSettled`, not `Promise.all`: one task's wait being cut
-    // short by `signal` (the human pressed Esc) must not swallow the others'
-    // real results — each sub-agent still keeps running in the background
-    // regardless of how this settles.
+    // short by an interrupt (Esc, or the human typing a new message instead
+    // of waiting) must not swallow the others' real results — each sub-agent
+    // still keeps running in the background regardless of how this settles.
+    const interrupt = watchForInterrupt(ctx, signal);
     const settled = await Promise.allSettled(
       spawned.map(async (s) => {
         const agent = await runAgentAndWait(
@@ -251,23 +301,27 @@ export const agentCreateTool = defineTool({
           ctx.thinkingLevel,
           s.def,
           s.forcedModel,
-          signal,
+          interrupt.signal,
         );
         return { ...s, agent };
       }),
-    );
+    ).finally(() => interrupt.dispose());
 
-    if (signal?.aborted) {
+    if (interrupt.signal.aborted) {
       const lines = spawned.map((s) => {
         const tags = [s.def?.name, s.modelId ?? s.forcedModel?.id].filter(Boolean);
         const label = tags.length > 0 ? `${s.name} [${tags.join(" · ")}]` : s.name;
         return `- ${label} — still running in the background`;
       });
+      const because =
+        interrupt.reason() === "steered"
+          ? "Cancelled waiting because you sent a new message — handling that instead."
+          : "Cancelled waiting.";
       return {
         content: [
           {
             type: "text",
-            text: `Cancelled waiting. These sub-agent(s) keep running:\n${lines.join("\n")}\n\nUse agent_inspect to check on them, or agent_send to give one more instructions.`,
+            text: `${because} These sub-agent(s) keep running:\n${lines.join("\n")}\n\nUse agent_inspect to check on them, or agent_send to give one more instructions.`,
           },
         ],
         details: { agents: spawned.map((s) => ({ name: s.name, file: s.file, template: s.def?.name })) },
@@ -275,10 +329,10 @@ export const agentCreateTool = defineTool({
       };
     }
 
-    // With `signal` not aborted, a rejection here means `ensureAgent` itself
-    // failed (bad model/def) before a live agent even existed — the turn's
-    // own errors are already caught inside `runAgentAndWait`. Report those
-    // inline instead of throwing away every other task's real result.
+    // With no interrupt, a rejection here means `ensureAgent` itself failed
+    // (bad model/def) before a live agent even existed — the turn's own
+    // errors are already caught inside `runAgentAndWait`. Report those inline
+    // instead of throwing away every other task's real result.
     const results = settled.flatMap((r, i) => {
       if (r.status === "fulfilled") return [r.value];
       const s = spawned[i]!;
