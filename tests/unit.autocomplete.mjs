@@ -62,11 +62,15 @@ function slashAndFileBase() {
     },
     applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
       // A transform our own replaceAtToken does not do, so a test can tell
-      // whether *this* ran versus our own logic.
+      // whether *this* ran versus our own logic. Slash-command completions
+      // (prefix starts with "/") insert plainly, with no "@" at all --
+      // exactly like pi's real slash-command completion does, and exactly
+      // what our own replaceAtToken must never be allowed to overwrite with
+      // a stray "@".
       const line = lines[cursorLine] ?? "";
       const before = line.slice(0, cursorCol);
       const cut = before.endsWith(prefix) ? before.slice(0, -prefix.length) : before;
-      const replacement = `@${item.value.toUpperCase()} `;
+      const replacement = prefix.startsWith("/") ? `/${item.value} ` : `@${item.value.toUpperCase()} `;
       const newLine = cut + replacement + line.slice(cursorCol);
       return { lines: [newLine], cursorLine, cursorCol: (cut + replacement).length };
     },
@@ -229,6 +233,20 @@ test("wrap: shouldTriggerFileCompletion is always false inside an @ token now (m
     true,
     "outside any @-token: delegates (base returns true here)",
   );
+});
+
+test("wrap: applyCompletion on an UNTAGGED item (e.g. a pi slash-command completion, no @ anywhere) forwards to the base — the actual bug this fixes", () => {
+  // The bug: an untagged item (anything that reached applyCompletion
+  // without going through our own agent-tagging step -- pi's own
+  // slash-command completions are the real-world case) used to fall through
+  // to our own replaceAtToken by default, splicing in "@<value> " and
+  // replacing the leading "/" with a stray "@". Only an explicit
+  // kind: "agent" tag may go through our own logic now; everything else,
+  // tagged "file" or not tagged at all, forwards to the base.
+  const provider = wrapWithAgentMentions(slashAndFileBase(), () => fakeScan(["reviewer"]));
+  const result = provider.applyCompletion(["/mo"], 0, "/mo".length, { value: "model", label: "model" }, "/mo");
+  assertEqual(result.lines, ["/model "], "the base's own slash-command completion ran — '/' was never replaced with '@'");
+  assertEqual(result.cursorCol, "/model ".length);
 });
 
 test("wrap: applyCompletion on an agent-kind item replaces the @-token with '@<name> ' — our own logic", () => {

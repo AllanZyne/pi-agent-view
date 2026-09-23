@@ -122,13 +122,20 @@ export function wrapWithAgentMentions(
 
     applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
       const mention = item as MentionItem;
-      if (mention.kind === "file") {
-        // pi's own item, pi's own logic — never our `replaceAtToken` guess.
-        return current.applyCompletion(lines, cursorLine, cursorCol, mention.original ?? item, prefix);
+      // Only an explicit `kind: "agent"` tag is ours. Everything else --
+      // `kind: "file"` (from the merged `@`-token list above, forwarded with
+      // its exact original item) *and* anything untagged (pi's own
+      // slash-command/argument completions and any other pass-through case
+      // below, which never went through our tagging step at all) -- must
+      // always run through the base's own `applyCompletion`. The previous
+      // default ("anything untagged is ours") is exactly the bug this fixes:
+      // a `/`-command selected with no `@` anywhere nearby reached here
+      // untagged, fell through to our `replaceAtToken`, and got spliced in
+      // as `@<value> ` -- replacing the leading `/` with a stray `@`.
+      if (mention.kind === "agent") {
+        return replaceAtToken(lines, cursorLine, cursorCol, prefix, `@${item.value} `);
       }
-      // `kind === "agent"`, or untagged as a safety net for anything that
-      // somehow reaches here without a tag: ours.
-      return replaceAtToken(lines, cursorLine, cursorCol, prefix, `@${item.value} `);
+      return current.applyCompletion(lines, cursorLine, cursorCol, mention.original ?? item, prefix);
     },
 
     // Suppress pi's *independent* file trigger whenever the cursor is inside
