@@ -387,6 +387,43 @@ test("terminating an agent keeps it Stopped after its session is gone", async ()
   assertEqual(rt.stateOf(file), "stopped", "still reported as stopped without a session");
 });
 
+test("a live agent's context usage flows into its row; the root's comes from the caller, not the pool", () => {
+  const dir = tempDir("agent-view-context-usage-");
+  const rootFile = writeSession(dir, "main", [assistantEntry("stop", "main done")]);
+  const agentFile = writeSession(dir, "worker", [assistantEntry("stop", "worker done")]);
+
+  const key = "__piAgentViewsRuntime";
+  const saved = globalThis[key];
+  const usage = { tokens: 500, contextWindow: 100000, percent: 0.5 };
+  const live = {
+    file: agentFile,
+    state: "idle",
+    transcript: [],
+    session: { isStreaming: false, model: undefined, getContextUsage: () => usage },
+  };
+  globalThis[key] = {
+    agents: new Map([[agentFile, live]]),
+    loading: false,
+    stopped: new Set(),
+    changeListeners: new Set(),
+  };
+  try {
+    const rootUsage = { tokens: 9, contextWindow: 200000, percent: 0.0045 };
+    const rows = vm.buildRows({
+      rootFile,
+      rootName: "main",
+      rootBusy: false,
+      agents: [{ id: "1", name: "worker", file: agentFile, createdAt: "" }],
+      rootContextUsage: rootUsage,
+    });
+    assertEqual(rows.find((r) => r.key === agentFile).contextUsage, usage, "the live agent's own usage, not the root's");
+    assertEqual(rows.find((r) => r.key === rootFile).contextUsage, rootUsage, "root usage is exactly what the caller passed");
+  } finally {
+    if (saved === undefined) delete globalThis[key];
+    else globalThis[key] = saved;
+  }
+});
+
 test("rows are grouped Working, Failed, Stopped, Idle, Completed", () => {
   const dir = tempDir("agent-view-groups-");
   const files = {

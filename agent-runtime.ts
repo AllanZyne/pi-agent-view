@@ -19,6 +19,7 @@ import {
   getAgentDir,
   ModelRuntime,
   SessionManager,
+  type ContextUsage,
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Model, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { SubAgentDef } from "./agent-catalog.ts";
@@ -690,6 +691,20 @@ export function getAgent(file: string): LiveAgent | undefined {
 export function modelOf(file: string): Model<any> | undefined {
   try {
     return registry().agents.get(file)?.session.model;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Context-window usage of a live agent, exactly like pi's own footer computes
+ * it for the main session (`AgentSession.getContextUsage()`). Undefined for
+ * an agent that is not live in this process — recomputing it from disk would
+ * mean reconstructing a whole session just to render a picker row.
+ */
+export function contextUsageOf(file: string): ContextUsage | undefined {
+  try {
+    return registry().agents.get(file)?.session.getContextUsage();
   } catch {
     return undefined;
   }

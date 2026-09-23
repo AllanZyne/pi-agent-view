@@ -100,3 +100,23 @@ test("a group boundary inside the window still gets its header", () => {
   assertEqual(lines.filter((l) => l.includes("Working (")).length, 1, "Working header");
   assertEqual(lines.filter((l) => l.includes("Idle (")).length, 1, "Idle header");
 });
+
+test("a row shows its full model id and no last-message summary", () => {
+  const longModel = "anthropic/claude-opus-4-1-20250805-with-a-very-long-suffix";
+  const withSummary = { ...row("agent", "idle"), model: longModel, summary: "did a thing worth mentioning" };
+  const lines = renderPicker(view([withSummary]), th, 200);
+  assert(lines.some((l) => l.includes(longModel)), `full model id is shown, not clipped: ${JSON.stringify(lines)}`);
+  assert(!lines.some((l) => l.includes("did a thing")), `no last-message summary: ${JSON.stringify(lines)}`);
+});
+
+test("a row with context usage shows percent/window, like pi's own footer", () => {
+  const withUsage = { ...row("agent", "idle"), contextUsage: { tokens: 12345, contextWindow: 128000, percent: 42.5 } };
+  const lines = renderPicker(view([withUsage]), th, 200);
+  assert(lines.some((l) => l.includes("42.5%/128k")), `context usage is shown: ${JSON.stringify(lines)}`);
+});
+
+test("unknown context usage (right after compaction) shows a question mark, not a crash", () => {
+  const unknown = { ...row("agent", "idle"), contextUsage: { tokens: null, contextWindow: 128000, percent: null } };
+  const lines = renderPicker(view([unknown]), th, 200);
+  assert(lines.some((l) => l.includes("?%/128k")), `unknown usage renders as ?: ${JSON.stringify(lines)}`);
+});

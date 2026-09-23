@@ -99,6 +99,7 @@ import {
   SkillInvocationMessageComponent,
   ToolExecutionComponent,
   UserMessageComponent,
+  type ContextUsage,
   type ExtensionAPI,
   type ExtensionContext,
   type Theme,
@@ -337,6 +338,17 @@ function formatTokens(count: number): string {
   if (count < 1000000) return `${Math.round(count / 1000)}k`;
   if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
   return `${Math.round(count / 1000000)}M`;
+}
+
+/**
+ * `42%/128k`, exactly like pi's own footer shows context usage for the
+ * conversation on screen (`ContextUsage`, `AgentSession.getContextUsage()`).
+ * `percent` is `null` right after compaction, before the next LLM response
+ * makes a fresh estimate possible.
+ */
+function formatContextUsage(usage: ContextUsage): string {
+  const percent = usage.percent === null ? "?" : usage.percent.toFixed(1);
+  return `${percent}%/${formatTokens(usage.contextWindow)}`;
 }
 
 /** Cheap change detector for a (possibly streaming) assistant message. */
@@ -739,9 +751,9 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
     const meta = deleting
       ? th.fg("error", row.isRoot ? "Press Ctrl+X again to abort" : "Press Ctrl+X again to delete")
       : th.fg("muted", `${row.messageCount} msg${row.messageCount === 1 ? "" : "s"}`);
-    const model = !deleting && row.model ? th.fg("dim", ` · ${clip(row.model, 28)}`) : "";
-    const summary = !deleting && row.summary ? th.fg("dim", `  ${clip(row.summary, Math.max(10, width - 24))}`) : "";
-    out.push(truncateToWidth(`     ${meta}${model}${summary}`, width));
+    const model = !deleting && row.model ? th.fg("dim", ` · ${row.model}`) : "";
+    const context = !deleting && row.contextUsage ? th.fg("dim", ` · ${formatContextUsage(row.contextUsage)}`) : "";
+    out.push(truncateToWidth(`     ${meta}${model}${context}`, width));
   }
 
   if (end < view.rows.length) {
@@ -1367,6 +1379,7 @@ export default function agentViews(pi: ExtensionAPI): void {
       rootBusy: !ctx.isIdle(),
       agents: listAgentEntries(root, (f) => getAgent(f) !== undefined),
       attached: view.attached,
+      rootContextUsage: ctx.getContextUsage(),
     });
     const next = reconcileSelection(view.rows, view, viewportRows());
     view.selected = next.selected;

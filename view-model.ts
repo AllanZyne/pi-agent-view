@@ -10,11 +10,13 @@ import * as fs from "node:fs";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   assistantHasContent,
+  contextUsageOf,
   getAgent,
   modelOf,
   readTranscript,
   stateOf,
   type AgentState,
+  type ContextUsage,
   type TranscriptItem,
 } from "./agent-runtime.ts";
 import type { AgentEntry } from "./storage.ts";
@@ -35,6 +37,8 @@ export interface AgentRow {
   lastModified: Date;
   summary?: string;
   model?: string;
+  /** Context-window usage, live agents only — see `contextUsageOf`. */
+  contextUsage?: ContextUsage;
   /** Template ID that created this instance, shown as a picker badge. */
   template?: string;
 }
@@ -111,6 +115,9 @@ export interface BuildRowsInput {
   agents: AgentEntry[];
   /** Agent currently mirrored into pi's transcript, if any. */
   attached?: string;
+  /** pi's own context usage (`ExtensionContext.getContextUsage()`), since the
+   *  root "agent" is not in the live agent pool `contextUsageOf` reads from. */
+  rootContextUsage?: ContextUsage;
 }
 
 /** Order rows the way they are rendered, so a selection index maps to a row. */
@@ -183,6 +190,7 @@ export function buildRows(input: BuildRowsInput): AgentRow[] {
       // A live agent's session knows its model right away; the file only learns
       // it from the next assistant message, so `/model` would look like a no-op.
       model: (isRoot ? undefined : modelOf(file)?.id) ?? info.model,
+      contextUsage: isRoot ? input.rootContextUsage : contextUsageOf(file),
       ...(template ? { template } : {}),
     };
   };
