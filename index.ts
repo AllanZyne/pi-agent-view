@@ -703,7 +703,8 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
   const title = th.fg("accent", th.bold("◆ Agents"));
   const count = th.fg("muted", `${view.rows.length} agent${view.rows.length === 1 ? "" : "s"}`);
   const busy = working > 0 ? th.fg("warning", ` · ${working} working`) : "";
-  out.push(truncateToWidth(`  ${title}  ${count}${busy}`, width));
+  const hint = th.fg("dim", " · ? help");
+  out.push(truncateToWidth(`  ${title}  ${count}${busy}${hint}`, width));
   out.push(truncateToWidth(`  ${rule}`, width));
 
   // The cursor is the *agent* it is on, so it cannot drift onto a neighbour

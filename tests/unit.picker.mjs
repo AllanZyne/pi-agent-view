@@ -48,6 +48,16 @@ test("the picker never draws more lines than pi's dock can give it", () => {
   );
 });
 
+test("the header carries a subtle, unobtrusive hint to press ? for help", () => {
+  const lines = renderPicker(view([row("agent", "idle")]), th, 100);
+  const header = lines[0];
+  assert(header.includes("? help"), `header hints at the help key: ${JSON.stringify(header)}`);
+  // Informational only, not a call to action: no bright/warning styling, and
+  // it must not push the picker over its line budget.
+  const many = Array.from({ length: 60 }, (_, i) => row(`agent-${i}`, i % 2 ? "working" : "idle"));
+  assert(renderPicker(view(many), th, 100).length <= pickerBudget(), "the hint does not cost extra lines");
+});
+
 test("the picker has no footer", () => {
   const lines = renderPicker(view([row("agent", "idle")]), th, 100);
   assert(!lines.some((line) => line.includes("attach") || line.includes("ctrl+x")), JSON.stringify(lines));
