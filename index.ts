@@ -692,7 +692,13 @@ function fitToBudget(out: string[]): string[] {
 export function renderPicker(view: ViewState, th: Theme, width: number): string[] {
   if (!view.open) return [];
   const out: string[] = [];
-  const rule = th.fg("dim", "─".repeat(Math.max(4, Math.min(width - 4, 100))));
+  // Both the rule and the header's right-aligned hint stop here, not at the
+  // terminal's actual edge — the rule is capped at 100 cols so it doesn't
+  // stretch into a long, pointless line on a wide terminal, and the hint
+  // lines up with it rather than drifting off to the far right on its own.
+  const ruleLen = Math.max(4, Math.min(width - 4, 100));
+  const lineWidth = 2 + ruleLen;
+  const rule = th.fg("dim", "─".repeat(ruleLen));
 
   if (view.showHelp) {
     out.push(truncateToWidth(`  ${th.fg("accent", th.bold("Agents — keys"))}`, width));
@@ -720,7 +726,7 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
   const busy = working > 0 ? th.fg("warning", ` · ${working} working`) : "";
   const left = `  ${title}  ${count}${busy}`;
   const hint = th.fg("dim", "(? help)");
-  out.push(truncateToWidth(rightAlign(left, hint, width), width));
+  out.push(truncateToWidth(rightAlign(left, hint, lineWidth), width));
   out.push(truncateToWidth(`  ${rule}`, width));
 
   // The cursor is the *agent* it is on, so it cannot drift onto a neighbour

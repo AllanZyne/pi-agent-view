@@ -58,11 +58,18 @@ test("the header carries a subtle, unobtrusive hint to press ? for help", () => 
   assert(renderPicker(view(many), th, 100).length <= pickerBudget(), "the hint does not cost extra lines");
 });
 
-test("the ? hint is right-aligned in parentheses, and drops cleanly instead of mangling when the terminal is too narrow", () => {
-  const wide = renderPicker(view([row("agent", "idle")]), th, 100)[0];
-  assert(wide.includes("(? help)"), `parenthesized: ${JSON.stringify(wide)}`);
-  assert(wide.trimEnd().endsWith("(? help)"), `pushed to the right edge: ${JSON.stringify(wide)}`);
+test("the ? hint lines up with the rule below it, not the terminal's far edge", () => {
+  // The rule is capped at 100 cols on purpose (renderPicker), so on a very
+  // wide terminal both the header hint and the rule stop well short of the
+  // actual edge — and, more to the point, stop at the *same* column as
+  // each other.
+  const lines = renderPicker(view([row("agent", "idle")]), th, 220);
+  const [header, rule] = lines;
+  assertEqual(header.length, rule.length, `header and rule end at the same column: ${JSON.stringify([header, rule])}`);
+  assert(header.trimEnd().endsWith("(? help)"), `parenthesized, at the rule's right edge: ${JSON.stringify(header)}`);
+});
 
+test("the ? hint drops cleanly instead of mangling when the terminal is too narrow", () => {
   const narrow = renderPicker(view([row("agent", "idle")]), th, 20)[0];
   assert(!narrow.includes("help"), `dropped whole, not truncated into noise: ${JSON.stringify(narrow)}`);
   assert(narrow.includes("Agents"), `left side is untouched: ${JSON.stringify(narrow)}`);
