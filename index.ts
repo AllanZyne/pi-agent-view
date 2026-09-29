@@ -44,7 +44,7 @@
  *   Enter + text   picker open: create and attach to an agent with that prompt
  *                  attached:    steer the attached agent
  *   Esc            abort the turn on screen if it's working (same as main's
- *                  own Esc); otherwise detach (agent keeps running)
+ *                  own Esc); a no-op otherwise — use ← to go back to `main`
  *   Ctrl+X         press twice: agent delete; main abort
  *   Ctrl+L         model selector for the conversation on screen
  *   Ctrl+P         cycle the attached agent's model
@@ -722,7 +722,7 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
       ["↑ ↓", "Select agent"],
       ["Enter / →", "Attach: stream it into the transcript"],
       ["Enter + text", "Create an agent with exactly that task and attach"],
-      ["Esc", "Abort if working, else detach (agent keeps running)"],
+      ["Esc", "Abort if working (same as main); no-op otherwise"],
       ["Ctrl+X", "Press twice to delete (main: abort)"],
       ["/model [name]", "Set that agent's model (Ctrl+L when attached)"],
       ["←", "Close the picker (reopen to refresh the list)"],
@@ -1011,12 +1011,14 @@ export class AgentViewEditor extends CustomEditor {
       }
       if (view.attached) {
         if (empty && matchesKey(data, "escape")) {
-          // Match main's own Esc: while the conversation on screen is
-          // actively working, Esc aborts *that* turn and stays put — it does
-          // not fall back to detaching. Only an idle agent has nothing to
-          // abort, so only then does Esc fall back to its other job here,
-          // going back to `main`.
-          this.act(stateOf(view.attached) === "working" ? { t: "abort", key: view.attached } : { t: "detach" });
+          // Match main's own Esc exactly: it aborts a streaming turn and
+          // otherwise does nothing (main's own idle Esc has no equivalent to
+          // fall back to here — no bash mode, no session tree — so an idle
+          // agent's Esc is a no-op too). Esc used to detach back to `main`
+          // when idle; that made an in-progress abort and a plain "go back"
+          // indistinguishable by feel, so it was removed — use ← (open the
+          // picker) to go back instead.
+          if (stateOf(view.attached) === "working") this.act({ t: "abort", key: view.attached });
           return;
         }
         if (empty && matchesKey(data, "ctrl+x")) {
@@ -1895,7 +1897,7 @@ export default function agentViews(pi: ExtensionAPI): void {
             requestTerminate(ctx, ctx.sessionManager.getSessionFile() ?? "", true);
             break;
           case "blockedCommand":
-            notify(ctx, `/${action.name} isn't available while attached to an agent — detach (Esc) first`, "warning");
+            notify(ctx, `/${action.name} isn't available while attached to an agent — go back to main (←) first`, "warning");
             break;
         }
       };

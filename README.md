@@ -41,7 +41,7 @@ pi install git:github.com/AllanZyne/pi-agent-view
 | `↑` `↓` | move the selection (empty prompt only) |
 | `Enter` / `→` | attach to the selected agent |
 | `Enter` + text | list open: new agent with exactly that first prompt, then attach immediately · attached: steer the agent |
-| `Esc` | abort the attached agent's turn if it's working (same as main's own Esc) · otherwise detach — back to `main`, the agent keeps running |
+| `Esc` | abort the attached agent's turn if it's working (same as main's own Esc) · a no-op otherwise — use `←` to go back to `main` |
 | `Ctrl+X` | press twice within 2 seconds: delete an agent outright, or abort `main` |
 | `Ctrl+L` | model selector for the agent you are looking at |
 | `Ctrl+P` / `Shift+Ctrl+P` | cycle the attached agent's model |
