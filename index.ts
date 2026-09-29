@@ -155,7 +155,13 @@ import {
   withAttachedCommandFilter,
 } from "./command-routing.ts";
 import { findChatContainer, includeChatChild, installChatFilter, tagRaisedChildren, type RenderNode } from "./transcript-view.ts";
-import { initMarkdownTransformers, initToolRenderers, mermaidTransformerFactory, toolRenderersFor } from "./tool-renderers.ts";
+import {
+  initMarkdownTransformers,
+  initToolRenderers,
+  mermaidTransformerFactory,
+  registerOwnToolRenderers,
+  toolRenderersFor,
+} from "./tool-renderers.ts";
 import { registerAgentCreateTool, agentCreateTool } from "./agent-create-tool.ts";
 import { registerAgentListTool, agentListTool } from "./agent-list-tool.ts";
 import { registerAgentInspectTool, agentInspectTool } from "./agent-inspect-tool.ts";
@@ -473,7 +479,14 @@ export class AgentItemComponent implements Component {
             this.lastExpanded = this.expanded;
             this.skill!.setExpanded(this.expanded);
           }
-          const out = this.skill!.render(width);
+          // `SkillInvocationMessageComponent` (a pi-tui `Box`) caches its last
+          // rendered lines and returns that cached array *by reference* on a
+          // cache hit. Pushing onto `out` directly would then mutate the
+          // component's own cache in place: the next render() call would still
+          // hit the (now longer) cache and return the same, ever-growing array,
+          // so the user message below the `[skill]` block would visibly
+          // duplicate itself once per frame forever. Copy before appending.
+          const out = [...this.skill!.render(width)];
           if (this.skillUserMessage !== undefined) {
             this.user ??= new UserMessageComponent(
               this.skillUserMessage,
@@ -1161,6 +1174,10 @@ export default function agentViews(pi: ExtensionAPI): void {
   // five anyway — set once here, read by every `ensureAgent()` call from
   // then on, for any agent at any depth.
   setManagedTools([agentCreateTool, agentListTool, agentInspectTool, agentSendTool, agentRemoveTool]);
+  // Same five tools, handed to `toolRenderersFor` too — see
+  // `registerOwnToolRenderers`'s doc comment for why an agent view's replayed
+  // tool calls need this on top of pi's own built-in renderers.
+  registerOwnToolRenderers([agentCreateTool, agentListTool, agentInspectTool, agentSendTool, agentRemoveTool]);
 
   const view = getView();
   /** Captured from the (invisible) tick widget so components can request renders. */

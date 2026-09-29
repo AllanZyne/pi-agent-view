@@ -445,6 +445,38 @@ test("a skill invocation renders pi's [skill] block, not its raw wire format", (
   assert(expanded.includes("Do a review."), "ctrl+o expands the block, like main");
 });
 
+test("a skill invocation's rendered lines do not grow on repeated frames", () => {
+  // Regression: pi-tui's `Box` (what `SkillInvocationMessageComponent` is)
+  // caches its last rendered lines and, on a cache hit, returns that cached
+  // array *by reference*. The skill-invocation branch used to do
+  // `const out = this.skill.render(width); out.push(...)`, which mutated the
+  // component's own cached array in place. Every subsequent render() call
+  // still hit the (now longer) cache and returned that same array, so the
+  // user's own message kept re-appending itself once per frame forever —
+  // exactly what happened live: spawning an agent with `/skill:grill-me
+  // let's do a test` filled the transcript with dozens of duplicate "let's do
+  // a test" lines under one `[skill]` block. A single render() call couldn't
+  // catch this; only calling it several times (like real re-renders do) can.
+  const text = '<skill name="code-review" location="/tmp/SKILL.md">\nDo a review.\n</skill>\n\nplease review my diff';
+  const items = [{ kind: "user", text }];
+  const component = new AgentItemComponent(
+    { file: "/tmp/agent.jsonl", index: 0 },
+    appTheme,
+    settings,
+    false,
+    fakeTui,
+    process.cwd(),
+    () => true,
+    () => items,
+  );
+  const first = component.render(WIDTH);
+  for (let i = 0; i < 20; i++) component.render(WIDTH);
+  const later = component.render(WIDTH);
+  assertEqual(later, first, "the same frame content renders the same lines, however many times it is drawn");
+  const occurrences = later.filter((line) => line.includes("please review my diff")).length;
+  assertEqual(occurrences, 1, "the user's own message appears exactly once, not once per render() call");
+});
+
 test("a compaction the agent's own session did renders pi's [compaction] block", () => {
   // Sub-agent sessions are created with pi's own SettingsManager, so they
   // auto-compact on threshold/overflow exactly like main. pi marks that with a
