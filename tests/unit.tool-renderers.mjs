@@ -36,6 +36,23 @@ test("unknown tools fall back to pi's generic rendering", async () => {
   assertEqual(tr.toolRenderersFor("definitely-not-a-tool"), undefined, "no renderers, no crash");
 });
 
+test("registerOwnToolRenderers makes this extension's own tools render like pi's built-ins", async () => {
+  // Regression test: an agent view's replayed toolCall items only ever go
+  // through `toolRenderersFor` (see TranscriptItemComponent in index.ts), so
+  // a sub-agent nesting its own agent_create/agent_send/... call used to fall
+  // back to raw JSON in that agent's view even though the exact same call
+  // from `main` drew the tool's real box (main's own rendering uses the
+  // registered tool definition directly, not this lookup).
+  assertEqual(tr.toolRenderersFor("not-yet-registered-own-tool"), undefined, "nothing registered yet");
+  tr.registerOwnToolRenderers([
+    { name: "not-yet-registered-own-tool", renderCall: () => "call", renderResult: () => "result" },
+  ]);
+  const renderers = tr.toolRenderersFor("not-yet-registered-own-tool");
+  assert(renderers, "the tool has renderers once registered");
+  assertEqual(typeof renderers.renderCall, "function", "renderCall carried through");
+  assertEqual(typeof renderers.renderResult, "function", "renderResult carried through");
+});
+
 test("lookups before loading are inert", async () => {
   tr.resetToolRenderers();
   assertEqual(tr.toolRenderersFor("bash"), undefined, "no renderers until initialised");

@@ -181,10 +181,51 @@ export async function initToolRenderers(): Promise<boolean> {
 }
 
 /**
- * Renderers for a tool, or undefined for tools pi has no built-in renderer for
- * (agents run with `noExtensions`, so extension tools cannot appear).
+ * This extension's own tools (`agent_create` and friends) carry their own
+ * `renderCall`/`renderResult` — see `registerOwnToolRenderers()` below for why
+ * `toolRenderersFor` needs to know about them too, not just pi's built-ins.
+ */
+const ownRenderers = new Map<string, ToolRenderers>();
+
+/**
+ * Feed this extension's own tool definitions (`agent_create`, `agent_send`,
+ * `agent_list`, `agent_inspect`, `agent_remove` — see `index.ts`) into the
+ * same lookup `toolRenderersFor` uses for pi's built-ins.
+ *
+ * Why this is needed at all: those tools carry their own `renderCall`/
+ * `renderResult`, so when *main* calls one, pi's own rendering pipeline uses
+ * the real registered tool definition and draws the tool's real box. But an
+ * agent view's `toolCall` items are replayed through freshly-built
+ * `ToolExecutionComponent`s (see `index.ts`'s `TranscriptItemComponent`),
+ * which only know a tool's renderers if something here hands them over — they
+ * are never given the real, registered tool definition. Without this, a
+ * sub-agent nesting its own `agent_create`/`agent_send`/`agent_list`/
+ * `agent_inspect`/`agent_remove` calls (every agent gets all five, to any
+ * depth — see README "Talking to agents") rendered as a bold tool name plus
+ * raw JSON in that agent's view, while the exact same call from `main`
+ * rendered as the tool's real box.
+ *
+ * Registration (not a static import of the tool modules here) keeps this file
+ * import-light: `agent-create-tool.ts` and friends pull in the whole agent
+ * runtime, and loading that module graph concurrently with this file's own
+ * dynamic `import()` of pi's renderers module (see `initToolRenderers`) is
+ * exactly the kind of cross-module-graph timing worth not risking in a file
+ * whose only other job is finding an absolute path on disk. `index.ts`
+ * already imports all five tool objects to register them for main, so it
+ * calls this once with those same objects.
+ */
+export function registerOwnToolRenderers(tools: ReadonlyArray<{ name: string } & ToolRenderers>): void {
+  for (const tool of tools) ownRenderers.set(tool.name, tool);
+}
+
+/**
+ * Renderers for a tool: this extension's own tools first (see
+ * `registerOwnToolRenderers`), then pi's built-ins, or undefined for a tool
+ * neither side knows how to draw.
  */
 export function toolRenderersFor(name: string): ToolRenderers | undefined {
+  const own = ownRenderers.get(name);
+  if (own) return own;
   try {
     return lookup?.(name);
   } catch {
