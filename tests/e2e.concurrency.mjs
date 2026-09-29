@@ -247,3 +247,41 @@ test(
   },
   { e2e: true },
 );
+
+test(
+  "aborting an agent stops its turn like Esc on main, without dropping the live session",
+  async () => {
+    // The distinction that matters: Esc on an attached agent (see index.ts)
+    // aborts the turn on screen — exactly like main's own Esc — rather than
+    // terminating it. Unlike terminateAgent, the session must stay in the
+    // in-process pool afterwards, so the very next message reaches the same
+    // live session instead of `ensureAgent` reviving a fresh one from disk.
+    const dir = tempDir("agent-view-e2e-");
+    const root = makeRoot(dir, "root-e2e-4");
+    const cwd = dir;
+
+    const interrupted = storage.registerAgent(root, storage.agentName("interrupted"), cwd);
+    const survivor = storage.registerAgent(root, storage.agentName("survivor-abort"), cwd);
+    const interruptedOut = path.join(dir, "interrupted.txt");
+    const survivorOut = path.join(dir, "survivor-abort.txt");
+
+    await runtime.runAgent(interrupted, taskFor("INTERRUPTED-DONE", interruptedOut), cwd);
+    await runtime.runAgent(survivor, taskFor("SURVIVOR-ABORT-DONE", survivorOut), cwd);
+
+    while (runtime.stateOf(interrupted) !== "working") await sleep(100);
+    const liveBefore = runtime.getAgent(interrupted);
+    assertEqual(await runtime.abortAgent(interrupted), true, "it was working when aborted");
+
+    assert(runtime.getAgent(interrupted) !== undefined, "the session is still in the pool, unlike a terminate");
+    assertEqual(runtime.getAgent(interrupted), liveBefore, "the very same session instance, not a revived one");
+    assertEqual(runtime.stateOf(interrupted), "idle", "idle, not the terminate-only Stopped state");
+    assertEqual(await runtime.abortAgent(interrupted), false, "nothing left to abort a second time");
+
+    await waitForSettled([survivor], 240_000);
+    assertEqual(runtime.stateOf(survivor), "completed", "the other agent was untouched");
+    assert(fs.existsSync(survivorOut), "and finished its own work");
+
+    await runtime.disposeAll();
+  },
+  { e2e: true },
+);

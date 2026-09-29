@@ -1113,6 +1113,42 @@ export async function steerAgent(file: string, text: string): Promise<boolean> {
 }
 
 /**
+ * Abort an agent's current turn, like pi's own `ctx.abort()` does for main:
+ * the running turn stops, but the session itself stays live so the very next
+ * message (a steer, a follow-up) reaches the same in-process session instead
+ * of reviving a fresh one from disk. Unlike `terminateAgent`, nothing is
+ * disposed.
+ *
+ * Mirrors main's own Esc cascade exactly (see interactive-mode's
+ * `onEscape`): a streaming turn is aborted first; failing that, a bash
+ * command the agent is running (pi's own `!` quick-bash, independent of any
+ * LLM turn) is cancelled instead. Returns false when there was neither to
+ * abort.
+ */
+export async function abortAgent(file: string): Promise<boolean> {
+  const agent = registry().agents.get(file);
+  if (!agent) return false;
+  if (agent.session.isStreaming) {
+    await abortSessionWithTimeout(agent.session);
+    // The `message_end` handler above brands an aborted turn "failed" (that
+    // labelling exists so a *terminated* agent's pending tool boxes and list
+    // row read "Failed" instead of looking stuck) -- but this abort keeps the
+    // session alive for the next message, exactly like main's own Esc, and a
+    // user-initiated interrupt is not a failure. Put it back to "idle" so the
+    // picker doesn't brand an agent you just interrupted as broken.
+    if (agent.state === "failed") agent.state = "idle";
+    notify(file);
+    return true;
+  }
+  if (agent.session.isBashRunning) {
+    agent.session.abortBash();
+    notify(file);
+    return true;
+  }
+  return false;
+}
+
+/**
  * Terminate an agent: abort its turn and drop its session.
  *
  * The transcript stays on disk, so the agent remains in the list and can be

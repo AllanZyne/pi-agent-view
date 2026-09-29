@@ -43,7 +43,8 @@
  *   Enter / →      attach: stream that agent into the transcript
  *   Enter + text   picker open: create and attach to an agent with that prompt
  *                  attached:    steer the attached agent
- *   Esc            detach (agent keeps running)
+ *   Esc            abort the turn on screen if it's working (same as main's
+ *                  own Esc); otherwise detach (agent keeps running)
  *   Ctrl+X         press twice: agent delete; main abort
  *   Ctrl+L         model selector for the conversation on screen
  *   Ctrl+P         cycle the attached agent's model
@@ -116,6 +117,7 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import {
+  abortAgent,
   cycleAgentModel,
   disposeAll,
   ensureAgent,
@@ -720,7 +722,7 @@ export function renderPicker(view: ViewState, th: Theme, width: number): string[
       ["↑ ↓", "Select agent"],
       ["Enter / →", "Attach: stream it into the transcript"],
       ["Enter + text", "Create an agent with exactly that task and attach"],
-      ["Esc", "Detach (agent keeps running)"],
+      ["Esc", "Abort if working, else detach (agent keeps running)"],
       ["Ctrl+X", "Press twice to delete (main: abort)"],
       ["/model [name]", "Set that agent's model (Ctrl+L when attached)"],
       ["←", "Close the picker (reopen to refresh the list)"],
@@ -809,6 +811,8 @@ type Action =
   | { t: "detach" }
   | { t: "spawn"; prompt: string }
   | { t: "steer"; key: string; text: string }
+  /** Esc while the attached agent is actively working: abort its turn, stay attached. */
+  | { t: "abort"; key: string }
   | { t: "model"; key: string; search?: string }
   | { t: "cycleModel"; key: string; direction: "forward" | "backward" }
   /** Ctrl+X: confirm, then abort main or delete an agent outright. */
@@ -1007,7 +1011,12 @@ export class AgentViewEditor extends CustomEditor {
       }
       if (view.attached) {
         if (empty && matchesKey(data, "escape")) {
-          this.act({ t: "detach" });
+          // Match main's own Esc: while the conversation on screen is
+          // actively working, Esc aborts *that* turn and stays put — it does
+          // not fall back to detaching. Only an idle agent has nothing to
+          // abort, so only then does Esc fall back to its other job here,
+          // going back to `main`.
+          this.act(stateOf(view.attached) === "working" ? { t: "abort", key: view.attached } : { t: "detach" });
           return;
         }
         if (empty && matchesKey(data, "ctrl+x")) {
@@ -1864,6 +1873,13 @@ export default function agentViews(pi: ExtensionAPI): void {
             void steerAgent(action.key, action.text).then((ok) => {
               if (!ok) notify(ctx, "That agent is not live", "warning");
             });
+            break;
+          case "abort":
+            // Matches main's own Esc-while-streaming exactly: abort the turn,
+            // stay attached to the same (still-live) agent — just like
+            // `ctx.abort()` leaves main's own session ready for the next
+            // message instead of throwing you out of the conversation.
+            void abortAgent(action.key);
             break;
           case "model":
             closePicker(ctx);
