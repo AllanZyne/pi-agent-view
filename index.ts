@@ -91,6 +91,7 @@ import {
   AssistantMessageComponent,
   CustomEditor,
   CompactionSummaryMessageComponent,
+  FooterComponent,
   getAgentDir,
   getMarkdownTheme,
   ModelSelectorComponent,
@@ -175,6 +176,7 @@ import {
   clearDeleteConfirm,
   DELETE_CONFIRM_MS,
   deleteConfirmed,
+  footerTarget,
   isVisible,
   moveSelection,
   noteMirrored,
@@ -1214,6 +1216,47 @@ export default function agentViews(pi: ExtensionAPI): void {
   /** Refreshed on every session start, like pi refreshes its own render settings. */
   let renderSettings = defaultRenderSettings();
 
+  /** `ctx.ui` of the current session, for footer swaps outside an event handler. */
+  let footerUi: ExtensionContext["ui"] | undefined;
+  /** Agent whose session the footer currently describes; undefined = main (pi's built-in). */
+  let footerFor: string | undefined;
+
+  /**
+   * Point the footer at whatever is on screen: pi's own `FooterComponent`
+   * bound to the attached agent's session (model, tokens, cost, context), or
+   * pi's built-in footer for main. Idempotent; call after anything that
+   * changes `view.attached`. Restoring uses `setFooter(undefined)`, so a
+   * footer some other extension had installed is not brought back on detach.
+   */
+  function syncFooter(): void {
+    const target = footerTarget(view.attached, (f) => getAgent(f) !== undefined);
+    if (target === footerFor || !footerUi) return;
+    footerFor = target;
+    if (target === undefined) {
+      footerUi.setFooter(undefined);
+      return;
+    }
+    footerUi.setFooter((_tui, _theme, footerData) => {
+      const inner = new FooterComponent(getAgent(target)!.session, footerData);
+      return {
+        render(width: number): string[] {
+          const live = getAgent(target);
+          // Detached or deleted by a path that didn't sync (e.g. `agent_remove`):
+          // never describe a stale session, swap back on the next tick.
+          if (!live || view.attached !== target) {
+            queueMicrotask(syncFooter);
+            return [];
+          }
+          inner.setSession(live.session);
+          inner.setAutoCompactEnabled(live.session.autoCompactionEnabled);
+          return inner.render(width);
+        },
+        invalidate: () => inner.invalidate(),
+        dispose: () => inner.dispose(),
+      };
+    });
+  }
+
   /**
    * Custom entries are persisted and can never be removed, so every agent's
    * items stay in pi's transcript for good. Visibility is what separates the
@@ -1509,6 +1552,7 @@ export default function agentViews(pi: ExtensionAPI): void {
     if (view.attached) detach();
 
     attachTo(view, file);
+    syncFooter();
     closePicker(ctx);
     // Nothing is injected into the agent's transcript: it reads exactly like a
     // fresh session. Which agent you are looking at is shown on the editor.
@@ -1524,6 +1568,7 @@ export default function agentViews(pi: ExtensionAPI): void {
   function detach(): void {
     if (!view.attached) return;
     attachTo(view, undefined);
+    syncFooter();
     redrawTranscript();
   }
 
@@ -1575,6 +1620,7 @@ export default function agentViews(pi: ExtensionAPI): void {
     if (root) removeAgentEntry(root, file);
     if (view.attached === file) {
       attachTo(view, undefined);
+      syncFooter();
       redrawTranscript();
     }
     notify(ctx, `Deleted ${name}`, "info");
@@ -1806,6 +1852,10 @@ export default function agentViews(pi: ExtensionAPI): void {
       view.unfilter = undefined;
     }
     restoreFromSession(ctx);
+    footerUi = ctx.ui;
+    footerFor = undefined;
+    ctx.ui.setFooter(undefined);
+    syncFooter();
     ctx.ui.setWidget("agent-view", undefined);
     // Clear any footer status left behind by an older build of this extension.
     ctx.ui.setStatus("agent-view", undefined);
@@ -1958,6 +2008,9 @@ export default function agentViews(pi: ExtensionAPI): void {
     ctx.ui.setWidget("agent-view", undefined);
     ctx.ui.setWidget("agent-view-tick", undefined);
     ctx.ui.setStatus("agent-view", undefined);
+    ctx.ui.setFooter(undefined);
+    footerFor = undefined;
+    footerUi = undefined;
     // Only release the pool when pi is really going away; a session switch or
     // extension reload must leave background agents running.
     if (event.reason === "quit") void disposeAll();

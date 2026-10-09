@@ -231,6 +231,13 @@ would just produce a notice.
   is attached, so those children are tagged with the view that owns them —
   otherwise a notice raised in an agent view would be invisible and then
   reappear in `main`'s transcript on detach.
+- The **footer follows the view**: while an agent is attached it is pi's own
+  `FooterComponent` bound to that agent's session, so tokens, cost, context
+  usage and model are the agent's (not cumulative with `main`). It follows
+  what is attached, not the picker cursor, and falls back to `main` as soon as
+  the attached agent stops being live. Detaching restores pi's built-in footer
+  via `setFooter(undefined)`, so a footer another extension had installed is
+  not brought back (pi has no API to read the current footer factory).
 - Attaching or detaching **scrolls to the newest message** and clears any text
   selection. pi has one scroll offset for the whole document, so a switch would
   otherwise inherit the previous view's offset (clamped to a completely

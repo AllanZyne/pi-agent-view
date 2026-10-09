@@ -512,3 +512,11 @@ test("clearDeleteConfirm resets both fields", () => {
   assertEqual(state.pendingDeleteUntil, undefined, "deadline cleared");
   assert(!vm.deleteConfirmed(state, "doomed"), "no longer confirmed once cleared");
 });
+
+test("footerTarget follows the attached agent only while it is live", () => {
+  const live = new Set(["a.jsonl"]);
+  const isLive = (f) => live.has(f);
+  assertEqual(vm.footerTarget(undefined, isLive), undefined, "main when nothing is attached");
+  assertEqual(vm.footerTarget("a.jsonl", isLive), "a.jsonl", "attached live agent owns the footer");
+  assertEqual(vm.footerTarget("gone.jsonl", isLive), undefined, "a no-longer-live agent falls back to main");
+});

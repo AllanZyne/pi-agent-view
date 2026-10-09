@@ -454,3 +454,14 @@ export function attachTo(state: MirrorState, file: string | undefined): void {
   state.attached = file;
   state.mirrored ??= {};
 }
+
+/**
+ * Whose session the footer should describe: the attached agent while it is
+ * live, otherwise `undefined` (= pi's built-in footer for the main session).
+ * Follows what is on screen, not the picker cursor. An attached agent that has
+ * stopped being live (e.g. deleted via `agent_remove`) falls back to main
+ * rather than leaving a footer bound to a disposed session.
+ */
+export function footerTarget(attached: string | undefined, isLive: (file: string) => boolean): string | undefined {
+  return attached !== undefined && isLive(attached) ? attached : undefined;
+}
