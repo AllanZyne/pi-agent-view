@@ -1,6 +1,7 @@
 {
   "name": "pi-agent-view",
   "version": "0.3.0",
+  "piVersion": "1.1.0",
   "description": "Concurrent sub-agents for pi, each rendered by pi itself",
   "keywords": [
     "pi-package"

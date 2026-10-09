@@ -158,11 +158,11 @@ import {
 } from "./command-routing.ts";
 import { findChatContainer, includeChatChild, installChatFilter, tagRaisedChildren, type RenderNode } from "./transcript-view.ts";
 import {
+  agentToolRenderers,
   initMarkdownTransformers,
   initToolRenderers,
   mermaidTransformerFactory,
   registerOwnToolRenderers,
-  toolRenderersFor,
 } from "./tool-renderers.ts";
 import { registerAgentCreateTool, agentCreateTool } from "./agent-create-tool.ts";
 import { registerAgentListTool, agentListTool } from "./agent-list-tool.ts";
@@ -283,7 +283,8 @@ export interface RenderSettings {
   outputPad: number;
   markdownTheme: MarkdownTheme;
   hideThinkingBlock: boolean;
-  tool: { showImages: boolean; imageWidthCells: number };
+  /** `ToolExecutionComponent` options, the same ones pi passes (incl. `outputPad`). */
+  tool: { showImages: boolean; imageWidthCells: number; outputPad: number };
   /**
    * pi's markdown transformers, the same list it hands its own message
    * components (today: the mermaid diagram renderer). Filled in lazily by
@@ -305,7 +306,7 @@ export function defaultRenderSettings(): RenderSettings {
     markdownTransformers: [],
     mermaidMode: () => "off",
     showCostNotices: true,
-    tool: { showImages: true, imageWidthCells: 60 },
+    tool: { showImages: true, imageWidthCells: 60, outputPad: 1 },
   };
 }
 
@@ -327,7 +328,11 @@ function readRenderSettings(cwd: string): RenderSettings {
           return "off";
         }
       },
-      tool: { showImages: settings.getShowImages(), imageWidthCells: settings.getImageWidthCells() },
+      tool: {
+        showImages: settings.getShowImages(),
+        imageWidthCells: settings.getImageWidthCells(),
+        outputPad: settings.getOutputPad(),
+      },
       showCostNotices: settings.getShowCacheMissNotices(),
     };
   } catch {
@@ -544,7 +549,12 @@ export class AgentItemComponent implements Component {
         // built before renderers were ready would be stuck rendering its
         // bare name plus raw JSON args forever. Rebuild once renderers show
         // up instead of caching that miss permanently.
-        const renderers = toolRenderersFor(item.name);
+        //
+        // Resolved through the agent's own session when it is live, like main
+        // resolves its own: extension resolvers (`pi.registerToolRenderer()`,
+        // e.g. MCP's) and the session's tool definitions (codemode's), then
+        // pi's built-ins.
+        const renderers = agentToolRenderers(getAgent(this.ref.file)?.session as never, item.name);
         if (!this.tool || (!this.toolHasRenderers && renderers)) {
           this.tool = new ToolExecutionComponent(
             item.name,
@@ -581,7 +591,13 @@ export class AgentItemComponent implements Component {
           if (item.executionStarted) this.tool.markExecutionStarted();
           if (item.result) {
             this.tool.updateResult(
-              { content: item.result.content, details: item.result.details, isError: item.result.isError },
+              {
+                content: item.result.content,
+                details: item.result.details,
+                isError: item.result.isError,
+                // bash's "Took" line, as pi passes it on tool_execution_end/reload.
+                durationMs: item.result.durationMs,
+              },
               item.result.isPartial,
             );
           }
@@ -604,6 +620,7 @@ export class AgentItemComponent implements Component {
             timestamp: item.timestamp,
           } as never,
           this.settings.markdownTheme,
+          this.settings.outputPad,
         );
         if (this.lastExpanded !== this.expanded) {
           this.lastExpanded = this.expanded;

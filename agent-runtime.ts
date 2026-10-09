@@ -24,6 +24,7 @@ import {
 import type { AssistantMessage, Model, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { SubAgentDef } from "./agent-catalog.ts";
 import { AGENT_POLICY } from "./agent-policy.ts";
+import { builtinExtensionEntries, enabledBuiltinPaths } from "./builtin-extensions.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -35,7 +36,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
  * | --- | --- |
  * | `working` | streaming right now |
  * | `failed` | the task ended with an error |
- * | `stopped` | not running and never reached a verdict: terminated, aborted, or died mid-turn |
+ * | `stopped` | not running and never reached a verdict: terminated, aborted (pi's `agent_settled.aborted`), or died mid-turn |
  * | `idle` | nothing has run yet, waiting for a prompt |
  * | `completed` | the task finished successfully |
  */
@@ -59,6 +60,12 @@ export interface ToolCallResult {
   details?: unknown;
   isError: boolean;
   isPartial: boolean;
+  /**
+   * How long the tool's `execute()` took (pi's `durationMs`, on
+   * `tool_execution_end` and on the persisted `toolResult` message). pi's tool
+   * renderers read it from the render context — bash's "Took" line.
+   */
+  durationMs?: number;
 }
 
 export type TranscriptItem =
@@ -132,6 +139,13 @@ export interface LiveAgent {
   state: AgentState;
   transcript: TranscriptItem[];
   error?: string;
+  /**
+   * Error of the latest assistant response in the current run, or undefined
+   * when it succeeded. The run's verdict is only drawn from it on
+   * `agent_settled`, so an error that pi retried successfully leaves no mark —
+   * the same rule pi's own program-status reporter uses.
+   */
+  runError?: string;
   unsubscribe: () => void;
 }
 
@@ -354,6 +368,7 @@ export function seedTranscript(sm: SessionManager): TranscriptItem[] {
             details: m.details,
             isError: Boolean(m.isError),
             isPartial: false,
+            ...(typeof m.durationMs === "number" ? { durationMs: m.durationMs } : {}),
           };
           break;
         }
@@ -482,10 +497,15 @@ function applyResult(agent: LiveAgent, id: string, result: ToolCallResult): bool
   return true;
 }
 
-function attachEvents(agent: LiveAgent): () => void {
+/** Exported for tests only: wire a live agent's session events into its transcript/state. */
+export function attachEvents(agent: LiveAgent): () => void {
   const { session } = agent;
 
   return session.subscribe((event: any) => {
+    // A call another tool made (a codemode script's `tools.x()`, via
+    // `ctx.executeTool()`) carries `parentToolCallId`. pi draws it inside its
+    // parent's box, never as a box of its own — skip it the same way.
+    if (event.type?.startsWith("tool_execution_") && event.parentToolCallId) return;
     switch (event.type) {
       case "message_start": {
         const m = event.message;
@@ -560,10 +580,9 @@ function attachEvents(agent: LiveAgent): () => void {
             }
             it.revision++;
           }
-          if (m.errorMessage) {
-            agent.state = "failed";
-            agent.error = m.errorMessage;
-          }
+          // The run's verdict waits for `agent_settled`: a retry may still
+          // replace this error, and an abort is not a failure at all.
+          if (m.stopReason !== "aborted") agent.runError = m.stopReason === "error" ? m.errorMessage || "Error" : undefined;
         } else if (m?.role === "toolResult") {
           agent.transcript.push({
             kind: "toolResult",
@@ -584,6 +603,7 @@ function attachEvents(agent: LiveAgent): () => void {
               details: m.details,
               isError: Boolean(m.isError),
               isPartial: false,
+              ...(typeof m.durationMs === "number" ? { durationMs: m.durationMs } : {}),
             };
             call.revision++;
           }
@@ -635,6 +655,7 @@ function attachEvents(agent: LiveAgent): () => void {
           toolCallId: string;
           result?: { content?: unknown[]; details?: unknown };
           isError?: boolean;
+          durationMs?: number;
         };
         const result = e.result ?? {};
         if (
@@ -643,6 +664,7 @@ function attachEvents(agent: LiveAgent): () => void {
             details: result.details,
             isError: Boolean(e.isError),
             isPartial: false,
+            ...(typeof e.durationMs === "number" ? { durationMs: e.durationMs } : {}),
           })
         ) {
           notify(agent.file);
@@ -650,8 +672,22 @@ function attachEvents(agent: LiveAgent): () => void {
         break;
       }
 
-      case "agent_end": {
-        if (agent.state !== "failed" && agent.state !== "stopped") agent.state = "completed";
+      // Not `agent_end`: that closes one low-level run, and pi may still
+      // retry, recover from overflow, or run queued messages after it.
+      // `agent_settled` is the run's real end.
+      case "agent_settled": {
+        const e = event as { aborted?: boolean };
+        if (e.aborted) {
+          agent.state = "stopped";
+          agent.error = undefined;
+        } else if (agent.runError) {
+          agent.state = "failed";
+          agent.error = agent.runError;
+        } else {
+          agent.state = "completed";
+          agent.error = undefined;
+        }
+        agent.runError = undefined;
         notify(agent.file);
         break;
       }
@@ -672,6 +708,8 @@ function attachEvents(agent: LiveAgent): () => void {
           agent.transcript.push(compactionItem({ ...e.result, timestamp: Date.now() }));
         } else if (e.errorMessage) {
           agent.transcript.push({ kind: "error", text: e.errorMessage });
+          // A failed recovery compaction ends the run unless a later response succeeds.
+          agent.runError = e.errorMessage;
         }
         notify(agent.file);
         break;
@@ -870,6 +908,16 @@ export async function ensureAgent(
   // extension inside every sub-agent. Skills/prompts/context files are still
   // loaded so the sub-agent behaves like a normal pi session. The `loading`
   // flag is kept as a belt-and-braces guard.
+  //
+  // `noExtensions` also drops pi's built-in extensions (codemode, tool search,
+  // MCP, llama.cpp), which main has; they are handed back explicitly — the
+  // ones the user's `extensions` setting enables (see builtin-extensions.ts).
+  const builtins = await builtinExtensionEntries();
+  const builtinPaths = await enabledBuiltinPaths(
+    cwd,
+    getAgentDir(),
+    builtins.map((b) => b.name),
+  );
   reg.loading = true;
   let session: AgentSession;
   try {
@@ -877,6 +925,8 @@ export async function ensureAgent(
       cwd,
       agentDir: getAgentDir(),
       noExtensions: true,
+      extensionFactories: builtins,
+      additionalExtensionPaths: builtinPaths,
       // The shared delegation policy applies to every sub-agent. A def's body
       // follows it as a specialization; both supplement (rather than replace)
       // pi's base system prompt, AGENTS.md, skills, and other context.
@@ -905,6 +955,14 @@ export async function ensureAgent(
     session = created.session;
   } finally {
     reg.loading = false;
+  }
+
+  // Emits `session_start`, like main's own startup does: the MCP extension
+  // connects its servers there. No UI is bound — a sub-agent has none.
+  try {
+    await session.bindExtensions({});
+  } catch {
+    /* an extension failing to start must not keep the agent from running */
   }
 
   // Pin the inherited model into the agent's own session so it stays put even
@@ -1129,14 +1187,9 @@ export async function abortAgent(file: string): Promise<boolean> {
   const agent = registry().agents.get(file);
   if (!agent) return false;
   if (agent.session.isStreaming) {
+    // The run's `agent_settled` (aborted: true) marks it "stopped"; the session
+    // stays live, so the very next message makes it "working" again.
     await abortSessionWithTimeout(agent.session);
-    // The `message_end` handler above brands an aborted turn "failed" (that
-    // labelling exists so a *terminated* agent's pending tool boxes and list
-    // row read "Failed" instead of looking stuck) -- but this abort keeps the
-    // session alive for the next message, exactly like main's own Esc, and a
-    // user-initiated interrupt is not a failure. Put it back to "idle" so the
-    // picker doesn't brand an agent you just interrupted as broken.
-    if (agent.state === "failed") agent.state = "idle";
     notify(file);
     return true;
   }
@@ -1204,6 +1257,26 @@ export async function abortSessionWithTimeout(
   }
 }
 
+/** Emit `session_shutdown` to a session's extensions, bounded by `timeoutMs`. */
+export async function shutdownExtensionsWithTimeout(
+  session: { extensionRunner?: { hasHandlers(type: string): boolean; emit(event: unknown): Promise<unknown> } },
+  timeoutMs = AGENT_ABORT_GRACE_MS,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const runner = session.extensionRunner;
+    if (!runner?.hasHandlers("session_shutdown")) return;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+    });
+    await Promise.race([runner.emit({ type: "session_shutdown", reason: "quit" }), timeout]);
+  } catch {
+    /* ignore */
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /**
  * Dispose an agent, releasing its session file. Graceful abort is bounded:
  * arbitrary/custom tools may ignore AbortSignal, and disposal must not inherit
@@ -1223,6 +1296,10 @@ export async function disposeAgent(file: string): Promise<void> {
   } catch {
     /* ignore */
   }
+  // `dispose()` does not emit `session_shutdown`; pi's own runtime emits it
+  // before disposing, and that is where extensions close what they opened
+  // (the MCP extension's server connections). Bounded like the abort above.
+  await shutdownExtensionsWithTimeout(agent.session);
   try {
     agent.session.dispose();
   } catch {

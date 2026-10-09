@@ -2,6 +2,8 @@
 
 Concurrent sub-agents for [pi](https://pi.dev), each rendered by pi itself.
 
+Compatible with pi **1.1.0**.
+
 > **Status: early / actively developed.** Expect rough edges and breaking
 > changes between versions. This extension mirrors agent transcripts into your
 > main session's `.jsonl` and patches how pi renders it, so a bug here can
@@ -41,7 +43,7 @@ pi install git:github.com/AllanZyne/pi-agent-view
 | `↑` `↓` | move the selection (empty prompt only) |
 | `Enter` / `→` | attach to the selected agent |
 | `Enter` + text | list open: new agent with exactly that first prompt, then attach immediately · attached: steer the agent |
-| `Esc` | abort the attached agent's turn if it's working (same as main's own Esc) · a no-op otherwise — use `←` to go back to `main` |
+| `Esc` | abort the attached agent's turn if it's working (same as main's own Esc; it shows as Stopped) · a no-op otherwise — use `←` to go back to `main` |
 | `Ctrl+X` | press twice within 2 seconds: delete an agent outright, or abort `main` |
 | `Ctrl+L` | model selector for the agent you are looking at |
 | `Ctrl+P` / `Shift+Ctrl+P` | cycle the attached agent's model |
@@ -102,6 +104,24 @@ spawned.
   default `agent_create` `wait: true`; use `wait: false` only while doing real
   independent work, then join once with `agent_inspect({ name, wait: true })`
   rather than polling or asking agents to notify each other with `agent_send`.
+
+## What a sub-agent loads
+
+A sub-agent is a normal pi session: same skills, prompt templates, context
+files (`AGENTS.md`), and settings as `main`, plus the five `agent_*` tools.
+It also gets **pi's built-in extensions**, the same ones the CLI loads into
+`main`: `codemode`, `tool_search`, MCP, and llama.cpp. If your `extensions`
+setting disables one (e.g. `-builtin:mcp`), sub-agents don't get it either.
+`codemode` and `tool_search` stay inactive unless your `defaultTools` setting
+enables them, or MCP does. That's the same rule `main` follows, but `--tools`
+on the command line only affects `main`. Each sub-agent connects its own MCP
+servers and closes them when it is removed.
+
+Your installed extensions are **not** loaded into sub-agents, so this extension
+never loads itself recursively. Tool boxes in an agent view resolve their
+renderers through that agent's own session, the way `main` does. Codemode's
+own renderers and an MCP tool's `pi.registerToolRenderer()` drawing therefore
+look the same in both.
 
 ## Agent templates (`.pi/agents/`)
 
@@ -183,8 +203,10 @@ would just produce a notice.
   `main` is always pi's own session, whatever the session name is. Agents
   spawned from a `.pi/agents/*.md` template show a `[<template>]` badge next to their
   name.
-- Icons: `✽` Working, `✓` Completed, `✗` Failed, `⊘` Stopped (aborted or
-  died mid-turn), `∙` Idle.
+- Icons: `✽` Working, `✓` Completed, `✗` Failed, `⊘` Stopped (aborted —
+  including Esc — terminated, or died mid-turn), `∙` Idle. The verdict is
+  taken when pi settles the run (`agent_settled`), so an error pi retried
+  successfully does not leave an agent Failed.
 - The list is a **snapshot**: it's rebuilt when opened, not on a timer.
   Reopen (`←` twice) to refresh.
 - The list sizes itself to what pi's layout can spare (in fullscreen a widget

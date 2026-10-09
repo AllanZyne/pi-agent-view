@@ -183,6 +183,52 @@ test("a tool call renders with pi's built-in renderers, not a bare name", async 
   assert(actual.join("\n").includes("ls -la"), `the command itself is shown: ${JSON.stringify(actual)}`);
 });
 
+/** pi's own bash box, driven like interactive mode, with the given options/result. */
+function piBashBox(id, command, toolOptions, result) {
+  const component = new pi.ToolExecutionComponent(
+    "bash",
+    id,
+    { command },
+    toolOptions,
+    toolRenderers.toolRenderersFor("bash"),
+    fakeTui,
+    process.cwd(),
+  );
+  component.setExpanded(false);
+  component.updateArgs({ command });
+  component.setArgsComplete();
+  component.markExecutionStarted();
+  component.updateResult(result, false);
+  return component.render(WIDTH).slice(1);
+}
+
+test("a tool box shows pi's recorded execution time (durationMs → bash's \"Took\")", async () => {
+  await toolRenderers.initToolRenderers();
+  const result = { ...textResult("done"), durationMs: 4200 };
+  const items = [toolCall("t1", "bash", { command: "sleep 4" }, { result })];
+  const expected = piBashBox("t1", "sleep 4", settings.tool, {
+    content: result.content,
+    details: undefined,
+    isError: false,
+    durationMs: 4200,
+  });
+  const actual = renderItem(items, 0);
+  assertEqual(actual, expected, "same box as main's, Took line included");
+  assert(actual.join("\n").includes("Took"), `the Took line is drawn: ${JSON.stringify(actual)}`);
+});
+
+test("a tool box honours the outputPad setting, like pi's own", async () => {
+  await toolRenderers.initToolRenderers();
+  const padded = { ...settings, outputPad: 3, tool: { ...settings.tool, outputPad: 3 } };
+  const items = [toolCall("t1", "bash", { command: "ls" }, { result: textResult("foo") })];
+  const expected = piBashBox("t1", "ls", padded.tool, { content: [{ type: "text", text: "foo" }], details: undefined, isError: false });
+  assertEqual(renderItem(items, 0, { settings: padded }), expected, "padded exactly like main's box");
+  assert(
+    JSON.stringify(expected) !== JSON.stringify(piBashBox("t1", "ls", settings.tool, { content: [{ type: "text", text: "foo" }], details: undefined, isError: false })),
+    "outputPad actually changes pi's box (otherwise this test proves nothing)",
+  );
+});
+
 test("tool output follows pi's expand state", async () => {
   await toolRenderers.initToolRenderers();
   const long = Array.from({ length: 400 }, (_, i) => `line ${i}`).join("\n");
@@ -373,7 +419,7 @@ test("nothing is drawn for an agent that is not attached", () => {
 test("default render settings match pi's defaults", () => {
   assertEqual(settings.outputPad, 1, "pi's outputPad default");
   assertEqual(settings.hideThinkingBlock, false, "thinking blocks shown");
-  assertEqual(settings.tool, { showImages: true, imageWidthCells: 60 }, "pi's image defaults");
+  assertEqual(settings.tool, { showImages: true, imageWidthCells: 60, outputPad: 1 }, "pi's tool box defaults");
   assert(theme === undefined || typeof theme === "object", "markdown theme is available");
 });
 

@@ -7,6 +7,8 @@
 
 import "./unit.storage.mjs";
 import "./unit.agent-tools.mjs";
+import "./unit.agent-events.mjs";
+import "./unit.builtin-extensions.mjs";
 import "./unit.agent-summary.mjs";
 import "./unit.agent-lookup.mjs";
 import "./unit.view-model.mjs";

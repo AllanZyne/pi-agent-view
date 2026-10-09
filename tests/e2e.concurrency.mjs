@@ -274,7 +274,7 @@ test(
 
     assert(runtime.getAgent(interrupted) !== undefined, "the session is still in the pool, unlike a terminate");
     assertEqual(runtime.getAgent(interrupted), liveBefore, "the very same session instance, not a revived one");
-    assertEqual(runtime.stateOf(interrupted), "idle", "idle, not the terminate-only Stopped state");
+    assertEqual(runtime.stateOf(interrupted), "stopped", "Stopped: pi settled the run with aborted: true");
     assertEqual(await runtime.abortAgent(interrupted), false, "nothing left to abort a second time");
 
     await waitForSettled([survivor], 240_000);
