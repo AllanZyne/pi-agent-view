@@ -12,6 +12,9 @@
  * exclusively by its own AgentSession (single writer, no contention).
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   AgentSession,
   createAgentSession,
@@ -19,12 +22,14 @@ import {
   getAgentDir,
   ModelRuntime,
   SessionManager,
+  SettingsManager,
   type ContextUsage,
+  type LoadExtensionsResult,
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Model, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { SubAgentDef } from "./agent-catalog.ts";
 import { AGENT_POLICY } from "./agent-policy.ts";
-import { builtinExtensionEntries, enabledBuiltinPaths } from "./builtin-extensions.ts";
+import { builtinExtensionEntries } from "./builtin-extensions.ts";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -173,6 +178,12 @@ interface Registry {
    * older build) just means "no managed tools", not a crash.
    */
   managedTools?: ToolDefinition[];
+  /**
+   * Main's project trust, for sub-agents' settings and project extensions.
+   * Set from main's `session_start` (see `setProjectTrust`). Without it every
+   * project counts as untrusted — never more trusting than main.
+   */
+  projectTrust?: { cwd: string; trusted: () => boolean };
 }
 
 /** Registry lives on globalThis so it survives extension reload. */
@@ -207,6 +218,48 @@ export function onAgentChange(cb: (file?: string) => void): () => void {
   const listeners = registry().changeListeners!;
   listeners.add(cb);
   return () => listeners.delete(cb);
+}
+
+/**
+ * Record main's project trust (`ctx.isProjectTrusted()`), so a sub-agent in
+ * main's cwd trusts its project exactly when main does. pi's `SettingsManager`
+ * defaults to trusted, which would load an untrusted project's settings and
+ * `.pi/extensions` into sub-agents that main itself refused.
+ */
+export function setProjectTrust(cwd: string, trusted: () => boolean): void {
+  registry().projectTrust = { cwd: path.resolve(cwd), trusted };
+}
+
+function isProjectTrusted(cwd: string): boolean {
+  const trust = registry().projectTrust;
+  if (!trust || trust.cwd !== path.resolve(cwd)) return false;
+  try {
+    return trust.trusted();
+  } catch {
+    return false;
+  }
+}
+
+function realpath(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/** This extension's own directory: the one extension sub-agents don't load. */
+const OWN_DIR = realpath(path.dirname(fileURLToPath(import.meta.url)));
+
+/**
+ * Exported for tests: is this loaded extension agent-view itself? Compared by
+ * real path, so a symlinked install (or a package dir) still matches.
+ */
+export function isOwnExtension(ext: { resolvedPath?: string; path?: string }, ownDir = OWN_DIR): boolean {
+  const p = ext.resolvedPath || ext.path;
+  if (!p || p.startsWith("<") || p.startsWith("builtin:")) return false;
+  const rel = path.relative(ownDir, realpath(p));
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
 /** See `Registry.managedTools`. Call once at extension activation. */
@@ -904,29 +957,31 @@ export async function ensureAgent(
   const inheritModel = forcedModel ?? defModel ?? model;
   const inheritThinking = def?.thinkingLevel ?? thinkingLevel;
 
-  // `noExtensions` is the clean way to avoid recursively loading THIS
-  // extension inside every sub-agent. Skills/prompts/context files are still
-  // loaded so the sub-agent behaves like a normal pi session. The `loading`
-  // flag is kept as a belt-and-braces guard.
+  // A sub-agent loads what main loads: the same extensions (user, project,
+  // packages) and pi's built-in ones (codemode, tool search, MCP, llama.cpp;
+  // pi resolves which are enabled from the `extensions` setting, exactly as
+  // for main), skills, prompts and context files. The one exception is this
+  // extension itself: a sub-agent gets its agent_* tools through
+  // `customTools` instead, and must not mount a second picker/UI.
   //
-  // `noExtensions` also drops pi's built-in extensions (codemode, tool search,
-  // MCP, llama.cpp), which main has; they are handed back explicitly — the
-  // ones the user's `extensions` setting enables (see builtin-extensions.ts).
+  // Excluding it takes two steps, since pi offers no "skip this path" option:
+  // its factory runs while `reg.loading` is set and returns at once (see
+  // index.ts), and `extensionsOverride` then drops the empty shell from the
+  // loaded set.
   const builtins = await builtinExtensionEntries();
-  const builtinPaths = await enabledBuiltinPaths(
-    cwd,
-    getAgentDir(),
-    builtins.map((b) => b.name),
-  );
+  const settingsManager = SettingsManager.create(cwd, getAgentDir(), { projectTrusted: isProjectTrusted(cwd) });
   reg.loading = true;
   let session: AgentSession;
   try {
     const loader = new DefaultResourceLoader({
       cwd,
       agentDir: getAgentDir(),
-      noExtensions: true,
+      settingsManager,
       extensionFactories: builtins,
-      additionalExtensionPaths: builtinPaths,
+      extensionsOverride: (base: LoadExtensionsResult) => ({
+        ...base,
+        extensions: base.extensions.filter((ext) => !isOwnExtension(ext)),
+      }),
       // The shared delegation policy applies to every sub-agent. A def's body
       // follows it as a specialization; both supplement (rather than replace)
       // pi's base system prompt, AGENTS.md, skills, and other context.
@@ -941,10 +996,10 @@ export async function ensureAgent(
       thinkingLevel: own.thinkingLevel ? undefined : inheritThinking,
       modelRuntime,
       sessionManager: sm,
+      settingsManager,
       resourceLoader: loader,
-      // `noExtensions: true` above keeps this sub-agent from recursively
-      // loading the whole agent-view extension, but it should still get the
-      // same management tools main has — `customTools` is the SDK's
+      // This extension is excluded above, but the sub-agent should still get
+      // the same management tools main has — `customTools` is the SDK's
       // extension-independent way to hand a session tools directly, and
       // `AgentSession` gives them a real per-session `ExtensionContext`
       // (via `runner.createContext()`) exactly like an extension-registered

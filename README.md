@@ -107,21 +107,27 @@ spawned.
 
 ## What a sub-agent loads
 
-A sub-agent is a normal pi session: same skills, prompt templates, context
-files (`AGENTS.md`), and settings as `main`, plus the five `agent_*` tools.
-It also gets **pi's built-in extensions**, the same ones the CLI loads into
-`main`: `codemode`, `tool_search`, MCP, and llama.cpp. If your `extensions`
-setting disables one (e.g. `-builtin:mcp`), sub-agents don't get it either.
-`codemode` and `tool_search` stay inactive unless your `defaultTools` setting
-enables them, or MCP does. That's the same rule `main` follows, but `--tools`
-on the command line only affects `main`. Each sub-agent connects its own MCP
-servers and closes them when it is removed.
+A sub-agent loads **everything `main` loads except pi-agent-view itself**.
+That covers your installed extensions (user, project, and packages), pi's
+built-in extensions (`codemode`, `tool_search`, MCP, and llama.cpp), skills,
+prompt templates, context files (`AGENTS.md`), and settings. On top of that
+it gets the five `agent_*` tools. Leaving pi-agent-view out means it never
+loads itself recursively and never mounts a second picker; sub-agents get
+their `agent_*` tools some other way.
 
-Your installed extensions are **not** loaded into sub-agents, so this extension
-never loads itself recursively. Tool boxes in an agent view resolve their
-renderers through that agent's own session, the way `main` does. Codemode's
-own renderers and an MCP tool's `pi.registerToolRenderer()` drawing therefore
-look the same in both.
+- The same settings decide what loads, so if `-builtin:mcp` disables MCP on
+  `main`, sub-agents don't get it either. `codemode` and `tool_search` stay
+  inactive unless `defaultTools` enables them, or MCP does. `--tools` on the
+  command line only affects `main`.
+- Project trust follows `main`. A sub-agent trusts its project (settings and
+  `.pi/extensions`) only when `main` trusts that same directory.
+- Extensions run per sub-agent. Your hooks fire for each agent's own events.
+  Each agent connects its own MCP servers and closes them when it is removed.
+  Sub-agents have no UI, so an extension's dialogs there resolve as
+  cancelled.
+- Tool boxes in an agent view resolve renderers through that agent's own
+  session, the way `main` does. Codemode's renderers and an extension's
+  `pi.registerToolRenderer()` therefore draw the same in both.
 
 ## Agent templates (`.pi/agents/`)
 

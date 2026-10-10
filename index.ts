@@ -125,6 +125,7 @@ import {
   forgetAgent,
   getAgent,
   isLoadingSubAgent,
+  setProjectTrust,
   modelOf,
   readTranscript,
   runAgent,
@@ -1179,13 +1180,14 @@ export class AgentViewEditor extends CustomEditor {
 // ── Extension ──────────────────────────────────────────────────────
 
 export default function agentViews(pi: ExtensionAPI): void {
-  // Sub-agents load resources with `noExtensions`, but guard anyway: this
-  // factory must never run inside an agent session being constructed.
+  // Sub-agents load every extension main loads except this one: inside a
+  // sub-agent being constructed this factory registers nothing, and
+  // `ensureAgent` (agent-runtime.ts) then drops it from the loaded set.
   if (isLoadingSubAgent()) return;
 
   // Main loads this extension and receives the shared policy per turn.
-  // Sub-agents run with noExtensions and receive the same file through their
-  // DefaultResourceLoader in agent-runtime.ts.
+  // Sub-agents receive the same file through their DefaultResourceLoader in
+  // agent-runtime.ts.
   pi.on("before_agent_start", (event) => ({
     systemPrompt: `${event.systemPrompt}\n\n${AGENT_POLICY}`,
   }));
@@ -1198,9 +1200,8 @@ export default function agentViews(pi: ExtensionAPI): void {
   registerAgentListTool(pi);
   registerAgentInspectTool(pi);
   registerAgentControlTools(pi);
-  // Sub-agents are built with `noExtensions: true` (see `ensureAgent` in
-  // agent-runtime.ts), so they never load this extension and never call
-  // `pi.registerTool` themselves. `customTools` is how they get these same
+  // Sub-agents never load this extension (see `ensureAgent` in
+  // agent-runtime.ts), so they never call `pi.registerTool` themselves. `customTools` is how they get these same
   // five anyway — set once here, read by every `ensureAgent()` call from
   // then on, for any agent at any depth.
   setManagedTools([agentCreateTool, agentListTool, agentInspectTool, agentSendTool, agentRemoveTool]);
@@ -1805,6 +1806,8 @@ export default function agentViews(pi: ExtensionAPI): void {
   // ── Wiring ─────────────────────────────────────────────────────
 
   pi.on("session_start", (event, ctx) => {
+    // Sub-agents trust main's project exactly when main does (any mode).
+    setProjectTrust(ctx.cwd, () => ctx.isProjectTrusted());
     if (ctx.mode !== "tui") return;
     clearDeleteConfirmation();
 

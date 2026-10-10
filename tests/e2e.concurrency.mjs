@@ -37,6 +37,23 @@ function taskFor(marker, file) {
   );
 }
 
+/**
+ * Wait until an agent's turn is really under way: the model is answering.
+ * `runAgent` marks an agent "working" at once, but the user's extensions
+ * (sub-agents load them like main does, e.g. an `input` hook) can run for a
+ * while before pi starts the run, and aborting before that has nothing to
+ * abort.
+ */
+async function waitForTurn(file, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const agent = runtime.getAgent(file);
+    if (agent?.session.isStreaming && agent.transcript.some((i) => i.kind === "assistant")) return;
+    await sleep(50);
+  }
+  throw new Error(`${file} never started its turn`);
+}
+
 async function waitForSettled(files, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   const seenParallel = { max: 0 };
@@ -227,7 +244,7 @@ test(
     await runtime.runAgent(survivor, taskFor("SURVIVOR-DONE", survivorOut), cwd);
 
     // Kill one mid-flight.
-    while (runtime.stateOf(doomed) !== "working") await sleep(100);
+    await waitForTurn(doomed);
     assertEqual(await runtime.terminateAgent(doomed), true, "it was running when terminated");
 
     assertEqual(runtime.getAgent(doomed), undefined, "its session is gone from the pool");
@@ -268,7 +285,7 @@ test(
     await runtime.runAgent(interrupted, taskFor("INTERRUPTED-DONE", interruptedOut), cwd);
     await runtime.runAgent(survivor, taskFor("SURVIVOR-ABORT-DONE", survivorOut), cwd);
 
-    while (runtime.stateOf(interrupted) !== "working") await sleep(100);
+    await waitForTurn(interrupted);
     const liveBefore = runtime.getAgent(interrupted);
     assertEqual(await runtime.abortAgent(interrupted), true, "it was working when aborted");
 

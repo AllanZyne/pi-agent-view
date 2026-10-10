@@ -1,14 +1,12 @@
 /**
  * pi's built-in extensions (`builtin:<name>`: codemode, tool search, MCP,
- * llama.cpp), loaded into every sub-agent the same way the CLI loads them into
- * main.
+ * llama.cpp), supplied to every sub-agent's resource loader the way the CLI
+ * supplies them to main's.
  *
- * Sub-agents are created with `noExtensions: true` so this extension is never
- * loaded recursively into them, but `noExtensions` also turns off the built-in
- * extensions (pi's `--no-extensions` does the same). The CLI keeps its list
- * in `dist/extensions/index.js` (`builtInExtensions`); the SDK says to supply
- * them yourself (see pi's docs/sdk.md, "Codemode and MCP"). This module does
- * that:
+ * The CLI keeps its list in `dist/extensions/index.js` (`builtInExtensions`)
+ * and passes it as `extensionFactories`; an SDK session gets none unless its
+ * host does the same (see pi's docs/sdk.md, "Codemode and MCP"). This module
+ * builds that same list:
  *
  * - The factories come from pi's public exports (`createCodemodeExtension`,
  *   `createToolSearchExtension`, `createMcpExtension`). In a bundled pi those
@@ -16,23 +14,16 @@
  *   CLI's own entries are these same factories (`export default createX()`).
  * - llama.cpp has no public export, so it is loaded from its file on disk,
  *   best effort, the same way `tool-renderers.ts` loads pi's renderers.
- * - Each one is passed as a `builtin: true` entry, so it loads like it does on
- *   main: hidden, replaceable, and named `builtin:<name>` in diagnostics.
- * - Which ones are enabled comes from the user's own `extensions` setting
- *   (`-builtin:mcp` disables MCP globally or per project), resolved by pi's
- *   `DefaultPackageManager` exactly the way main's resource loader resolves
- *   it. `noExtensions` drops those settings-enabled paths, so the enabled ones
- *   go in as `additionalExtensionPaths` (`builtin:<name>`), which is pi's
- *   documented way to load one explicitly.
+ * - Each one is a `builtin: true` entry, so pi resolves whether it is enabled
+ *   from the `extensions` setting (`-builtin:mcp`) exactly as for main, and
+ *   loads it hidden, replaceable, and named `builtin:<name>`.
  */
 
 import {
   createCodemodeExtension,
   createMcpExtension,
   createToolSearchExtension,
-  DefaultPackageManager,
   type InlineExtension,
-  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { piModuleUrl } from "./pi-package.ts";
 
@@ -76,27 +67,6 @@ export function builtinExtensionEntries(): Promise<BuiltinEntry[]> {
     return list;
   })();
   return entries;
-}
-
-/**
- * `builtin:<name>` paths the user's settings enable for `cwd`. A failure to
- * resolve settings counts as "all enabled", which is pi's default.
- */
-export async function enabledBuiltinPaths(cwd: string, agentDir: string, names: readonly string[]): Promise<string[]> {
-  const all = names.map((name) => `builtin:${name}`);
-  try {
-    const pm = new DefaultPackageManager({
-      cwd,
-      agentDir,
-      settingsManager: SettingsManager.create(cwd, agentDir),
-      builtinExtensions: [...names],
-    });
-    const resolved = await pm.resolve();
-    const enabled = new Set(resolved.extensions.filter((r) => r.enabled).map((r) => r.path));
-    return all.filter((path) => enabled.has(path));
-  } catch {
-    return all;
-  }
 }
 
 /** Test seam: forget the loaded entries. */
