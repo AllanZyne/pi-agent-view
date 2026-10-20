@@ -39,6 +39,12 @@ export const GLOBAL_ATTACHED_COMMANDS = new Set<string>([
   "quit",
   "arminsayshi",
   "dementedelves",
+  // This extension's own commands. They run in main's context (sub-agents do not
+  // load this extension), and /agent-rename resolves its target from the
+  // attached view, so they must reach pi's dispatch instead of being steered to
+  // the agent as chat text. (/agent-main-clear is blocked instead, below.)
+  "agent-rename",
+  "agents",
 ]);
 
 /**
