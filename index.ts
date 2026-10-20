@@ -136,12 +136,15 @@ import {
   stateOf,
   steerAgent,
   type TranscriptItem,
+  generateAgentName,
+  generateRecap,
 } from "./agent-runtime.ts";
 import {
   agentName,
   listAgentEntries,
   registerAgent,
   removeAgentEntry,
+  renameAgentEntry,
   resolveRoot,
   ROOT_AGENT_NAME,
   templateId,
@@ -1530,6 +1533,47 @@ export default function agentViews(pi: ExtensionAPI): void {
     }));
   }
 
+  // ── Recap ──────────────────────────────────────────────────────
+  //
+  // Like Claude Code's "away summary": when you switch to an agent that is no
+  // longer working and has moved since you last looked, a small model writes a
+  // one/two-sentence "where it stands" note, shown in a widget above the editor.
+  // It disappears when you send something, the agent starts working again, or
+  // you detach. Disable with AGENT_VIEW_RECAP=0.
+
+  /** Transcript length the user last saw (or was recapped on), per agent file. */
+  const recapSeen = new Map<string, number>();
+  /** Last context seen by attach(), so detach() (which has none) can clear the widget. */
+  let recapCtx: ExtensionContext | undefined;
+  const RECAP_WIDGET = "agent-view-recap";
+
+  function clearRecap(ctx: ExtensionContext): void {
+    ctx.ui.setWidget(RECAP_WIDGET, undefined);
+  }
+
+  async function maybeRecap(ctx: ExtensionContext, file: string): Promise<void> {
+    recapCtx = ctx;
+    if (process.env.AGENT_VIEW_RECAP === "0") return;
+    const state = stateOf(file);
+    if (state === undefined || state === "working") return;
+    const items = readTranscript(file);
+    if (!items.some((i) => i.kind === "assistant") || recapSeen.get(file) === items.length) return;
+    recapSeen.set(file, items.length);
+
+    const text = await generateRecap(items, state, ctx.model);
+    // Dropped if the user moved on, or the agent woke up, while the model thought.
+    if (!text || view.attached !== file || stateOf(file) === "working") return;
+    ctx.ui.setWidget(RECAP_WIDGET, (_tui, theme) => ({
+      render: (w: number) => {
+        if (view.attached !== file || stateOf(file) === "working") return [];
+        const body = wrapTextWithAnsi(`※ recap: ${text}`, Math.max(20, w - 2));
+        return body.map((l) => truncateToWidth(` ${theme.fg("dim", l)}`, w));
+      },
+      invalidate: () => {},
+    }));
+    tui?.requestRender();
+  }
+
   /**
    * Attach: stream an agent's output into pi's transcript. Only rendering
    * changes — the agent keeps running and pi's own session is untouched.
@@ -1559,6 +1603,7 @@ export default function agentViews(pi: ExtensionAPI): void {
     // fresh session. Which agent you are looking at is shown on the editor.
     mirror();
     redrawTranscript();
+    void maybeRecap(ctx, file);
   }
 
   /**
@@ -1568,6 +1613,8 @@ export default function agentViews(pi: ExtensionAPI): void {
    */
   function detach(): void {
     if (!view.attached) return;
+    recapSeen.set(view.attached, readTranscript(view.attached).length);
+    recapCtx?.ui.setWidget(RECAP_WIDGET, undefined);
     attachTo(view, undefined);
     syncFooter();
     redrawTranscript();
@@ -1642,7 +1689,9 @@ export default function agentViews(pi: ExtensionAPI): void {
     }
 
     const existing = listAgentEntries(root, (f) => getAgent(f) !== undefined);
-    const name = agentName(prompt, existing.map((a) => a.name));
+    let name = await generateAgentName(prompt, existing.map((a) => a.name), ctx.model);
+    // Naming awaits a model call; another spawn may have taken the name meanwhile.
+    name = agentName(name, listAgentEntries(root, (f) => getAgent(f) !== undefined).map((a) => a.name));
     let file: string | undefined;
     try {
       file = registerAgent(root, name, ctx.cwd);
@@ -1776,6 +1825,43 @@ export default function agentViews(pi: ExtensionAPI): void {
     const template = entry ? templateId(entry) : undefined;
     return template ? loadCatalog(ctx.cwd).agents.get(template) : undefined;
   }
+
+  pi.registerCommand("agent-rename", {
+    description: "Rename the attached agent: /agent-rename [name] (no name = regenerate with a small model)",
+    handler: async (args, ctx) => {
+      const requested = (args ?? "").trim();
+      const root = rootOf(ctx);
+      const own = ctx.sessionManager.getSessionFile();
+      const target = own && root && own !== root.rootFile ? own : view.attached;
+      if (!root || !target) {
+        notify(ctx, "Attach to an agent first (main cannot be renamed)", "error");
+        return;
+      }
+      let newName = requested;
+      if (!newName) {
+        // No name given: regenerate one from the agent's own task, with the
+        // same small model and rules as the name it got at spawn time.
+        const first = readTranscript(target).find((i) => i.kind === "user");
+        if (!first || first.kind !== "user" || !first.text.trim()) {
+          notify(ctx, "Nothing to name this agent from yet. Usage: /agent-rename <name>", "error");
+          return;
+        }
+        const others = listAgentEntries(root, (f) => getAgent(f) !== undefined)
+          .filter((a) => a.file !== target)
+          .map((a) => a.name);
+        newName = await generateAgentName(first.text, others, ctx.model);
+      }
+      const err = renameAgentEntry(root, target, newName);
+      if (err) {
+        notify(ctx, err, "error");
+        return;
+      }
+      manifestNames.delete(target);
+      reloadRows(ctx);
+      tui?.requestRender();
+      notify(ctx, `Renamed to ${newName}`, "info");
+    },
+  });
 
   pi.registerCommand("agents", {
     description: "List agent templates discovered under .pi/agents/",
@@ -1942,6 +2028,8 @@ export default function agentViews(pi: ExtensionAPI): void {
             void spawn(ctx, action.prompt);
             break;
           case "steer":
+            clearRecap(ctx);
+            recapSeen.delete(action.key);
             void steerAgent(action.key, action.text).then((ok) => {
               if (!ok) notify(ctx, "That agent is not live", "warning");
             });

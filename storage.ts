@@ -229,3 +229,28 @@ export function removeAgentEntry(root: RootCtx, file: string): void {
     /* ignore */
   }
 }
+
+/**
+ * Rename an agent's manifest entry. The name must be a slug (lowercase letters,
+ * digits, single hyphens) and unique within the group (`main` is reserved).
+ * Returns an error message, or undefined on success.
+ */
+export function renameAgentEntry(root: RootCtx, file: string, newName: string): string | undefined {
+  if (!/^[a-z]+(-[a-z]+)*$/.test(newName)) {
+    return "Name must be lowercase letters separated by single hyphens";
+  }
+  if (newName.length > MAX_NAME_LENGTH) return `Name must be at most ${MAX_NAME_LENGTH} characters`;
+  if (newName === ROOT_AGENT_NAME) return `"${ROOT_AGENT_NAME}" is reserved`;
+  const m = loadManifest(root.sessionDir, root.rootId);
+  const entry = m?.agents.find((a) => a.file === file);
+  if (!m || !entry) return "Not a sub-agent (main cannot be renamed)";
+  if (m.agents.some((a) => a !== entry && a.name === newName)) return `Name "${newName}" is already used`;
+  entry.name = newName;
+  saveManifest(root.sessionDir, m);
+  try {
+    if (fs.existsSync(file)) SessionManager.open(file).appendSessionInfo(newName);
+  } catch {
+    /* session name is cosmetic; the manifest is authoritative */
+  }
+  return undefined;
+}

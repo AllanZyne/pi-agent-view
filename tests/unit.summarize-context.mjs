@@ -62,3 +62,29 @@ test("summarizeContext: truncates a single very long turn", () => {
   assert(out.length < 5000, "long turn text is truncated");
   assert(out.endsWith("\u2026"), "truncated turn ends with an ellipsis marker");
 });
+
+test("buildRecapContext: empty transcript yields empty string", () => {
+  assertEqual(runtime.buildRecapContext([]), "");
+});
+
+test("buildRecapContext: keeps turns and terse tool lines in order, marks failures", () => {
+  const items = [
+    user("fix the build"),
+    { kind: "toolCall", id: "1", name: "bash", args: { command: "npm   test" }, result: { isError: true, isPartial: false, content: [] } },
+    assistant("tests fail in foo"),
+    { kind: "toolResult", toolCallId: "1", name: "bash", text: "x", isError: true, content: [] },
+  ];
+  assertEqual(
+    runtime.buildRecapContext(items),
+    "User: fix the build\nTool bash: npm test (failed)\nAssistant: tests fail in foo",
+  );
+});
+
+test("buildRecapContext: newest activity survives the size cap", () => {
+  const items = [];
+  for (let i = 0; i < 100; i++) items.push(user(`turn ${i} ` + "x".repeat(600)));
+  const out = runtime.buildRecapContext(items);
+  assert(out.length <= 9000, `bounded (${out.length})`);
+  assert(out.includes("turn 99 "), "newest turn kept");
+  assert(!out.includes("turn 0 "), "oldest turn dropped");
+});

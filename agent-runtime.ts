@@ -12,6 +12,7 @@
  * exclusively by its own AgentSession (single writer, no contention).
  */
 
+import { agentName } from "./storage.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1108,6 +1109,171 @@ export async function resolveModelSearch(token: string): Promise<ModelSearchResu
 export async function availableModelIds(): Promise<string[]> {
   const runtime = await getModelRuntime();
   return runtime.getAvailableSnapshot().map((m) => `${m.provider}/${m.id}`);
+}
+
+/** Preference order for the cheap helper model (id substring). */
+const SMALL_MODEL_HINTS = ["haiku", "luna", "flash", "mini"];
+const SMALL_MODEL_TIMEOUT_MS = 8000;
+/**
+ * The helper model that last answered. Naming and recaps share it, so both use
+ * one model per process (and a model that works is not re-probed each call);
+ * cleared when it fails so the next call re-selects.
+ */
+let preferredSmallModel: Model<any> | undefined;
+
+/**
+ * One cheap completion on a small model; undefined on any failure.
+ *
+ * Candidates in preference order: hint order first, then (within a hint) the
+ * session model's provider and region-prefixed inference-profile ids (Bedrock
+ * rejects bare base ids), then newest-looking id; the session model itself is
+ * the last resort. A few are tried because a listed model may be unusable
+ * (no access, wrong region). Override the model with $AGENT_VIEW_SMALL_MODEL
+ * (a substring of a model id; $AGENT_VIEW_NAME_MODEL is still honoured).
+ * `maxTokens` is generous because reasoning models spend it on thinking first.
+ */
+async function completeWithSmallModel(
+  systemPrompt: string,
+  userText: string,
+  fallbackModel?: Model<any>,
+): Promise<string | undefined> {
+  try {
+    const runtime = await getModelRuntime();
+    const available = runtime.getAvailableSnapshot();
+    const hints = [
+      process.env.AGENT_VIEW_SMALL_MODEL,
+      process.env.AGENT_VIEW_NAME_MODEL,
+      ...SMALL_MODEL_HINTS,
+    ].filter((h): h is string => !!h);
+    const candidates: Model<any>[] = [];
+    for (const hint of hints) {
+      const h = hint.toLowerCase();
+      const rank = (m: Model<any>) =>
+        (m.provider === fallbackModel?.provider ? 0 : 2) + (/^(us|global|eu|apac)\./.test(m.id) ? 0 : 1);
+      const matches = available
+        .filter((m) => m.id.toLowerCase().includes(h) && !candidates.includes(m))
+        .sort((x, y) => rank(x) - rank(y) || y.id.localeCompare(x.id));
+      candidates.push(...matches);
+    }
+    if (fallbackModel) candidates.push(fallbackModel);
+    if (preferredSmallModel && !process.env.AGENT_VIEW_SMALL_MODEL && !process.env.AGENT_VIEW_NAME_MODEL) {
+      candidates.unshift(preferredSmallModel);
+    }
+
+    for (const model of candidates.slice(0, 4)) {
+      const reply = await runtime.completeSimple(
+        model,
+        { systemPrompt, messages: [{ role: "user", content: userText, timestamp: Date.now() }] },
+        { signal: AbortSignal.timeout(SMALL_MODEL_TIMEOUT_MS), maxTokens: 512 },
+      );
+      // "length" may still carry text (reasoning models).
+      if (reply.stopReason === "error" || reply.stopReason === "aborted") {
+        if (model === preferredSmallModel) preferredSmallModel = undefined;
+        continue;
+      }
+      const text = reply.content
+        .map((c) => (c.type === "text" ? c.text : ""))
+        .join("")
+        .trim();
+      if (text) {
+        preferredSmallModel = model;
+        return text;
+      }
+    }
+  } catch {
+    /* fall through */
+  }
+  return undefined;
+}
+
+/**
+ * Name a new agent with a small model, falling back to the prompt-derived slug.
+ *
+ * The model's reply is run through `agentName`, so it gets exactly the same
+ * normalisation (lowercase letters, single hyphens, <= 40 chars) and the same
+ * uniqueness suffixing as a prompt-derived name. Any failure silently degrades
+ * to `agentName(prompt, taken)`.
+ */
+export async function generateAgentName(
+  prompt: string,
+  taken: readonly string[],
+  fallbackModel?: Model<any>,
+): Promise<string> {
+  const text = await completeWithSmallModel(
+    "You name tasks. Always answer in English, even if the task is not in English. Reply with ONLY a short kebab-case name (2-4 lowercase English words, letters and hyphens only) describing the task. No quotes, no punctuation, no explanation.",
+    prompt.slice(0, 2000),
+    fallbackModel,
+  );
+  return agentName(text && /[a-z]/i.test(text) ? text : prompt, taken);
+}
+
+const RECAP_MAX_ITEMS = 40;
+const RECAP_MAX_CHARS = 8000;
+const RECAP_TURN_MAX_CHARS = 700;
+
+/**
+ * Plain-text digest of the tail of a transcript for the recap model.
+ *
+ * Unlike `summarizeContext` (user/assistant turns only) this keeps one terse
+ * line per tool call and error, because "what did the agent actually do" lives
+ * mostly in its tool use. Walks backwards from the newest item so the freshest
+ * activity always survives the caps; returns "" when there is nothing to recap.
+ */
+export function buildRecapContext(items: readonly TranscriptItem[]): string {
+  const lines: string[] = [];
+  let chars = 0;
+  let seen = 0;
+  for (let i = items.length - 1; i >= 0 && seen < RECAP_MAX_ITEMS; i--) {
+    const item = items[i]!;
+    let line: string | undefined;
+    switch (item.kind) {
+      case "user":
+        line = `User: ${truncate(item.text, RECAP_TURN_MAX_CHARS)}`;
+        break;
+      case "assistant": {
+        const text = assistantText(item.message).trim();
+        if (text) line = `Assistant: ${truncate(text, RECAP_TURN_MAX_CHARS)}`;
+        break;
+      }
+      case "toolCall": {
+        const arg = Object.values(item.args).find((v) => typeof v === "string") as string | undefined;
+        line = `Tool ${item.name}${arg ? `: ${truncate(arg.replace(/\s+/g, " "), 120)}` : ""}${
+          item.result?.isError ? " (failed)" : ""
+        }`;
+        break;
+      }
+      default:
+        break;
+    }
+    if (!line) continue;
+    seen++;
+    if (chars + line.length > RECAP_MAX_CHARS && lines.length > 0) break;
+    lines.push(line);
+    chars += line.length;
+  }
+  return lines.reverse().join("\n");
+}
+
+/**
+ * A short "where things stand" recap of an agent's transcript, for showing when
+ * you come back to an agent that is no longer working. Modelled on Claude
+ * Code's away summary: under ~40 words, plain text, goal + current task first,
+ * then the one next action. Undefined when there is nothing to say or no model
+ * answered (callers just show nothing).
+ */
+export async function generateRecap(
+  items: readonly TranscriptItem[],
+  state: AgentState | undefined,
+  fallbackModel?: Model<any>,
+): Promise<string | undefined> {
+  const context = buildRecapContext(items);
+  if (!context) return undefined;
+  const text = await completeWithSmallModel(
+    "You write a recap for a user who stepped away from a coding agent and is coming back. Recap in under 40 words, 1-2 plain sentences, no markdown. Lead with the overall goal and current task, then say where the agent stands now (finished, failed, waiting for the user, stopped) and the one next action if any. Skip root-cause narrative, fix internals, secondary to-dos. Always write the recap in English, regardless of the language of the conversation. Output only the recap.",
+    `Agent status: ${state ?? "unknown"}\n\nRecent activity (oldest first):\n${context}`,
+    fallbackModel,
+  );
+  return text?.replace(/\s+/g, " ").trim() || undefined;
 }
 
 /**

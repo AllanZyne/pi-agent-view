@@ -191,3 +191,21 @@ test("agentName never shadows the root session's name", () => {
   assertEqual(storage.agentName("Main!"), "main-b", "case does not matter");
   assertEqual(storage.agentName("main thing"), "main-thing", "only an exact collision is renamed");
 });
+
+test("renameAgentEntry renames, and rejects bad, reserved, duplicate and unknown", () => {
+  const dir = tempDir();
+  const rootFile = path.join(dir, "root.jsonl");
+  fs.writeFileSync(rootFile, "");
+  const root = { rootId: "root-r", rootFile, sessionDir: dir };
+  const a = storage.registerAgent(root, "alpha", dir);
+  storage.registerAgent(root, "beta", dir);
+
+  assertEqual(storage.renameAgentEntry(root, a, "gamma-ray"), undefined, "valid rename succeeds");
+  assertEqual(storage.loadManifest(dir, "root-r").agents[0].name, "gamma-ray", "manifest updated");
+  assert(storage.renameAgentEntry(root, a, "Bad Name"), "non-slug rejected");
+  assert(storage.renameAgentEntry(root, a, "main"), "reserved name rejected");
+  assert(storage.renameAgentEntry(root, a, "a".repeat(41)), "too long rejected");
+  assert(storage.renameAgentEntry(root, a, "has2digit"), "digits rejected");
+  assert(storage.renameAgentEntry(root, a, "beta"), "duplicate rejected");
+  assert(storage.renameAgentEntry(root, rootFile, "zzz"), "main cannot be renamed");
+});
