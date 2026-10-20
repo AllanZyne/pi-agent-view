@@ -52,6 +52,15 @@ test("detached (main): every command passes through untouched", async () => {
   );
 });
 
+test("detached (main): agent-only commands (/agent-rename) are hidden, others untouched", async () => {
+  const provider = withAttachedCommandFilter(fakeCommandProvider(["model", "agent-rename", "agent-main-clear"]), viewWith(undefined));
+  const result = await provider.getSuggestions(["/"], 0, 1, {});
+  assertEqual(result.items.map((i) => i.value), ["model", "agent-main-clear"], "agent-rename hidden on main");
+  const attached = withAttachedCommandFilter(fakeCommandProvider(["model", "agent-rename", "agent-main-clear"]), viewWith("f"));
+  const r2 = await attached.getSuggestions(["/"], 0, 1, {});
+  assertEqual(r2.items.map((i) => i.value), ["model", "agent-rename"], "agent-rename visible, agent-main-clear hidden when attached");
+});
+
 test("attached to an agent: blacklisted commands (pi's own session/tree, and per-session ones not yet implemented against the attached agent) are hidden from completion", () => {
   return (async () => {
     const provider = withAttachedCommandFilter(

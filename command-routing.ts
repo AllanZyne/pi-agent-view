@@ -108,6 +108,13 @@ export function parseModelCommand(text: string): { search?: string } | undefined
 }
 
 /**
+ * Commands that only make sense with an agent on screen. Hidden from `/`
+ * completion on `main`, mirroring how `BLOCKED_ATTACHED_COMMANDS` is hidden
+ * while attached (the command itself also refuses to run on `main`).
+ */
+export const AGENT_ONLY_COMMANDS = new Set<string>(["agent-rename"]);
+
+/**
  * The bare command name of a `/foo` or `/foo args` line, or `undefined` for
  * anything else (plain chat text, `!bash`, `@mention`, ...).
  */
@@ -123,8 +130,8 @@ export function commandName(text: string): string | undefined {
  * completion — the blacklist above, since typing one gets blocked with a
  * notice instead of doing anything useful. Global commands and the ones this
  * view implements itself both stay visible: both actually run. Detached (on
- * `main`), this passes every call straight through: `attached` is unset only
- * there.
+ * `main`), only `AGENT_ONLY_COMMANDS` are hidden; everything else passes
+ * straight through (`attached` is unset only there).
  */
 export function withAttachedCommandFilter(
   current: AutocompleteProvider,
@@ -134,7 +141,14 @@ export function withAttachedCommandFilter(
     triggerCharacters: current.triggerCharacters,
     async getSuggestions(lines, cursorLine, cursorCol, options) {
       const result = await current.getSuggestions(lines, cursorLine, cursorCol, options);
-      if (!result || !view.attached) return result;
+      if (!result) return result;
+      if (!view.attached) {
+        // On main: hide the agent-only commands (everything else passes through).
+        if (!result.prefix.startsWith("/") || result.prefix.includes(" ")) return result;
+        const kept = result.items.filter((item: AutocompleteItem) => !AGENT_ONLY_COMMANDS.has(item.value));
+        if (kept.length === result.items.length) return result;
+        return kept.length === 0 ? null : { ...result, items: kept };
+      }
       // Only the top-level "/" command list needs filtering: a command that
       // made it past that list either runs directly or is one we implement
       // ourselves, so its own argument completions (prefix has a space in it)

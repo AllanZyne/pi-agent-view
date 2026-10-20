@@ -1096,6 +1096,9 @@ export class AgentViewEditor extends CustomEditor {
             // own handler clears the editor itself, and by this point (an
             // accepted completion) the editor may already be empty anyway.
             if (cmd && GLOBAL_ATTACHED_COMMANDS.has(cmd)) {
+              // pi's dispatch clears the editor for its own built-ins but not for
+              // extension commands (/agent-rename), which would keep their text.
+              this.setText("");
               this.onSubmit?.(text);
               return;
             }
@@ -1539,13 +1542,16 @@ export default function agentViews(pi: ExtensionAPI): void {
   // ── Recap ──────────────────────────────────────────────────────
   //
   // Like Claude Code's "away summary": when you switch to an agent that is no
-  // longer working and has moved since you last looked, a small model writes a
-  // one/two-sentence "where it stands" note, shown in a widget above the editor.
-  // It disappears when you send something, the agent starts working again, or
-  // you detach. Disable with AGENT_VIEW_RECAP=0.
+  // longer working, a small model writes a one/two-sentence "where it stands"
+  // note, shown in a widget above the editor. It is cached per agent against the
+  // transcript length it was written for: coming back to an agent that has not
+  // moved reuses the cached text (no model call); only a changed transcript is
+  // recapped again. It disappears when you send something, the agent starts
+  // working again, or you detach. Disable with AGENT_VIEW_RECAP=0.
 
-  /** Transcript length the user last saw (or was recapped on), per agent file. */
-  const recapSeen = new Map<string, number>();
+  const recapCache = new Map<string, { len: number; text: string }>();
+  /** Recaps being generated, by file, so quick re-attaches share one model call. */
+  const recapPending = new Map<string, { len: number; promise: Promise<string | undefined> }>();
   /** Last context seen by attach(), so detach() (which has none) can clear the widget. */
   let recapCtx: ExtensionContext | undefined;
   const RECAP_WIDGET = "agent-view-recap";
@@ -1560,16 +1566,31 @@ export default function agentViews(pi: ExtensionAPI): void {
     const state = stateOf(file);
     if (state === undefined || state === "working") return;
     const items = readTranscript(file);
-    if (!items.some((i) => i.kind === "assistant") || recapSeen.get(file) === items.length) return;
-    recapSeen.set(file, items.length);
+    if (!items.some((i) => i.kind === "assistant")) return;
 
-    const text = await generateRecap(items, state, ctx.model);
+    const len = items.length;
+    let text: string | undefined;
+    const cached = recapCache.get(file);
+    if (cached && cached.len === len) {
+      text = cached.text;
+    } else {
+      let pending = recapPending.get(file);
+      if (!pending || pending.len !== len) {
+        pending = { len, promise: generateRecap(items, state, ctx.model) };
+        recapPending.set(file, pending);
+      }
+      const mine = pending;
+      text = await mine.promise;
+      if (recapPending.get(file) === mine) recapPending.delete(file);
+      if (text) recapCache.set(file, { len, text });
+    }
     // Dropped if the user moved on, or the agent woke up, while the model thought.
     if (!text || view.attached !== file || stateOf(file) === "working") return;
+    const shown = text;
     ctx.ui.setWidget(RECAP_WIDGET, (_tui, theme) => ({
       render: (w: number) => {
         if (view.attached !== file || stateOf(file) === "working") return [];
-        const body = wrapTextWithAnsi(`※ recap: ${text}`, Math.max(20, w - 2));
+        const body = wrapTextWithAnsi(`※ recap: ${shown}`, Math.max(20, w - 2));
         return body.map((l) => truncateToWidth(` ${theme.fg("dim", l)}`, w));
       },
       invalidate: () => {},
@@ -1616,7 +1637,6 @@ export default function agentViews(pi: ExtensionAPI): void {
    */
   function detach(): void {
     if (!view.attached) return;
-    recapSeen.set(view.attached, readTranscript(view.attached).length);
     recapCtx?.ui.setWidget(RECAP_WIDGET, undefined);
     attachTo(view, undefined);
     syncFooter();
@@ -2090,7 +2110,6 @@ export default function agentViews(pi: ExtensionAPI): void {
             break;
           case "steer":
             clearRecap(ctx);
-            recapSeen.delete(action.key);
             void steerAgent(action.key, action.text).then((ok) => {
               if (!ok) notify(ctx, "That agent is not live", "warning");
             });
