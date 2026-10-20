@@ -235,7 +235,13 @@ export function removeAgentEntry(root: RootCtx, file: string): void {
  * digits, single hyphens) and unique within the group (`main` is reserved).
  * Returns an error message, or undefined on success.
  */
-export function renameAgentEntry(root: RootCtx, file: string, newName: string): string | undefined {
+export function renameAgentEntry(
+  root: RootCtx,
+  file: string,
+  newName: string,
+  /** The agent's live SessionManager, if it has one: a second writer on a live file is avoided. */
+  liveSm?: SessionManager,
+): string | undefined {
   if (!/^[a-z]+(-[a-z]+)*$/.test(newName)) {
     return "Name must be lowercase letters separated by single hyphens";
   }
@@ -248,7 +254,8 @@ export function renameAgentEntry(root: RootCtx, file: string, newName: string): 
   entry.name = newName;
   saveManifest(root.sessionDir, m);
   try {
-    if (fs.existsSync(file)) SessionManager.open(file).appendSessionInfo(newName);
+    if (liveSm) liveSm.appendSessionInfo(newName);
+    else if (fs.existsSync(file)) SessionManager.open(file).appendSessionInfo(newName);
   } catch {
     /* session name is cosmetic; the manifest is authoritative */
   }

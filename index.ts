@@ -138,6 +138,7 @@ import {
   type TranscriptItem,
   generateAgentName,
   generateRecap,
+  regenerateAgentName,
 } from "./agent-runtime.ts";
 import {
   agentName,
@@ -1677,6 +1678,27 @@ export default function agentViews(pi: ExtensionAPI): void {
   }
 
   /**
+   * Replace a just-spawned agent's slug with a small-model name, off the
+   * critical path. Only swaps if the name is still the slug we gave it (the user
+   * may have run /agent-rename meanwhile) and silently gives up on any failure
+   * or collision.
+   */
+  function renameInBackground(ctx: ExtensionContext, root: RootCtx, file: string, slug: string, prompt: string): void {
+    void (async () => {
+      const others = listAgentEntries(root, (f) => getAgent(f) !== undefined)
+        .filter((a) => a.file !== file)
+        .map((a) => a.name);
+      const name = await generateAgentName(prompt, others, ctx.model);
+      const current = listAgentEntries(root, (f) => getAgent(f) !== undefined).find((a) => a.file === file);
+      if (!current || current.name !== slug || name === slug) return;
+      if (renameAgentEntry(root, file, name, getAgent(file)?.session.sessionManager)) return;
+      manifestNames.delete(file);
+      reloadRows(ctx);
+      tui?.requestRender();
+    })().catch(() => {});
+  }
+
+  /**
    * Create a new plain agent from the picker and immediately show it.
    * The user's text is the complete task: this direct UI gesture deliberately
    * does not prepend context from main or from the previously attached agent.
@@ -1688,13 +1710,15 @@ export default function agentViews(pi: ExtensionAPI): void {
       return undefined;
     }
 
+    // Start immediately under the instant prompt-derived slug. The nicer
+    // small-model name is generated concurrently and swapped in afterwards
+    // (see renameInBackground), so naming never delays the task.
     const existing = listAgentEntries(root, (f) => getAgent(f) !== undefined);
-    let name = await generateAgentName(prompt, existing.map((a) => a.name), ctx.model);
-    // Naming awaits a model call; another spawn may have taken the name meanwhile.
-    name = agentName(name, listAgentEntries(root, (f) => getAgent(f) !== undefined).map((a) => a.name));
+    const name = agentName(prompt, existing.map((a) => a.name));
     let file: string | undefined;
     try {
       file = registerAgent(root, name, ctx.cwd);
+      renameInBackground(ctx, root, file, name, prompt);
       await runAgent(file, prompt, ctx.cwd, ctx.model, ctx.thinkingLevel);
     } catch (err) {
       // A registered agent may not have a session file yet. Remove its manifest
@@ -1839,19 +1863,19 @@ export default function agentViews(pi: ExtensionAPI): void {
       }
       let newName = requested;
       if (!newName) {
-        // No name given: regenerate one from the agent's own task, with the
-        // same small model and rules as the name it got at spawn time.
-        const first = readTranscript(target).find((i) => i.kind === "user");
-        if (!first || first.kind !== "user" || !first.text.trim()) {
+        // No name given: regenerate one from what the agent has done so far
+        // (the same digest the recap uses), with the same small model.
+        const items = readTranscript(target);
+        if (!items.some((i) => i.kind === "user" || i.kind === "assistant")) {
           notify(ctx, "Nothing to name this agent from yet. Usage: /agent-rename <name>", "error");
           return;
         }
         const others = listAgentEntries(root, (f) => getAgent(f) !== undefined)
           .filter((a) => a.file !== target)
           .map((a) => a.name);
-        newName = await generateAgentName(first.text, others, ctx.model);
+        newName = await regenerateAgentName(items, others, ctx.model);
       }
-      const err = renameAgentEntry(root, target, newName);
+      const err = renameAgentEntry(root, target, newName, getAgent(target)?.session.sessionManager);
       if (err) {
         notify(ctx, err, "error");
         return;

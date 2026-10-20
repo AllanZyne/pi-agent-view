@@ -946,7 +946,8 @@ export async function ensureAgent(
   const transcript = seedTranscript(sm);
   const own = ownSettings(sm);
 
-  const modelRuntime = await getModelRuntime();
+  // Independent of each other, so don't pay for them one after the other.
+  const [modelRuntime, builtins] = await Promise.all([getModelRuntime(), builtinExtensionEntries()]);
 
   // Resolve the def's model to a concrete `Model<any>` if one is declared. A
   // missing / unresolvable model falls through to the caller-supplied
@@ -969,7 +970,6 @@ export async function ensureAgent(
   // its factory runs while `reg.loading` is set and returns at once (see
   // index.ts), and `extensionsOverride` then drops the empty shell from the
   // loaded set.
-  const builtins = await builtinExtensionEntries();
   const settingsManager = SettingsManager.create(cwd, getAgentDir(), { projectTrusted: isProjectTrusted(cwd) });
   reg.loading = true;
   let session: AgentSession;
@@ -1205,6 +1205,31 @@ export async function generateAgentName(
     fallbackModel,
   );
   return agentName(text && /[a-z]/i.test(text) ? text : prompt, taken);
+}
+
+/**
+ * Re-name an existing agent from what it has actually done, using the same
+ * transcript digest as the recap (`buildRecapContext`) rather than only its
+ * first prompt, so the name tracks the current task if the work drifted.
+ * Same output rules and normalisation as `generateAgentName`; falls back to the
+ * first user message's slug when there is no digest or no model answers.
+ */
+export async function regenerateAgentName(
+  items: readonly TranscriptItem[],
+  taken: readonly string[],
+  fallbackModel?: Model<any>,
+): Promise<string> {
+  const context = buildRecapContext(items);
+  const firstUser = items.find((i) => i.kind === "user");
+  const firstPrompt = firstUser?.kind === "user" ? firstUser.text : "";
+  const text = context
+    ? await completeWithSmallModel(
+        "You name coding-agent sessions. From the recent activity, name the agent's overall goal and current task. Always answer in English, even if the conversation is not. Reply with ONLY a short kebab-case name (2-4 lowercase English words, letters and hyphens only). No quotes, no punctuation, no explanation.",
+        `Recent activity (oldest first):\n${context}`,
+        fallbackModel,
+      )
+    : undefined;
+  return agentName(text && /[a-z]/i.test(text) ? text : firstPrompt, taken);
 }
 
 const RECAP_MAX_ITEMS = 40;

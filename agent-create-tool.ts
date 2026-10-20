@@ -24,7 +24,7 @@ import { Type } from "typebox";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
-import { generateAgentName, getAgent, resolveModelSearch, runAgent, runAgentAndWait } from "./agent-runtime.ts";
+import { getAgent, resolveModelSearch, runAgent, runAgentAndWait } from "./agent-runtime.ts";
 import { isTerminalFailure, lastAssistantText } from "./agent-summary.ts";
 import { loadCatalog, type SubAgentDef } from "./agent-catalog.ts";
 import {
@@ -245,22 +245,16 @@ export const agentCreateTool = defineTool({
     // Slugs must not collide with each other or with agents already in
     // this root's manifest — same naming rule the picker uses.
     const existingNames = listAgentEntries(root, (f) => getAgent(f) !== undefined).map((a) => a.name);
-    // Names come from a small model (async), so generate them up front in
-    // order; `existingNames` grows as we go to keep the batch collision-free.
+    // Names are the instant prompt-derived slug, never a model call: nothing
+    // may delay the task starting, and the name is handed back to the calling
+    // model as its handle for agent_send / agent_inspect, so it must also stay
+    // stable (no later background rename). `existingNames` grows as we go to
+    // keep the batch collision-free.
     const names: string[] = [];
     for (const t of requested) {
-      const name = await generateAgentName(t.task, existingNames, ctx.model);
+      const name = agentName(t.task, existingNames);
       existingNames.push(name);
       names.push(name);
-    }
-    // Capacity may have been consumed while the naming calls were in flight.
-    try {
-      assertAgentCapacity(root, requested.length);
-    } catch (err) {
-      return {
-        content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
-        isError: true,
-      };
     }
     const spawned = requested.map((t, i) => {
       const def: SubAgentDef | undefined = t.template ? catalog.agents.get(t.template) : undefined;
