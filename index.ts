@@ -1453,7 +1453,9 @@ export default function agentViews(pi: ExtensionAPI): void {
   function restoreFromSession(ctx: ExtensionContext): void {
     view.mirrored = {};
     try {
-      for (const entry of ctx.sessionManager.getEntries()) {
+      // Active branch only: entries on a branch abandoned by /agent-main-clear
+      // (or /tree) are no longer rendered, so they must not count as mirrored.
+      for (const entry of ctx.sessionManager.getBranch()) {
         if (entry.type !== "custom" || entry.customType !== ITEM_ENTRY) continue;
         const ref = entry.data as ItemRef | undefined;
         if (ref?.file) noteMirrored(view, ref.file, ref.index + 1);
@@ -1884,6 +1886,41 @@ export default function agentViews(pi: ExtensionAPI): void {
       reloadRows(ctx);
       tui?.requestRender();
       notify(ctx, `Renamed to ${newName}`, "info");
+    },
+  });
+
+  pi.registerCommand("agent-main-clear", {
+    description: "Clear main's transcript and context in place (no new session; history stays reachable via /tree)",
+    handler: async (_args, ctx) => {
+      // Main only. An attached view blocks this command (BLOCKED_ATTACHED_COMMANDS)
+      // and sub-agents do not load this extension, so neither ever gets here.
+      if (!ctx.isIdle()) {
+        notify(ctx, "Wait for main to finish (or press Esc) before clearing", "warning");
+        return;
+      }
+      // Move the leaf back before the first user message: the next turn starts
+      // from an empty context in the same session file. Nothing is deleted; the
+      // old conversation is just an abandoned branch.
+      const first = ctx.sessionManager
+        .getBranch()
+        .find((e) => e.type === "message" && e.message.role === "user");
+      if (!first) {
+        notify(ctx, "Nothing to clear", "info");
+        return;
+      }
+      const result = await ctx.navigateTree(first.id);
+      if (result.cancelled) return;
+      // pi stores no leaf pointer: on reopen the leaf is simply the last entry in
+      // the file. Append a (context-invisible) marker as a child of the new,
+      // empty leaf so the clear survives quitting before the next message.
+      pi.appendEntry("agent-view-clear", { at: Date.now() });
+      // pi parks the first prompt in the editor when navigating to a user message.
+      ctx.ui.setEditorText("");
+      // Agent output mirrored into main's old branch is no longer on screen:
+      // forget it so the next attach re-mirrors from the start.
+      view.mirrored = {};
+      tui?.requestRender(true);
+      notify(ctx, "Cleared main's transcript (earlier history is still in /tree)", "info");
     },
   });
 

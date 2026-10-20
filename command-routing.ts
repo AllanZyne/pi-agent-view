@@ -85,6 +85,7 @@ export const BLOCKED_ATTACHED_COMMANDS = new Set<string>([
   "compact",
   "copy",
   "session",
+  "agent-main-clear",
 ]);
 
 /**
